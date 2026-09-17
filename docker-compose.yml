@@ -1,0 +1,23 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - inksetter-cache:/cache
+    environment:
+      # URL of source OPDS server.
+      # Kavita
+      UPSTREAM_CATALOG: "http://kavita:5000/api/opds/YOUR-API-KEY"
+      # Komga
+      # UPSTREAM_CATALOG: "http://komga:25600/opds/v1.2/catalog"
+      # Codex
+      # UPSTREAM_CATALOG: "http://codex:9810/opds/v1.2"
+      # URL that will be used to reach this application. Only needed when reverse proxy is used.
+      # PUBLIC_BASE: "https://inksetter"
+      # Disable OCR part of the pipeline. Check README for more details.
+      # OCR_ENABLED: "0"
+    restart: unless-stopped
+
+volumes:
+  inksetter-cache:

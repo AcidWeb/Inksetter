@@ -1,0 +1,22 @@
+[project]
+name = "inksetter"
+version = "0.1.0"
+description = "OPDS proxy that renders manga/comic pages for E-Ink screens"
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE"]
+requires-python = ">=3.14"
+dependencies = [
+    "lxml>=6.0",
+    "httpx>=0.28",
+    "numpy>=2.3",
+    "scipy>=1.14",
+    "fastapi>=0.116",
+    "pyvips[binary]>=3.0",
+    "uvicorn[standard]>=0.35",
+    "rapidocr-onnxruntime>=1.4",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.16.5"
+]

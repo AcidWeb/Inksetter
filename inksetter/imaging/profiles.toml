@@ -1,0 +1,226 @@
+# Check profiles.py for available options and their default values.
+
+# --------------------------------------------------------------------------
+# Meta-profile for Kaleido 3 panel.
+# --------------------------------------------------------------------------
+
+[mixins.kaleido]
+fmt = "pngc"
+saturation = 1.45
+black = 14
+white = 242
+gamma = 1.12
+usm_amount = 0.65
+defringe = "diagonal"
+panel = "kaleido"
+
+
+# --------------------------------------------------------------------------
+# Meta-profiles for devices with the 10"+ panels.
+# --------------------------------------------------------------------------
+
+[mixins.big-panel]
+upscale_max = 2.2
+
+[mixins.kaleido-big]
+base = "kaleido"
+upscale_max = 2.2
+
+
+# --------------------------------------------------------------------------
+# Kindle, mono.
+# --------------------------------------------------------------------------
+
+# Voyage, 7th gen, 2014. 6".
+[profiles.kindle-voyage]
+width = 1072
+height = 1448
+
+# Paperwhite 3, 7th gen, 2015. 6".
+[profiles.kindle-pw-3]
+width = 1072
+height = 1448
+
+# Paperwhite 4, 10th gen, 2018. 6".
+[profiles.kindle-pw-4]
+width = 1072
+height = 1448
+
+# Paperwhite 5, 11th gen, 2021. 6.8".
+[profiles.kindle-pw-5]
+width = 1236
+height = 1648
+
+# Paperwhite 6, 12th gen, 2024. 7".
+[profiles.kindle-pw-6]
+width = 1272
+height = 1696
+
+# Oasis 1, 8th gen, 2016. 6".
+[profiles.kindle-oasis-1]
+width = 1072
+height = 1448
+
+# Oasis 2, 9th gen, 2017. 7".
+[profiles.kindle-oasis-2]
+width = 1264
+height = 1680
+
+# Oasis 3, 10th gen, 2019. 7".
+[profiles.kindle-oasis-3]
+width = 1264
+height = 1680
+
+# Kindle, 11th gen, 2022. 6".
+[profiles.kindle-basic-1]
+width = 1072
+height = 1448
+
+# Kindle, 12th gen, 2024. 6".
+[profiles.kindle-basic-2]
+width = 1072
+height = 1448
+
+# Scribe, 1st gen, 2022. 10.2".
+[profiles.kindle-scribe-1]
+base = "big-panel"
+width = 1860
+height = 2480
+
+# Scribe, 2nd gen, 2024. 10.2".
+[profiles.kindle-scribe-2]
+base = "big-panel"
+width = 1860
+height = 2480
+
+# Scribe, 3rd gen, 2025. 11".
+[profiles.kindle-scribe-3]
+base = "big-panel"
+width = 1986
+height = 2648
+
+
+# --------------------------------------------------------------------------
+# Kindle, colour.
+# --------------------------------------------------------------------------
+
+# Colorsoft, 2024. 7".
+[profiles.kindle-colorsoft]
+base = "kaleido"
+width = 1272
+height = 1696
+
+# Scribe Colorsoft, 2025. 11".
+[profiles.kindle-scribe-colorsoft]
+base = "kaleido-big"
+width = 1986
+height = 2648
+
+
+# --------------------------------------------------------------------------
+# Kobo, mono.
+# --------------------------------------------------------------------------
+
+# Glo HD, 2015. 6".
+[profiles.kobo-glo-hd]
+width = 1072
+height = 1448
+
+# Clara HD, 2018. 6".
+[profiles.kobo-clara-hd]
+width = 1072
+height = 1448
+
+# Clara 2E, 2022. 6".
+[profiles.kobo-clara-2e]
+width = 1072
+height = 1448
+
+# Clara BW, 2024. 6".
+[profiles.kobo-clara-bw]
+width = 1072
+height = 1448
+
+# Aura One, 2016. 7.8".
+[profiles.kobo-aura-one]
+width = 1404
+height = 1872
+
+# Forma, 2018. 8".
+[profiles.kobo-forma]
+width = 1440
+height = 1920
+
+# Libra H2O, 2019. 7".
+[profiles.kobo-libra-h2o]
+width = 1264
+height = 1680
+
+# Libra 2, 2021. 7".
+[profiles.kobo-libra-2]
+width = 1264
+height = 1680
+
+# Sage, 2021. 8".
+[profiles.kobo-sage]
+width = 1440
+height = 1920
+
+# Elipsa, 2021. 10.3".
+[profiles.kobo-elipsa]
+width = 1404
+height = 1872
+
+# Elipsa 2E, 2023. 10.3".
+[profiles.kobo-elipsa-2e]
+width = 1404
+height = 1872
+
+
+# --------------------------------------------------------------------------
+# Kobo, colour.
+# --------------------------------------------------------------------------
+
+# Clara Colour, 2024. 6".
+[profiles.kobo-clara-colour]
+base = "kaleido"
+width = 1072
+height = 1448
+
+# Libra Colour, 2024. 7".
+[profiles.kobo-libra-colour]
+base = "kaleido"
+width = 1264
+height = 1680
+
+
+# --------------------------------------------------------------------------
+# Escape hatch: no image processing at all, feed rewriting only.
+# --------------------------------------------------------------------------
+
+[profiles.passthrough]
+width = 0
+height = 0
+fmt = "raw"
+autocrop = false
+
+
+# --------------------------------------------------------------------------
+# Covers and thumbnails.
+# --------------------------------------------------------------------------
+
+[profiles.cover]
+width = 480
+height = 640
+fmt = "jpeg"
+jpeg_quality = 78
+autocrop = false
+usm_amount = 0.35
+dither = "none"
+strip_folio = false
+
+[profiles.cover-colour]
+base = "cover"
+fmt = "jpegc"
+saturation = 1.35
+auto_mono = false

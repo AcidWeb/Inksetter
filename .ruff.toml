@@ -1,0 +1,9 @@
+line-length = 120
+target-version = "py314"
+
+[lint]
+select = ["A", "ARG", "B", "C4", "E", "F", "I", "PIE", "RUF", "TRY", "UP", "W"]
+ignore = ["I001", "TRY003"]
+
+[format]
+quote-style = "single"

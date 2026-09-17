@@ -1,0 +1,7 @@
+__pycache__/
+.ruff_cache/
+.venv/
+sample/
+*.py[cod]
+CLAUDE.md
+docker-compose.override.yml
