@@ -239,7 +239,7 @@ def _diagonal_attenuation(
     ang = np.rad2deg(np.arctan2(freq_y[:, None], freq_x[None, :]))
     ang -= np.float32(angle)
     ang %= np.float32(90.0)
-    np.minimum(ang, 90.0 - ang, out=ang)  # 0..45, to the nearest arm
+    np.minimum(ang, 90.0 - ang, out=ang)
     wedge = np.exp(-((ang / np.float32(tolerance)) ** 2))
     del ang
 
