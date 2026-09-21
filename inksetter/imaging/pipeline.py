@@ -411,6 +411,15 @@ def _autocrop_box(luma: pyvips.Image, p: Profile) -> tuple[int, int, int, int] |
     )
 
 
+def _chroma_of(im: pyvips.Image) -> float:
+    if im.bands < 3:
+        return 0.0
+    t = im.thumbnail_image(64, size='down')
+    if t.hasalpha():
+        t = t.flatten(background=255)
+    return float(t.colourspace('lch')[1].avg())
+
+
 def chroma_metric(buf: bytes) -> float:
     try:
         im = pyvips.Image.thumbnail_buffer(buf, 64, size='down')
@@ -430,7 +439,7 @@ class _Geom(NamedTuple):
     pad: float | None = None
 
 
-def _geometry(buf: bytes, p: Profile, tw: int, th: int, mono: bool) -> _Geom:
+def _geometry(buf: bytes, p: Profile, tw: int, th: int, mono: bool, page: pyvips.Image | None = None) -> _Geom:
     chatty = log.isEnabledFor(logging.DEBUG)
     mark = time.perf_counter() if chatty else 0.0
 
@@ -440,7 +449,7 @@ def _geometry(buf: bytes, p: Profile, tw: int, th: int, mono: bool) -> _Geom:
         log.debug('  %-10s %5.0f ms  %dx%d %s', what, (now - mark) * 1000, im.width, im.height, extra)
         mark = now
 
-    im = _open(buf).autorot()
+    im = _open(buf).autorot() if page is None else page
     if chatty:
         im = im.copy_memory()
         step('decode', f'{im.bands} band(s), {len(buf) / 1024:.0f} kB in')
@@ -608,8 +617,10 @@ def _flatten_pad(a: np.ndarray, content: tuple[int, int, int, int], level: float
     return a
 
 
-def _render_mono(buf: bytes, p: Profile, tw: int, th: int, fmt: str) -> tuple[bytes, str]:
-    geom = _geometry(buf, p, tw, th, mono=True)
+def _render_mono(
+    buf: bytes, p: Profile, tw: int, th: int, fmt: str, page: pyvips.Image | None = None
+) -> tuple[bytes, str]:
+    geom = _geometry(buf, p, tw, th, mono=True, page=page)
     g = geom.image
     if g.bands > 1:
         g = g.colourspace('b-w')
@@ -631,8 +642,8 @@ def _render_mono(buf: bytes, p: Profile, tw: int, th: int, fmt: str) -> tuple[by
     return q.pngsave_buffer(bitdepth=4, compression=p.png_compression, strip=True), 'image/png'
 
 
-def _render_colour(buf: bytes, p: Profile, tw: int, th: int) -> tuple[bytes, str]:
-    geom = _geometry(buf, p, tw, th, mono=False)
+def _render_colour(buf: bytes, p: Profile, tw: int, th: int, page: pyvips.Image | None = None) -> tuple[bytes, str]:
+    geom = _geometry(buf, p, tw, th, mono=False, page=page)
     im = geom.image
     if im.bands == 1:
         im = im.colourspace('srgb')
@@ -731,7 +742,8 @@ def render_page(
         log.debug('render: %s %dx%d, mono profile -> %s', p.name, tw, th, p.fmt)
         return _summarise(_render_mono(buf, p, tw, th, p.fmt), buf, p, started, 'mono')
 
-    if p.auto_mono and (chroma := chroma_metric(buf)) < p.mono_chroma_threshold:
+    page = _open(buf).autorot()
+    if p.auto_mono and (chroma := _chroma_of(page)) < p.mono_chroma_threshold:
         log.debug(
             'render: %s %dx%d, chroma %.3f < %.1f -> mono %s',
             p.name,
@@ -741,10 +753,10 @@ def render_page(
             p.mono_chroma_threshold,
             p.mono_fmt,
         )
-        return _summarise(_render_mono(buf, p, tw, th, p.mono_fmt), buf, p, started, 'auto-mono')
+        return _summarise(_render_mono(buf, p, tw, th, p.mono_fmt, page=page), buf, p, started, 'auto-mono')
 
     log.debug('render: %s %dx%d -> colour %s', p.name, tw, th, p.fmt)
-    return _summarise(_render_colour(buf, p, tw, th), buf, p, started, 'colour')
+    return _summarise(_render_colour(buf, p, tw, th, page=page), buf, p, started, 'colour')
 
 
 def _summarise(result, buf: bytes, p: Profile, started: float, path: str):
