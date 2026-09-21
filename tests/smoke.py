@@ -34,6 +34,7 @@ os.environ.setdefault('PREFETCH', '2')
 os.environ.setdefault('LOG_LEVEL', 'WARNING')
 
 import dataclasses  # noqa: E402
+import socket  # noqa: E402
 import importlib  # noqa: E402
 import importlib.resources  # noqa: E402
 
@@ -3276,6 +3277,35 @@ async def main() -> int:
 
         r = await c.get('/kobo-clara-bw/f/' + encode_token('http://127.0.0.1:8899/opds/v1.2/redirect'))
         check('SSRF blocked across a redirect', r.status_code == 403, f'status={r.status_code}')
+
+        from inksetter.opds import upstream as _upmod
+
+        with socket.socket() as _probe:
+            _probe.bind(('127.0.0.1', 0))
+            dead_port = _probe.getsockname()[1]
+        dead = f'http://127.0.0.1:{dead_port}/opds'
+        real_settings = _upmod.settings
+        _upmod.settings = dataclasses.replace(real_settings, upstream_catalog=dead)
+        try:
+            for label, route in (
+                ('feed', 'f'),
+                ('page', 'p'),
+                ('image', 'img'),
+                ('download', 'dl'),
+            ):
+                r = await c.get(f'/kobo-clara-bw/{route}/' + encode_token(f'{dead}/x.cbz'))
+                check(
+                    f'an unreachable upstream is 502 on the {label} route',
+                    r.status_code == 502,
+                    f'status={r.status_code} body={r.text[:60]}',
+                )
+                check(
+                    f'...and says so rather than blaming the proxy ({label})',
+                    'unreachable' in r.text,
+                    r.text[:60],
+                )
+        finally:
+            _upmod.settings = real_settings
 
         for label, tok in (('not base64', '!!!not-base64!!!'), ('bad utf-8', '_w==')):
             r = await c.get(f'/kobo-clara-bw/f/{tok}')
