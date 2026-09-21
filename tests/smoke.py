@@ -1690,6 +1690,38 @@ def check_pad_seam() -> None:
         f'{level(dark_tb, False, True)}',
     )
 
+    def flat_dark_left_mixed_right(a):
+        a[:, :2] = 10
+        a[:400, -2:] = 0
+        a[400:, -2:] = 250
+
+    def both_edges_graded(a):
+        ramp = np.linspace(0, 120, 1000).astype(np.uint8)[:, None]
+        a[:, :2] = ramp
+        a[:, -2:] = ramp
+
+    check(
+        'a mixed edge abstains rather than forcing a tie-break',
+        level(flat_dark_left_mixed_right, horizontal=True, vertical=False) == 0.0,
+        f'{level(flat_dark_left_mixed_right, True, False)}',
+    )
+    check(
+        'when no consulted edge is flat, the pad is white',
+        level(both_edges_graded, horizontal=True, vertical=False) == 255.0,
+        f'{level(both_edges_graded, True, False)}',
+    )
+
+    def noisy_dark_edges(a):
+        noise = np.where(np.arange(1000) % 2 == 0, 8, 14).astype(np.uint8)[:, None]
+        a[:, :2] = noise
+        a[:, -2:] = noise
+
+    check(
+        'an edge with ordinary scan noise still votes',
+        level(noisy_dark_edges, horizontal=True, vertical=False) == 0.0,
+        f'{level(noisy_dark_edges, True, False)}',
+    )
+
     a = np.full((1000, 700), 255, np.uint8)
     a[:12, :] = 0
     a[-12:, :] = 0
@@ -1813,6 +1845,56 @@ def check_edge_line() -> None:
         box == clean_box,
         f'lined={box} clean={clean_box}',
     )
+
+
+def check_dark_margin_crop() -> None:
+    prof = profiles.PROFILES['kobo-clara-bw']
+    w, h, inset = 900, 1300, 90
+
+    def bordered(ink_border: bool, paper_left: bool = False) -> pyvips.Image:
+        bg, fg = (0, 255) if ink_border else (255, 40)
+        a = np.full((h, w), bg, np.uint8)
+        a[inset : h - inset, inset : w - inset] = fg
+        if paper_left:
+            a[:, :inset] = 255
+        return pyvips.Image.new_from_memory(a.tobytes(), w, h, 1, 'uchar')
+
+    ink, paper, mixed = bordered(True), bordered(False), bordered(True, paper_left=True)
+    check('every edge of an ink-bordered page reads as ink', all(pipeline._dark_edges(ink)))
+    check('no edge of a paper-bordered page does', not any(pipeline._dark_edges(paper)))
+    check(
+        'and the decision is per edge, not per page',
+        pipeline._dark_edges(mixed) == (False, True, True, True),
+        f'{pipeline._dark_edges(mixed)}',
+    )
+
+    box = pipeline._autocrop_box(ink, prof)
+    check('an ink border is cropped away', box is not None, 'box refused')
+    if box:
+        left, top, bw, bh = box
+        check(
+            'and the crop lands on the content, not the border',
+            abs(left - inset) <= 4
+            and abs(top - inset) <= 4
+            and abs(bw - (w - 2 * inset)) <= 8
+            and abs(bh - (h - 2 * inset)) <= 8,
+            f'box={box}, wanted about ({inset}, {inset}, {w - 2 * inset}, {h - 2 * inset})',
+        )
+
+    band = np.full((h, w), 255, np.uint8)
+    band[:, :120] = 0
+    band[200 : h - 200, 300 : w - 200] = 40
+    one_side = pyvips.Image.new_from_memory(band.tobytes(), w, h, 1, 'uchar')
+    check(
+        'a band down one side reads as ink on that edge only',
+        pipeline._dark_edges(one_side) == (True, False, False, False),
+        f'{pipeline._dark_edges(one_side)}',
+    )
+    ob = pipeline._autocrop_box(one_side, prof)
+    check('and that band is trimmed away', ob is not None and ob[0] >= 110, f'box={ob}')
+
+    solid = pyvips.Image.new_from_memory(np.full((h, w), 0, np.uint8).tobytes(), w, h, 1, 'uchar')
+    check('a page that is solid ink is refused, not cropped away', pipeline._autocrop_box(solid, prof) is None)
 
 
 def check_autocrop_open() -> None:
@@ -3508,6 +3590,7 @@ async def main() -> int:
     print('edge lines')
     check_edge_line()
     print('autocrop')
+    check_dark_margin_crop()
     check_autocrop_open()
     print('strip folio')
     check_strip_folio()

@@ -43,7 +43,7 @@ if not os.environ.get('VIPS_CONCURRENCY'):
     pyvips.concurrency_set(vips_threads(os.cpu_count() or 4))
 
 # Bump this whenever anything in this module changes in a way that alters output pixels. Bump invalidates the cache.
-PIPELINE_VERSION = '1'
+PIPELINE_VERSION = '2'
 
 _BAYER_N = 8
 
@@ -341,35 +341,55 @@ def _strip_edge_lines(luma: pyvips.Image, threshold: int) -> tuple[int, int, int
     return (left, top, right, bottom)
 
 
+def _dark_edges(luma: pyvips.Image) -> tuple[bool, bool, bool, bool]:
+    try:
+        return tuple(iqr <= _PAD_FLAT_IQR and med < _PAD_MIDPOINT for med, iqr in _side_stats(luma))
+    except pyvips.Error, ValueError:
+        return (False, False, False, False)
+
+
 def _autocrop_box(luma: pyvips.Image, p: Profile) -> tuple[int, int, int, int] | None:
     threshold = p.autocrop_threshold
-    sl, st, sr, sb = _strip_edge_lines(luma, threshold)
+    edges = _dark_edges(luma)
+    all_dark = all(edges)
+    sl, st, sr, sb = (0, 0, 0, 0) if all_dark else _strip_edge_lines(luma, threshold)
     ox, oy = sl, st
     if sl or st or sr or sb:
         luma = luma.crop(sl, st, luma.width - sl - sr, luma.height - st - sb)
+
+    def _trim(src_im):
+        white = src_im.find_trim(threshold=threshold, background=255)
+        if not any(edges):
+            return white
+        ink = src_im.find_trim(threshold=threshold, background=0)
+        wl, wt, ww, wh = white
+        il, it, iw, ih = ink
+        x0 = il if edges[0] else wl
+        y0 = it if edges[2] else wt
+        x1 = (il + iw) if edges[1] else (wl + ww)
+        y1 = (it + ih) if edges[3] else (wt + wh)
+        return [x0, y0, max(0, x1 - x0), max(0, y1 - y0)]
+
     try:
-        plain = luma.gaussblur(2).find_trim(threshold=threshold, background=255)
+        plain = _trim(luma.gaussblur(2))
         window = _open_window(luma)
         edge = window // 2
+        fill = 0.0 if all_dark else 255.0
         padded = luma.embed(
             edge,
             edge,
             luma.width + 2 * edge,
             luma.height + 2 * edge,
             extend='background',
-            background=[255.0] * luma.bands,
+            background=[fill] * luma.bands,
         )
-        opened = (
-            padded.rank(window, window, (window * window) // 2)
-            .crop(edge, edge, luma.width, luma.height)
-            .find_trim(threshold=threshold, background=255)
-        )
+        opened = _trim(padded.rank(window, window, (window * window) // 2).crop(edge, edge, luma.width, luma.height))
     except pyvips.Error:
         return None
 
     left, top, w, h = plain
     if min(opened[2], opened[3]) > 0 and opened[2] * opened[3] <= w * h:
-        mask = luma < (255 - threshold)
+        mask = (luma > threshold) if all_dark else (luma < (255 - threshold))
         base = _ink_in(mask, plain)
         if base > 0 and (base - _ink_in(mask, opened)) / base <= _OPEN_INK_TOLERANCE:
             left, top, w, h = opened
@@ -484,9 +504,10 @@ def _geometry(buf: bytes, p: Profile, tw: int, th: int, mono: bool) -> _Geom:
 # --------------------------------------------------------------------------
 
 _PAD_MIDPOINT = 128.0
+_PAD_FLAT_IQR = 17.0
 
 
-def _side_medians(im: pyvips.Image) -> tuple[float, float, float, float]:
+def _side_stats(im: pyvips.Image) -> tuple[tuple[float, float], ...]:
     d = 2
     parts = (
         im.crop(0, 0, min(d, im.width), im.height),
@@ -494,12 +515,17 @@ def _side_medians(im: pyvips.Image) -> tuple[float, float, float, float]:
         im.crop(0, 0, im.width, min(d, im.height)),
         im.crop(0, max(0, im.height - d), im.width, min(d, im.height)),
     )
-    return tuple(float(np.median(_band_stack(part))) for part in parts)
+    out = []
+    for part in parts:
+        v = _band_stack(part)
+        q1, med, q3 = np.percentile(v, (25, 50, 75))
+        out.append((float(med), float(q3 - q1)))
+    return tuple(out)
 
 
 def _mono_pad_level(im: pyvips.Image, horizontal: bool, vertical: bool) -> float:
     try:
-        left, right, top, bottom = _side_medians(im)
+        left, right, top, bottom = _side_stats(im)
     except pyvips.Error, ValueError:
         return 255.0
     sides = []
@@ -507,9 +533,10 @@ def _mono_pad_level(im: pyvips.Image, horizontal: bool, vertical: bool) -> float
         sides += [left, right]
     if vertical:
         sides += [top, bottom]
-    if not sides:
+    flat = [med for med, iqr in sides if iqr <= _PAD_FLAT_IQR]
+    if not flat:
         return 255.0
-    ends = {0.0 if s < _PAD_MIDPOINT else 255.0 for s in sides}
+    ends = {0.0 if med < _PAD_MIDPOINT else 255.0 for med in flat}
     return ends.pop() if len(ends) == 1 else 255.0
 
 
