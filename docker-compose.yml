@@ -1,10 +1,10 @@
 services:
   app:
-    build: .
+    image: ghcr.io/acidweb/inksetter:latest
     ports:
       - "8080:8080"
     volumes:
-      - inksetter-cache:/cache
+      - cache:/cache
     environment:
       # URL of source OPDS server.
       # Kavita
@@ -20,4 +20,4 @@ services:
     restart: unless-stopped
 
 volumes:
-  inksetter-cache:
+  cache:
