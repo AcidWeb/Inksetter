@@ -14,9 +14,13 @@ The application itself has a fairly simple structure, so you can deploy it in a 
 
 ## Usage
 
-When the proxy is deployed, entering its root URL will display a list of all OPDS catalogues that can be used directly in the selected client. Every device profile has its own specific address.
+When the proxy is deployed, entering its root URL will display a list of all device profiles. Each one can be opened straight in the browser to browse the library and download processed files, or its OPDS address can be added to the client of your choice. Every device profile has its own specific address.
 
-Please be aware that downloading CBZ might take multiple minutes if the source CBZ is very big, high-res, or the proxy is running on a slow device. As long download not timeout, it means the process is in progress. For a number of technical reasons, the current status of the process cannot be displayed directly on the target device.
+Please be aware that downloading CBZ might take multiple minutes if the source CBZ is very big, high-res, or the proxy is running on a slow device. As long download not timeout, it means the process is in progress. For a number of technical reasons, the current status of the process cannot be displayed directly on the target device - the browser pages do show it.
+
+### Browser
+
+Opening a profile from the root page browses the same catalogue an OPDS client sees. The download link produces exactly the file a reader would have been given. This is convenient for pulling a volume onto a PC, or for seeing what the pipeline does to a book without involving the device at all.
 
 ### KOReader
 
@@ -32,6 +36,7 @@ Currently, if the proxy uses Kavita as the OPDS source, two additional features 
 ## Current limitations
 
 * Only CBZ files are supported.
+* The browser pages render OPDS V1 feeds only. An OPDS V2 source still works normally for readers.
 * Webtoon format (long vertical strips) support is limited. Please check the [wiki](https://github.com/AcidWeb/Inksetter/wiki) for more details.
 * Very big CBZ (1GB+) archives might fail to download if source OPDS server don't support HTTP range requests.
 

@@ -169,7 +169,7 @@ def _parser() -> etree.XMLParser:
     return etree.XMLParser(recover=True, resolve_entities=False, no_network=True)
 
 
-def _root_or_none(body: bytes):
+def root_or_none(body: bytes):
     try:
         root = etree.fromstring(body, parser=_parser())
     except etree.XMLSyntaxError:
@@ -177,7 +177,7 @@ def _root_or_none(body: bytes):
     return root
 
 
-def _entry_cover(entry) -> str | None:
+def entry_cover(entry) -> str | None:
     for rel in (
         'http://opds-spec.org/image',
         'http://opds-spec.org/cover',
@@ -202,7 +202,7 @@ def _rewrite_link(link, ctx: Ctx, page_mime: str | None, cover: str | None) -> N
 
 
 def rewrite_atom(body: bytes, ctx: Ctx, page_mime: str | None) -> bytes:
-    root = _root_or_none(body)
+    root = root_or_none(body)
     if root is None:
         return body
 
@@ -214,7 +214,7 @@ def rewrite_atom(body: bytes, ctx: Ctx, page_mime: str | None) -> bytes:
 
     done: set = set()
     for entry in root.iter(f'{{{ATOM}}}entry'):
-        cover = _entry_cover(entry)
+        cover = entry_cover(entry)
         for link in entry.iter(f'{{{ATOM}}}link'):
             _rewrite_link(link, ctx, page_mime, cover)
             done.add(link)
@@ -225,8 +225,19 @@ def rewrite_atom(body: bytes, ctx: Ctx, page_mime: str | None) -> bytes:
     return etree.tostring(root, xml_declaration=True, encoding='utf-8')
 
 
+def search_template(body: bytes) -> str | None:
+    root = root_or_none(body)
+    if root is None:
+        return None
+    for url in root.iter(f'{{{OSD_NS}}}Url'):
+        tpl = url.get('template')
+        if tpl and is_search_template(tpl):
+            return tpl
+    return None
+
+
 def rewrite_opensearch(body: bytes, ctx: Ctx) -> bytes:
-    root = _root_or_none(body)
+    root = root_or_none(body)
     if root is None:
         return body
     for url in root.iter(f'{{{OSD_NS}}}Url'):

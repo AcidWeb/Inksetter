@@ -24,6 +24,8 @@ FORWARD_RESPONSE = (
     'last-modified',
     'etag',
 )
+CHALLENGE = {401: 'www-authenticate', 407: 'proxy-authenticate'}
+DEFAULT_CHALLENGE = 'Basic realm="Inksetter"'
 MAX_REDIRECTS = 5
 TIMEOUT = 30.0
 
@@ -34,9 +36,10 @@ _CONTENT_RANGE = re.compile(r'bytes\s+\d+-\d+/(\d+)', re.I)
 
 
 class UpstreamError(Exception):
-    def __init__(self, status: int, detail: str = '') -> None:
+    def __init__(self, status: int, detail: str = '', headers: dict[str, str] | None = None) -> None:
         super().__init__(detail or f'upstream status {status}')
         self.status = status
+        self.headers = headers or {}
 
 
 def host_key(url: str) -> str:
@@ -68,10 +71,14 @@ def _transport_error(exc: Exception) -> UpstreamError:
     return UpstreamError(502, f'upstream unreachable: {type(exc).__name__}')
 
 
-def _status_error(status: int) -> UpstreamError:
+def _status_error(status: int, headers=None) -> UpstreamError:
     if status >= 500:
         return UpstreamError(502, f'upstream is failing: status {status}')
-    return UpstreamError(status)
+    challenge = CHALLENGE.get(status)
+    if challenge is None:
+        return UpstreamError(status)
+    offered = (headers or {}).get(challenge) or (DEFAULT_CHALLENGE if status == 401 else '')
+    return UpstreamError(status, headers={challenge: offered} if offered else None)
 
 
 def _redirect_target(url: str, resp: httpx.Response) -> str | None:
@@ -132,7 +139,7 @@ class Client:
                 target = _redirect_target(url, resp)
                 if target is None:
                     if resp.status_code >= 400:
-                        raise _status_error(resp.status_code)
+                        raise _status_error(resp.status_code, resp.headers)
                     return resp
                 url = target
         except httpx.TransportError as exc:
@@ -148,7 +155,7 @@ class Client:
                     target = _redirect_target(url, resp)
                     if target is None:
                         if resp.status_code >= 400:
-                            raise _status_error(resp.status_code)
+                            raise _status_error(resp.status_code, resp.headers)
                         return resp
                 url = target
         except httpx.TransportError as exc:
@@ -164,7 +171,7 @@ class Client:
                     target = _redirect_target(url, resp)
                     if target is None:
                         if resp.status_code >= 400:
-                            raise _status_error(resp.status_code)
+                            raise _status_error(resp.status_code, resp.headers)
                         async for chunk in resp.aiter_bytes(1 << 20):
                             await asyncio.to_thread(sink.write, chunk)
                         return resp

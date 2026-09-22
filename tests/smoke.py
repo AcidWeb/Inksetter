@@ -8,11 +8,13 @@ The way is shut. It was made by those who are dead, and the dead keep it, until 
 """
 
 import ast
+import base64
 import asyncio
 import gzip
 import inspect
 import io
 import json
+import math
 import os
 import pathlib
 import re
@@ -47,8 +49,10 @@ from fastapi.responses import StreamingResponse  # noqa: E402
 
 from inksetter import cache as cache_mod  # noqa: E402
 from inksetter import settings as settings_mod  # noqa: E402
+from inksetter import app as app_mod  # noqa: E402
 from inksetter.app import app  # noqa: E402
 from inksetter.imaging import cbz, folio, pipeline, profiles  # noqa: E402
+from inksetter import web  # noqa: E402
 from inksetter.opds import rewrite  # noqa: E402
 from inksetter.opds.rewrite import encode_token  # noqa: E402
 from inksetter.opds.upstream import client as up_client  # noqa: E402
@@ -65,12 +69,30 @@ FEED = """<?xml version="1.0" encoding="utf-8"?>
   <link rel="http://opds-spec.org/image" type="image/jpeg"
         href="/opds/v1.2/books/7/thumbnail"/>
   <link rel="http://opds-spec.org/acquisition" type="application/vnd.comicbook+zip"
-        href="/opds/v1.2/books/7/file"/>
+        href="/opds/v1.2/books/7/file" length="41943040"/>
   <link rel="__PSE_REL__" type="image/jpeg"
         href="/opds/v1.2/books/7/pages/{pageNumber}?zero_based=true&amp;maxWidth={maxWidth}"
         pse:count="3" pse:lastRead="2"/>
  </entry>
 </feed>""".replace('__PSE_REL__', PSE_REL)
+
+
+NAV_FEED = """<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+ <title>Shelves</title>
+ <link rel="self" type="application/atom+xml;profile=opds-catalog" href="/opds/v1.2/nav"/>
+ <link rel="up" type="application/atom+xml;profile=opds-catalog" href="/opds/v1.2/catalog"/>
+ <link rel="next" type="application/atom+xml;profile=opds-catalog" href="/opds/v1.2/nav?p=2"/>
+ <entry><title>Shelf &lt;script&gt;alert(1)&lt;/script&gt;</title>
+  <summary>twelve of them</summary>
+  <link rel="subsection" type="application/atom+xml;profile=opds-catalog"
+        href="/opds/v1.2/mid"/>
+  <link rel="previous" type="application/atom+xml;profile=opds-catalog"
+        href="/opds/v1.2/nav?entrys-own"/>
+  <link rel="http://opds-spec.org/image" type="image/jpeg"
+        href="/opds/v1.2/books/7/thumbnail"/>
+ </entry>
+</feed>"""
 
 
 def fake_colour_page(w: int = 1600, h: int = 2400) -> bytes:
@@ -109,6 +131,55 @@ upstream = FastAPI()
 
 @upstream.get('/opds/v1.2/catalog')
 def _catalog():
+    return Response(FEED, media_type='application/atom+xml;profile=opds-catalog')
+
+
+MID_FEED = """<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+ <title>Manga</title>
+ <link rel="self" type="application/atom+xml;profile=opds-catalog" href="/opds/v1.2/mid"/>
+ <entry><title>A Series</title>
+  <link rel="subsection" type="application/atom+xml;profile=opds-catalog"
+        href="/opds/v1.2/catalog"/>
+ </entry>
+</feed>"""
+
+
+@upstream.get('/opds/v1.2/mid')
+def _mid():
+    return Response(MID_FEED, media_type='application/atom+xml;profile=opds-catalog')
+
+
+@upstream.get('/opds/v1.2/guarded')
+def _guarded(authorization: str = Header(default='')):
+    if authorization != 'Basic Zm9vOmJhcg==':
+        return Response(
+            'denied',
+            status_code=401,
+            headers={'www-authenticate': 'Basic realm="Komga", charset="UTF-8"'},
+        )
+    return Response(FEED, media_type='application/atom+xml;profile=opds-catalog')
+
+
+@upstream.get('/opds/v1.2/silent401')
+def _silent_401():
+    return Response('denied', status_code=401)
+
+
+@upstream.get('/opds/v1.2/forbidden')
+def _forbidden():
+    return Response('no', status_code=403, headers={'www-authenticate': 'Basic realm="nope"'})
+
+
+@upstream.get('/opds/v1.2/nav')
+def _nav():
+    return Response(NAV_FEED, media_type='application/atom+xml;profile=opds-catalog')
+
+
+@upstream.get('/opds/v1.2/negotiate')
+def _negotiate(accept: str = Header(default='')):
+    if 'text/html' in accept:
+        return Response('<html><body>upstream html</body></html>', media_type='text/html')
     return Response(FEED, media_type='application/atom+xml;profile=opds-catalog')
 
 
@@ -311,7 +382,11 @@ def _norange_file():
 
 @upstream.get('/opds/v1.2/books/7/file')
 def _file():
-    return Response(_cbz_bytes(), media_type='application/vnd.comicbook+zip')
+    return Response(
+        _cbz_bytes(),
+        media_type='application/vnd.comicbook+zip',
+        headers={'content-disposition': 'attachment; filename="Fake Vol 1.cbz"'},
+    )
 
 
 CREDS_SEEN: dict[str, str | None] = {}
@@ -1033,11 +1108,12 @@ def check_module_boundary() -> None:
                 'inksetter.opds',
                 'inksetter.app',
                 'inksetter.cache',
+                'inksetter.web',
             ],
         ),
         'opds': (
             ['inksetter.opds.rewrite', 'inksetter.opds.upstream'],
-            ['pyvips', 'numpy', 'inksetter.imaging', 'inksetter.app', 'inksetter.cache'],
+            ['pyvips', 'numpy', 'inksetter.imaging', 'inksetter.app', 'inksetter.cache', 'inksetter.web'],
         ),
     }
     code = (
@@ -3085,6 +3161,557 @@ def check_strip_folio() -> None:
     )
 
 
+def _decoded(token: str) -> tuple[str, str | None]:
+    try:
+        return rewrite.decode_parts(token)
+    except rewrite.TokenError:
+        return '', None
+
+
+async def check_browse(c) -> None:
+    up = 'http://127.0.0.1:8899'
+    r = await c.get('/kobo-clara-bw/browse')
+    html = r.text
+    check('browse root served as html', r.status_code == 200 and 'text/html' in r.headers['content-type'])
+    check('no upstream host reaches the page', up not in html)
+    check('no upstream path reaches the page', '/opds/v1.2/' not in html)
+    check('the page names the profile it rendered for', 'kobo-clara-bw' in html and '1072' in html)
+
+    dl = re.findall(r'/kobo-clara-bw/dl/([\w-]+)', html)
+    check('the acquisition entry offers one download', len(dl) == 1, f'{len(dl)} links')
+    token = dl[0] if dl else ''
+    check(
+        'the download token points back at the upstream file',
+        _decoded(token)[0] == f'{up}/opds/v1.2/books/7/file',
+    )
+    check(
+        'the download token carries the cover, as the feed route does',
+        _decoded(token)[1] == f'{up}/opds/v1.2/books/7/thumbnail',
+    )
+    check('the cover is rendered through the img route', len(re.findall(r'/kobo-clara-bw/img/[\w-]+', html)) == 1)
+    box = math.gcd(profiles.COVER.width, profiles.COVER.height)
+    check(
+        'the css cover box is the cover profile box, so nothing is cropped',
+        f'aspect-ratio:{profiles.COVER.width // box}/{profiles.COVER.height // box};' in web.CSS,
+        f'{profiles.COVER.width}x{profiles.COVER.height}',
+    )
+    check('pse:count is shown as a page count', '3 pages' in html)
+    check('the acquisition length is shown', '40.0 MB' in html)
+    check('an acquisition feed renders as rows', 'Download CBZ' in html and 'class="grid"' not in html)
+
+    form = re.search(r'<form class="q" action="([^"]+)"', html)
+    check('a search form is offered', form is not None)
+    action = form.group(1) if form else ''
+    stok = action.rsplit('/', 1)[-1]
+    check('the search form targets the browse search route', '/kobo-clara-bw/bs/' in action)
+    check(
+        'the search token is the description document, not a filled template',
+        _decoded(stok)[0] == f'{up}/opds/v1.2/search',
+    )
+    r = await c.get(f'/kobo-clara-bw/bs/{stok}', params={'q': 'dune'})
+    check('search resolves the description and runs the query', 'hits:dune' in r.text)
+    check('the search box keeps the term', 'value="dune"' in r.text)
+
+    ntok = encode_token(f'{up}/opds/v1.2/nav')
+    nav = (await c.get(f'/kobo-clara-bw/b/{ntok}')).text
+    check('a feed with no acquisitions renders as a grid', 'class="grid"' in nav)
+    check('navigation entries link into the browse route', '/kobo-clara-bw/b/' in nav)
+    check('navigation entries do not link into the machine-readable feed route', '/kobo-clara-bw/f/' not in nav)
+    check('an entry title is escaped', '<script>' not in nav and '&lt;script&gt;' in nav)
+    check('a summary stands in when there is no page count', 'twelve of them' in nav)
+    check(
+        'the next link is offered as a browse link',
+        f'/kobo-clara-bw/b/{encode_token(f"{up}/opds/v1.2/nav?p=2")}' in nav,
+    )
+    check(
+        'the up link is offered as a browse link',
+        f'/kobo-clara-bw/b/{encode_token(f"{up}/opds/v1.2/catalog")}' in nav,
+    )
+    check(
+        "an entry's own navigation link is not hoisted into the pager",
+        encode_token(f'{up}/opds/v1.2/nav?entrys-own') not in nav,
+    )
+
+    gtok = encode_token(f'{up}/opds/v1.2/negotiate')
+    r = await c.get(f'/kobo-clara-bw/b/{gtok}', headers={'accept': 'text/html,application/xhtml+xml'})
+    check(
+        "the browser's Accept is not forwarded upstream",
+        'upstream html' not in r.text and 'Download CBZ' in r.text,
+    )
+
+    v2 = encode_token(f'{up}/opds/v2/catalog')
+    r = await c.get(f'/kobo-clara-bw/b/{v2}')
+    check(
+        'an OPDS 2.0 upstream gets an explanation, not a traceback',
+        r.status_code == 200 and 'do not render' in r.text,
+    )
+
+    r = await c.get('/passthrough/browse')
+    panel = web._panel(profiles.PROFILES['passthrough'])
+    check(
+        'a sizeless profile prints no dimensions at all',
+        'original' in panel and not any(ch.isdigit() for ch in panel),
+        panel,
+    )
+    check('and the page it renders says so', r.status_code == 200 and 'original' in r.text)
+    check('browse on an unknown profile is 404', (await c.get('/nope/browse')).status_code == 404)
+
+    r = await c.get(f'/kobo-clara-bw/dl/{token}')
+    check('a download link taken from the page returns a cbz', r.content[:4] == b'PK\x03\x04')
+
+    r = await c.get(f'/kobo-clara-bw/dl/{token}', params={'job': 'job-1'})
+    state = (await c.get('/kobo-clara-bw/dl-status/job-1')).json()
+    check('a finished repack reports itself done', state['stage'] == 'done', f'{state}')
+    check('and it got through every page', state['done'] == state['total'] == 3, f'{state}')
+    check('the download itself is unaffected by being watched', r.content[:4] == b'PK\x03\x04')
+    check(
+        'an unknown job is a 404, not an empty answer',
+        (await c.get('/kobo-clara-bw/dl-status/never-started')).status_code == 404,
+    )
+    check(
+        'the status route checks the profile like every other',
+        (await c.get('/nope/dl-status/job-1')).status_code == 404,
+    )
+    bad = encode_token(f'{up}/opds/v1.2/missing')
+    await c.get(f'/kobo-clara-bw/dl/{bad}', params={'job': 'job-2'})
+    check(
+        'a download that never arrives is reported as failed',
+        (await c.get('/kobo-clara-bw/dl-status/job-2')).json()['stage'] == 'error',
+    )
+    ptok = encode_token(f'{up}/opds/v1.2/books/7/file')
+    await c.get(f'/passthrough/dl/{ptok}', params={'job': 'job-3'})
+    check(
+        'a profile that repacks nothing still finishes the job',
+        (await c.get('/passthrough/dl-status/job-3')).json()['stage'] == 'done',
+    )
+    check(
+        'the browser is told the upstream filename, so the token is not the name',
+        r.headers.get('content-disposition') == 'attachment; filename="Fake Vol 1.cbz"',
+        repr(r.headers.get('content-disposition')),
+    )
+
+    guard = encode_token(f'{up}/opds/v1.2/guarded')
+    r = await c.get(f'/kobo-clara-bw/b/{guard}')
+    check('a guarded upstream still answers 401', r.status_code == 401, f'status={r.status_code}')
+    check(
+        'and the challenge is forwarded, so the browser can prompt',
+        r.headers.get('www-authenticate') == 'Basic realm="Komga", charset="UTF-8"',
+        repr(r.headers.get('www-authenticate')),
+    )
+    r = await c.get(f'/kobo-clara-bw/b/{guard}', headers={'authorization': 'Basic Zm9vOmJhcg=='})
+    check(
+        'the credentials the browser then sends get through',
+        r.status_code == 200 and 'Download CBZ' in r.text,
+        f'status={r.status_code}',
+    )
+    r = await c.get(f'/kobo-clara-bw/f/{guard}')
+    check(
+        'the same challenge reaches a reader on the feed route',
+        r.status_code == 401 and 'realm="Komga"' in r.headers.get('www-authenticate', ''),
+    )
+    r = await c.get(f'/kobo-clara-bw/b/{encode_token(f"{up}/opds/v1.2/silent401")}')
+    check(
+        'a 401 with no challenge of its own is still given one',
+        r.status_code == 401 and r.headers.get('www-authenticate') == 'Basic realm="Inksetter"',
+        repr(r.headers.get('www-authenticate')),
+    )
+    r = await c.get(f'/kobo-clara-bw/b/{encode_token(f"{up}/opds/v1.2/forbidden")}')
+    check(
+        'a 403 is not dressed up as a login prompt',
+        r.status_code == 403 and 'www-authenticate' not in {k.lower() for k in r.headers},
+    )
+    r = await c.get(f'/kobo-clara-bw/b/{encode_token(f"{up}/opds/v1.2/missing")}')
+    check(
+        'and neither is a 404',
+        r.status_code == 404 and 'www-authenticate' not in {k.lower() for k in r.headers},
+    )
+    html_accept = {'accept': 'text/html,application/xhtml+xml'}
+    r = await c.get(f'/kobo-clara-bw/b/{guard}', headers=html_accept)
+    check(
+        'a browser that cancels the prompt gets a page, not raw json',
+        'Sign in required' in r.text and r.text.lstrip()[:1] == '<',
+        r.text[:60],
+    )
+    check(
+        'and that page still carries the challenge',
+        r.headers.get('www-authenticate') == 'Basic realm="Komga", charset="UTF-8"',
+    )
+    r = await c.get(f'/kobo-clara-bw/f/{guard}')
+    check(
+        'while a reader is still answered in json',
+        r.headers['content-type'].startswith('application/json') and 'upstream status 401' in r.text,
+        r.headers['content-type'],
+    )
+    r = await c.get('/nope/browse', headers=html_accept)
+    check(
+        'an unknown profile reads as a page in a browser too',
+        r.status_code == 404 and 'Not found' in r.text and 'unknown profile' in r.text,
+    )
+
+    home = (await c.get('/')).text
+    check('the index links each profile into the browse pages', '/kobo-clara-bw/browse' in home)
+    check('the index still shows the catalog URL for readers', '/kobo-clara-bw/catalog' in home)
+    check('the index does not name itself twice in the tab', '<title>Inksetter</title>' in home)
+
+
+def _grid_columns(width: float) -> int:
+    track = max(web.GRID_MIN, (width - (web.GRID_COLUMNS - 1) * web.GRID_GAP) / web.GRID_COLUMNS)
+    n = 1
+    while (n + 1) * track + n * web.GRID_GAP <= width:
+        n += 1
+    return n
+
+
+def check_grid_columns() -> None:
+    check(
+        'the css says a fifth of the row, gaps taken out',
+        'calc((100% - 64px)/5)' in web.CSS,
+        next((ln for ln in web.CSS.splitlines() if ln.startswith('.grid{')), 'no .grid rule'),
+    )
+    check('a full-width window shows five covers', _grid_columns(1000 - 48) == 5)
+    check('and a window twice that still shows five', _grid_columns(2000) == 5)
+    check('and one ten times that still shows five', _grid_columns(10000) == 5)
+    narrow = {w: _grid_columns(w) for w in (343, 500, 700)}
+    check(
+        'a narrow window drops rather than squeezing below the floor',
+        narrow == {343: 2, 500: 3, 700: 4},
+        f'{narrow}',
+    )
+    check(
+        'no width anywhere overflows the cap',
+        max(_grid_columns(w) for w in range(200, 4000, 7)) == web.GRID_COLUMNS,
+        f'max {max(_grid_columns(w) for w in range(200, 4000, 7))}',
+    )
+
+
+def _entries_of(archive: bytes) -> dict[str, bytes]:
+    z = zipfile.ZipFile(io.BytesIO(archive))
+    return {n: z.read(n) for n in z.namelist()}
+
+
+def check_repack_progress() -> None:
+    seen = []
+    blob = _cbz_bytes(4)
+    out = b''.join(
+        cbz.repack_iter(
+            io.BytesIO(blob),
+            profiles.PROFILES['kobo-clara-bw'],
+            1,
+            progress=lambda done, total: seen.append((done, total)),
+        )
+    )
+    check('a repack reports before it has done anything', seen[:1] == [(0, 4)], f'{seen[:1]}')
+    check('it counts every page exactly once, in order', seen == [(n, 4) for n in range(5)], f'{seen}')
+    check('and the archive it produced is still whole', len(zipfile.ZipFile(io.BytesIO(out)).namelist()) == 5)
+
+    big = _cbz_bytes(8)
+    one, many = [], []
+    b1 = b''.join(
+        cbz.repack_iter(
+            io.BytesIO(big),
+            profiles.PROFILES['kobo-clara-bw'],
+            1,
+            progress=lambda done, total: one.append((done, total)),
+        )
+    )
+    b2 = b''.join(
+        cbz.repack_iter(
+            io.BytesIO(big),
+            profiles.PROFILES['kobo-clara-bw'],
+            3,
+            progress=lambda done, total: many.append((done, total)),
+        )
+    )
+    check('eight pages are counted one by one', one == [(n, 8) for n in range(9)], f'{one}')
+    check('the pooled repack counts the same way', many == one, f'{many}')
+    check('and produces the same entries as the serial one', _entries_of(b2) == _entries_of(b1))
+
+    counted = []
+    cover = fake_page(9, 800, 1200)
+    b3 = b''.join(
+        cbz.repack_iter(
+            io.BytesIO(blob),
+            profiles.PROFILES['kobo-clara-bw'],
+            1,
+            cover=cover,
+            progress=lambda done, total: counted.append((done, total)),
+        )
+    )
+    check('a prepended cover is counted as a page too', counted[-1] == (5, 5), f'{counted[-1]}')
+    check('and it really is in the archive', len(zipfile.ZipFile(io.BytesIO(b3)).namelist()) == 6)
+
+    no_cb = b''.join(cbz.repack_iter(io.BytesIO(blob), profiles.PROFILES['kobo-clara-bw'], 1))
+    check('watching a repack does not change what it produces', _entries_of(no_cb) == _entries_of(out))
+
+
+def check_job_board() -> None:
+    board = app_mod.Jobs(limit=3, ttl=900.0)
+    board.set('a', stage='fetching')
+    check('a job can be read back', board.get('a')['stage'] == 'fetching')
+    board.set('a', stage='repacking', done=7, total=9)
+    check('and updated in place', board.get('a') == {'stage': 'repacking', 'done': 7, 'total': 9})
+    check('an unknown job is unknown', board.get('zzz') is None)
+    check('a bogus id is refused outright', (board.set('../etc', stage='x'), board.get('../etc'))[1] is None)
+    check('an over-long id is refused too', (board.set('x' * 65, stage='x'), board.get('x' * 65))[1] is None)
+    for name in ('b', 'c', 'd', 'e'):
+        board.set(name, stage='fetching')
+    check('the board cannot grow past its limit', len(board._board) == 3, f'{len(board._board)}')
+    check('and it is the oldest that goes', board.get('a') is None and board.get('e') is not None)
+
+    stale = app_mod.Jobs(limit=8, ttl=-1.0)
+    stale.set('old', stage='fetching')
+    stale.set('new', stage='fetching')
+    check('an entry older than the ttl is swept', stale.get('old') is None)
+
+
+async def check_logo(c) -> None:
+    packaged = pathlib.Path(app_mod.__file__).with_name(web.LOGO).read_bytes()
+    for path in (f'/{web.LOGO}', '/favicon.ico'):
+        r = await c.get(path)
+        check(f'{path} is served', r.status_code == 200, f'status={r.status_code}')
+        check(f'{path} is a png', r.headers['content-type'] == 'image/png')
+        check(f'{path} is the packaged file, byte for byte', r.content == packaged, f'{len(r.content)} bytes')
+        check(f'{path} is cacheable', 'max-age' in r.headers.get('cache-control', ''))
+
+    im = pyvips.Image.new_from_buffer(packaged, '')
+    check('the logo is square and has transparency', im.width == im.height and im.hasalpha(), f'{im.width}x{im.height}')
+
+    home = (await c.get('/')).text
+    feed = (await c.get('/kobo-clara-bw/browse')).text
+    for name, html in (('landing', home), ('browse', feed)):
+        check(f'the {name} page declares the icon', 'rel="icon" type="image/png"' in html)
+        check(f'the {name} page points the icon at the served route', f'/{web.LOGO}"' in html)
+
+    check('the landing page wears the logo in its header', 'class="mark"' in home)
+    check('and the header is the big one', "class='hero'" in home)
+    check('which is centred', 'header.hero{align-items:center;justify-content:center' in web.CSS)
+    check('the opening line is its own thing, not a breadcrumb', '<p class="lede">' in home)
+    lede = re.search(r'p\.lede\{font-size:([\d.]+)px', web.CSS)
+    crumbs = re.search(r'\.crumbs\{font-size:([\d.]+)px', web.CSS)
+    check(
+        'and reads larger than the breadcrumbs it used to borrow from',
+        lede and crumbs and float(lede.group(1)) > float(crumbs.group(1)),
+        f'lede {lede.group(1) if lede else "?"}px vs crumbs {crumbs.group(1) if crumbs else "?"}px',
+    )
+    check('an inner page does not repeat the hero', 'class="mark"' not in feed and "class='hero'" not in feed)
+    check(
+        'the logo rides in its own request, not inside the page',
+        'data:image' not in home and len(home) < 60_000,
+        f'{len(home)} bytes',
+    )
+    err = (await c.get('/nope/browse', headers={'accept': 'text/html'})).text
+    check('even an error page gets a favicon', 'rel="icon"' in err)
+
+
+def check_landing_groups() -> None:
+    titles = [t for t, _ in web.GROUPS]
+    placed = {n: web.group_of(p) for n, p in profiles.PROFILES.items()}
+    check('every profile lands in a group', set(placed.values()) <= set(titles), f'{set(placed.values())}')
+    check('and no group is left empty', set(placed.values()) == set(titles), f'{set(titles) - set(placed.values())}')
+
+    by_group: dict[str, list[str]] = {t: [] for t in titles}
+    for name, title in placed.items():
+        by_group.setdefault(title, []).append(name)
+    check(
+        'the panel sorts the devices, not the names',
+        all(profiles.PROFILES[n].panel == 'kaleido' for n in by_group['Colour'])
+        and all(profiles.PROFILES[n].panel == 'mono' for n in by_group['Black and white']),
+    )
+    check(
+        'a webtoon profile is filed as webtoon, not as the colour panel it runs on',
+        {n for n, p in profiles.PROFILES.items() if p.fit == 'width'} == set(by_group['Webtoon'])
+        and all(profiles.PROFILES[n].panel == 'kaleido' for n in by_group['Webtoon']),
+        f'{sorted(by_group["Webtoon"])}',
+    )
+    check(
+        'a profile that renders nothing is not called black and white',
+        by_group['No processing'] == ['passthrough'],
+        f'{by_group["No processing"]}',
+    )
+
+    home = web.index('http://proxy.test', sorted(profiles.PROFILES.items()))
+    for title in titles:
+        check(f'the page has a {title.lower()} section', f'>{title}<' in home)
+    shown = re.findall(r'<h2 class="group">([^<]+)<span>(\d+)</span>', home)
+    check(
+        'each heading counts what is under it',
+        [(t, str(len(by_group[t]))) for t in titles] == shown,
+        f'{shown}',
+    )
+    check(
+        'every profile is still listed exactly once',
+        [home.count(f'/{n}/browse') for n in profiles.PROFILES] == [1] * len(profiles.PROFILES),
+    )
+    check(
+        'and still shows its catalog URL',
+        all(f'/{n}/catalog' in home for n in profiles.PROFILES),
+    )
+    order = re.findall(r'href="http://proxy\.test/([\w-]+)/browse"', home)
+    check(
+        'names run alphabetically inside a group',
+        all(sorted(by_group[t]) == [n for n in order if placed[n] == t] for t in titles),
+    )
+    walked = list(dict.fromkeys(placed[n] for n in order))
+    check(
+        'the groups run in the declared order, each one only once',
+        walked == [t for t in titles if by_group[t]],
+        f'{walked}',
+    )
+
+
+def check_progress_script() -> None:
+    p = profiles.PROFILES['kobo-clara-bw']
+    item = web.Item(title='V1', href='/kobo-clara-bw/dl/tok', cover=None, note='', download=True)
+    feed = web.Feed(title='S', items=(item,), search=None, up=None, nxt=None, prev=None)
+    html = web.page(feed, p, 'http://proxy.test')
+    check('a page with downloads carries the script', '<script>' in html)
+    check(
+        'and points it at the status route for this profile',
+        'data-status="http://proxy.test/kobo-clara-bw/dl-status/"' in html,
+    )
+    check('the plain link survives for a browser without js', 'href="/kobo-clara-bw/dl/tok"' in html)
+
+    shown = list(web.STAGE_LABELS.values())
+    check(
+        'every stage the badge can show reads as a capitalised word',
+        all(s and s[0].isupper() for s in shown),
+        f'{[s for s in shown if not (s and s[0].isupper())]}',
+    )
+    check(
+        'the wire stages stay lower case, so the protocol is unchanged',
+        all(k.islower() for k in web.STAGE_LABELS),
+        f'{[k for k in web.STAGE_LABELS if not k.islower()]}',
+    )
+    missing = [s for s in shown if f'"{s}"' not in html]
+    check('the script is handed every label', not missing, f'{missing}')
+    body = html.split('<script>')[1].split('</script>')[0]
+    skeleton = body.replace(json.dumps(web.STAGE_LABELS).replace('<', '\\u003c'), '')
+    spoken = {s.lower() for s in shown}
+    hardcoded = [q for q in re.findall(r"'([^']*)'", skeleton) if q.lower() in spoken]
+    check(
+        'and speaks no stage of its own, in any case',
+        not hardcoded,
+        f'{hardcoded}',
+    )
+    check(
+        'and every stage the server reports has a label',
+        {'starting', 'fetching', 'repacking', 'done', 'error'} <= set(web.STAGE_LABELS),
+    )
+
+    nav = web.Item(title='S', href='/kobo-clara-bw/b/tok', cover=None, note='', download=False)
+    grid = web.page(
+        web.Feed(title='S', items=(nav,), search=None, up=None, nxt=None, prev=None), p, 'http://proxy.test'
+    )
+    check('a page with nothing to download carries no script', '<script>' not in grid)
+    check('and no status hook either', 'data-status' not in grid)
+
+
+def _crumbs(html: str) -> tuple[list[tuple[str, str]], str]:
+    nav = re.search(r'<nav class="crumbs">(.*?)</nav>', html, re.S)
+    inner = nav.group(1) if nav else ''
+    here = re.search(r'<b>([^<]*)</b>', inner)
+    return re.findall(r'<a href="([^"]*)">([^<]*)</a>', inner), (here.group(1) if here else '')
+
+
+async def check_trail(c) -> None:
+    up = 'http://127.0.0.1:8899'
+    nav = encode_token(f'{up}/opds/v1.2/nav')
+
+    top = (await c.get(f'/kobo-clara-bw/b/{nav}')).text
+    links, here = _crumbs(top)
+    check(
+        'with no trail yet, only the feed\'s own rel="up" stands in',
+        here == 'Shelves' and [t for _, t in links] == ['Profiles', 'Up'],
+        f'{[t for _, t in links]}',
+    )
+
+    step = re.search(r'<a class="t" href="([^"]+)"', top).group(1).replace('&amp;', '&')
+    check('a navigation link carries a trail', f'{web.TRAIL_PARAM}=' in step, step[-40:])
+
+    mid = (await c.get(step.replace('http://proxy.test', ''))).text
+    links, here = _crumbs(mid)
+    titles = [t for _, t in links]
+    check(
+        'one level down, the parent becomes a crumb', here == 'Manga' and titles == ['Profiles', 'Shelves'], f'{titles}'
+    )
+    check(
+        'and that crumb points back at the parent',
+        len(links) > 1 and f'/kobo-clara-bw/b/{nav}' in links[1][0],
+        links[1][0] if len(links) > 1 else 'no crumb',
+    )
+
+    step2 = re.search(r'<a class="t" href="([^"]+)"', mid).group(1).replace('&amp;', '&')
+    deep = (await c.get(step2.replace('http://proxy.test', ''))).text
+    links, here = _crumbs(deep)
+    check(
+        'two levels down, the whole walk is on show',
+        here == 'Fake' and [t for _, t in links] == ['Profiles', 'Shelves', 'Manga'],
+        f'{[t for _, t in links]}',
+    )
+    deep_links = links + [('', '')] * 3
+    check(
+        'the first crumb drops the trail it no longer needs',
+        f'{web.TRAIL_PARAM}=' not in deep_links[1][0],
+        deep_links[1][0],
+    )
+    own = web.decode_trail(deep_links[2][0].partition(f'{web.TRAIL_PARAM}=')[2])
+    check(
+        'while the second keeps just its own ancestors',
+        len(own) == 1 and own[0][1] == 'Shelves',
+        f'{[t for _, t in own]}',
+    )
+
+    back = (await c.get(deep_links[1][0].replace('http://proxy.test', '') or '/')).text
+    _, here = _crumbs(back)
+    check('clicking a crumb lands back on that page', here == 'Shelves')
+
+    check('a download link is not burdened with a trail', f'?{web.TRAIL_PARAM}=' not in _dl_href(deep))
+    nxt = re.search(r'<a href="([^"]*)">Next', top)
+    check(
+        "next keeps the page's own trail, not its children's",
+        nxt is not None and f'{web.TRAIL_PARAM}=' not in nxt.group(1),
+        nxt.group(1) if nxt else 'no next',
+    )
+
+    junk = await c.get(f'/kobo-clara-bw/b/{nav}', params={web.TRAIL_PARAM: 'not~valid~base64!!'})
+    check(
+        'a corrupt trail is dropped, not fatal',
+        junk.status_code == 200 and _crumbs(junk.text)[1] == 'Shelves',
+        f'status={junk.status_code}',
+    )
+    check('and is never echoed back into a link', 'not~valid~base64' not in junk.text)
+
+    hostile = web.encode_trail([('javascript:alert(1)', 'Evil'), ('../../etc', 'Worse')])
+    r = await c.get(f'/kobo-clara-bw/b/{nav}', params={web.TRAIL_PARAM: hostile})
+    check(
+        'a trail cannot smuggle a link of its own onto the page',
+        'javascript:' not in r.text and '../../etc' not in r.text,
+    )
+
+    pairs12 = [(encode_token(f'{up}/opds/v1.2/n{i}'), f'L{i}') for i in range(12)]
+    long_trail = web.encode_trail(pairs12)
+    links, _ = _crumbs((await c.get(f'/kobo-clara-bw/b/{nav}', params={web.TRAIL_PARAM: long_trail})).text)
+    check(
+        'a trail cannot grow without bound',
+        len(links) == web.TRAIL_MAX + 1,
+        f'{len(links) - 1} crumbs, cap {web.TRAIL_MAX}',
+    )
+    written = base64.urlsafe_b64decode(long_trail + '=' * (-len(long_trail) % 4)).decode()
+    check(
+        'and it is capped where it is written, not only where it is read',
+        written.count('\n') + 1 == web.TRAIL_MAX,
+        f'{written.count(chr(10)) + 1} entries written',
+    )
+
+    form = re.search(r'<form class="q".*?</form>', deep, re.S).group(0)
+    check('the search form carries the trail forward too', f'name="{web.TRAIL_PARAM}"' in form)
+
+
+def _dl_href(html: str) -> str:
+    found = re.search(r'<a class="dl" href="([^"]*)"', html)
+    return found.group(1) if found else ''
+
+
 def check(name: str, ok: bool, detail: str = '') -> None:
     (PASS if ok else FAIL).append(name)
     print(f'  {"PASS" if ok else "FAIL"}  {name}{"  " + detail if detail else ""}')
@@ -3609,6 +4236,16 @@ async def main() -> int:
         )
         r = await c.get(f'/kindle-scribe-colorsoft/pf/{pf}', params={'maxWidth': '{maxWidth}'})
         check('/pf/ tolerates an unsubstituted maxWidth', r.status_code == 200, f'status={r.status_code}')
+
+        print('browse pages')
+        await check_browse(c)
+        await check_trail(c)
+        await check_logo(c)
+        check_grid_columns()
+        check_repack_progress()
+        check_job_board()
+        check_progress_script()
+        check_landing_groups()
 
     print('repack + profile config')
     jc = dataclasses.replace(profiles.PROFILES['kindle-scribe-colorsoft'], fmt='jpegc', auto_mono=False)

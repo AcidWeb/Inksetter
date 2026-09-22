@@ -73,7 +73,7 @@ def _run_serial(jobs, zout, profile: Profile):
     for job in jobs:
         if job[0] == 'copy':
             _emit(zout, job, None)
-            yield
+            yield job[0]
             continue
         try:
             blob, _ = render_page(job[3], profile)
@@ -81,24 +81,25 @@ def _run_serial(jobs, zout, profile: Profile):
             log.warning('page %s failed to render; shipping it unchanged', job[2], exc_info=True)
             blob = None
         _emit(zout, job, blob)
-        yield
+        yield job[0]
 
 
 def _run_pooled(jobs, zout, profile: Profile, workers: int):
     window = max(2, workers * 2)
     pending: collections.deque = collections.deque()
 
-    def flush_one() -> None:
+    def flush_one() -> str:
         job, fut = pending.popleft()
         if fut is None:
             _emit(zout, job, None)
-            return
+            return job[0]
         try:
             blob, _ = fut.result()
         except Exception:
             log.warning('page %s failed to render; shipping it unchanged', job[2], exc_info=True)
             blob = None
         _emit(zout, job, blob)
+        return job[0]
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers, thread_name_prefix='repack') as pool:
         try:
@@ -106,11 +107,9 @@ def _run_pooled(jobs, zout, profile: Profile, workers: int):
                 fut = None if job[0] == 'copy' else pool.submit(render_page, job[3], profile)
                 pending.append((job, fut))
                 while len(pending) >= window:
-                    flush_one()
-                    yield
+                    yield flush_one()
             while pending:
-                flush_one()
-                yield
+                yield flush_one()
         except BaseException:
             for _, fut in pending:
                 if fut is not None:
@@ -146,15 +145,17 @@ def repack_iter(
     *,
     cover: bytes | None = None,
     comicinfo=None,
+    progress=None,
 ):
     zin = zipfile.ZipFile(src)
     infos = [i for i in zin.infolist() if not i.is_dir()]
     declared = sum(i.file_size for i in infos)
     names = sorted((i.filename for i in infos), key=natural_key)
+    images = sum(1 for x in names if is_image(x))
     log.info(
         'repack: %d entries, %d image(s), %.0f MB declared, %d worker(s)',
         len(infos),
-        sum(1 for x in names if is_image(x)),
+        images,
         declared / 1e6,
         workers,
     )
@@ -171,13 +172,21 @@ def repack_iter(
     meta_blob = None
     if comicinfo is not None and not any(n.lower().endswith(_COMICINFO) for n in names):
         try:
-            meta_blob = comicinfo(sum(1 for n in names if is_image(n)) + (lead is not None))
+            meta_blob = comicinfo(images + (lead is not None))
         except Exception:
             meta_blob = None
+
+    total_pages = images + (lead is not None)
+
+    def tell(done: int) -> None:
+        if progress is not None:
+            progress(done, total_pages)
 
     def chunks():
         begun = time.perf_counter()
         written = 0
+        pages = 0
+        tell(0)
         try:
             sink = _StreamSink()
             zout = zipfile.ZipFile(sink, 'w', zipfile.ZIP_STORED)
@@ -197,9 +206,14 @@ def repack_iter(
                         block = sink.drain()
                         if block:
                             yield block
+                    pages += 1
+                    tell(pages)
 
-                for _ in _run(_entries(zin, names), zout, profile, workers):
+                for kind in _run(_entries(zin, names), zout, profile, workers):
                     written += 1
+                    if kind == 'page':
+                        pages += 1
+                        tell(pages)
                     block = sink.drain()
                     if block:
                         yield block
