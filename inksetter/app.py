@@ -161,7 +161,7 @@ async def _serve_feed(request: Request, profile_name: str, url: str) -> Response
     ctype = resp.headers.get('content-type', '')
     page_mime = None if p.fmt == 'raw' else p.mime
     if rewrite.is_feed(ctype):
-        body = rewrite.rewrite(resp.content, ctype, _ctx(request, profile_name, url), page_mime)
+        body = rewrite.rewrite(resp.content, ctype, _ctx(request, profile_name, url), page_mime, not p.resliced)
     else:
         body = resp.content
     return Response(content=body, media_type=ctype or 'application/atom+xml')
@@ -289,6 +289,10 @@ def _query_int(raw: str, default: int = 0) -> int:
 @app.api_route('/{profile}/p/{token}', methods=['GET', 'HEAD'])
 async def page(profile: str, token: str, request: Request, page: str = '0', maxWidth: str = '0'):
     p = _profile_or_404(profile)
+    if p.resliced:
+        raise UpstreamError(
+            404, 'this profile does not stream pages: download the book, which is re-cut for the screen'
+        )
     template = rewrite.decode_token(token)
     headers = request_headers(request.headers)
     page_no = _query_int(page)

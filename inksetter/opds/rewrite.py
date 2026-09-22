@@ -201,7 +201,7 @@ def _rewrite_link(link, ctx: Ctx, page_mime: str | None, cover: str | None) -> N
         link.set('type', page_mime)
 
 
-def rewrite_atom(body: bytes, ctx: Ctx, page_mime: str | None) -> bytes:
+def rewrite_atom(body: bytes, ctx: Ctx, page_mime: str | None, stream: bool = True) -> bytes:
     root = root_or_none(body)
     if root is None:
         return body
@@ -211,6 +211,11 @@ def rewrite_atom(body: bytes, ctx: Ctx, page_mime: str | None) -> bytes:
             href = (el.text or '').strip()
             if href:
                 el.text = map_href(href, 'img', ctx)
+
+    if not stream:
+        for link in list(root.iter(f'{{{ATOM}}}link')):
+            if link.get('href') and classify(link.get('rel'), link.get('type'), link.get('href')) == 'p':
+                link.getparent().remove(link)
 
     done: set = set()
     for entry in root.iter(f'{{{ATOM}}}entry'):
@@ -270,30 +275,41 @@ def _publication_cover(node: dict) -> str | None:
     return None
 
 
+def _json_kind(node: dict, container: str | None) -> str:
+    type_ = node.get('type')
+    if container == 'images':
+        return 'img'
+    if container == 'pages':
+        return 'pf' if (type_ or '').lower().startswith('image/') else 'dl'
+    return classify(_rel_string(node.get('rel')), type_, node['href'])
+
+
 def _walk_json(
     node,
     ctx: Ctx,
     page_mime: str | None,
     container: str | None = None,
     cover: str | None = None,
+    stream: bool = True,
 ):
     if isinstance(node, list):
+        if not stream:
+            node[:] = [
+                item
+                for item in node
+                if not (
+                    isinstance(item, dict) and isinstance(item.get('href'), str) and _json_kind(item, container) == 'p'
+                )
+            ]
         for item in node:
-            _walk_json(item, ctx, page_mime, container, cover)
+            _walk_json(item, ctx, page_mime, container, cover, stream)
         return
     if not isinstance(node, dict):
         return
 
     href = node.get('href')
     if isinstance(href, str):
-        type_ = node.get('type')
-        if container == 'images':
-            kind = 'img'
-        elif container == 'pages':
-            kind = 'pf' if (type_ or '').lower().startswith('image/') else 'dl'
-        else:
-            kind = classify(_rel_string(node.get('rel')), type_, href)
-
+        kind = _json_kind(node, container)
         node['href'] = map_href(href, kind, ctx, search_style='opds2', cover=cover)
         if kind in ('p', 'pf') and page_mime:
             node['type'] = page_mime
@@ -316,15 +332,15 @@ def _walk_json(
             sub = container
         else:
             sub = None
-        _walk_json(value, ctx, page_mime, sub, own_cover if key == 'links' else None)
+        _walk_json(value, ctx, page_mime, sub, own_cover if key == 'links' else None, stream)
 
 
-def rewrite_json(body: bytes, ctx: Ctx, page_mime: str | None) -> bytes:
+def rewrite_json(body: bytes, ctx: Ctx, page_mime: str | None, stream: bool = True) -> bytes:
     try:
         doc = json.loads(body)
     except ValueError:
         return body
-    _walk_json(doc, ctx, page_mime)
+    _walk_json(doc, ctx, page_mime, stream=stream)
     return json.dumps(doc, ensure_ascii=False).encode('utf-8')
 
 
@@ -333,19 +349,19 @@ def rewrite_json(body: bytes, ctx: Ctx, page_mime: str | None) -> bytes:
 # --------------------------------------------------------------------------
 
 
-def rewrite(body: bytes, content_type: str, ctx: Ctx, page_mime: str | None) -> bytes:
+def rewrite(body: bytes, content_type: str, ctx: Ctx, page_mime: str | None, stream: bool = True) -> bytes:
     ct = (content_type or '').lower()
     if 'opensearchdescription' in ct:
         return rewrite_opensearch(body, ctx)
     if any(j in ct for j in JSON_TYPES):
-        return rewrite_json(body, ctx, page_mime)
+        return rewrite_json(body, ctx, page_mime, stream)
     if 'xml' in ct:
-        return rewrite_atom(body, ctx, page_mime)
+        return rewrite_atom(body, ctx, page_mime, stream)
     head = body.lstrip()[:1]
     if head == b'{':
-        return rewrite_json(body, ctx, page_mime)
+        return rewrite_json(body, ctx, page_mime, stream)
     if head == b'<':
-        return rewrite_atom(body, ctx, page_mime)
+        return rewrite_atom(body, ctx, page_mime, stream)
     return body
 
 

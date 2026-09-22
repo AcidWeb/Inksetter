@@ -321,7 +321,7 @@ def repack_iter(
         except Exception:
             meta_blob = None
 
-    strip = profile.reslice and profile.fit == 'width'
+    strip = profile.resliced
     pad = STRIP_PAD if strip else 4
     if strip:
         log.info('repack: re-cutting the strip into %d px pages', round(profile.width * profile.aspect))

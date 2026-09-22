@@ -153,6 +153,10 @@ class Profile:
         return self.auto_mono_fmt if self.auto_mono_fmt in ('png4', 'png8') else 'png4'
 
     @property
+    def resliced(self) -> bool:
+        return self.reslice and self.fit == 'width'
+
+    @property
     def chroma_sigma(self) -> float:
         if self.chroma_blur > 0:
             return self.chroma_blur

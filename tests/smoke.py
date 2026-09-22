@@ -3695,6 +3695,79 @@ def _decoded(token: str) -> tuple[str, str | None]:
         return '', None
 
 
+async def check_no_stream(c) -> None:
+    up = 'http://127.0.0.1:8899'
+    strip = profiles.PROFILES['kindle-colorsoft-webtoon']
+    check('premise: the webtoon profile is re-sliced', strip.resliced)
+    check('a strip kept whole is not re-sliced', not dataclasses.replace(strip, reslice=False).resliced)
+    check('a paged fit is never re-sliced, whatever it asks', not dataclasses.replace(strip, fit='box').resliced)
+
+    r = await c.get(f'/{strip.name}/catalog')
+    feed = r.text
+    check('a webtoon catalog is served', r.status_code == 200, f'status={r.status_code}')
+    check('a webtoon feed offers no page stream', f'/{strip.name}/p/' not in feed and PSE_REL not in feed)
+    check('nor the pse:count and pse:lastRead that go with it', 'pse:count' not in feed and 'pse:lastRead' not in feed)
+    check('nor a stream placeholder', '{pageNumber}' not in feed and '{maxWidth}' not in feed)
+    check(
+        'the feed, download, cover and search links stay',
+        all(f'/{strip.name}/{k}/' in feed for k in ('f', 'dl', 'img', 'osd')),
+    )
+    check('no upstream host leaks from a webtoon feed', up not in feed)
+
+    token = encode_token(f'{up}/opds/v1.2/books/7/pages/{{pageNumber}}?zero_based=true&maxWidth={{maxWidth}}')
+    kept = dataclasses.replace(strip, name='smoke-webtoon-kept', reslice=False)
+    profiles.PROFILES[kept.name] = kept
+    try:
+        r = await c.get(f'/{kept.name}/catalog')
+        found = re.search(rf'/{kept.name}/p/([\w-]+)\?page=', r.text)
+        check('a width-fit profile that keeps the strip still streams', found is not None and 'pse:count="3"' in r.text)
+        check(
+            'premise: the refusal below uses the token the feed offers', found is not None and found.group(1) == token
+        )
+        r = await c.get(f'/{kept.name}/p/{token}', params={'page': 0, 'maxWidth': strip.width})
+        check('and its stream serves a page', r.status_code == 200 and r.headers['content-type'].startswith('image/'))
+    finally:
+        del profiles.PROFILES[kept.name]
+
+    r = await c.get(f'/{strip.name}/p/{token}', params={'page': 0, 'maxWidth': strip.width})
+    check('the stream route refuses a webtoon profile', r.status_code == 404, f'status={r.status_code}')
+    said = r.json().get('error', '') if r.headers.get('content-type', '').startswith('application/json') else ''
+    check('and says to download the book instead', 'download' in said, f'{said!r}')
+    r = await c.request('HEAD', f'/{strip.name}/p/{token}', params={'page': 0})
+    check('HEAD is refused alike', r.status_code == 404, f'status={r.status_code}')
+    r = await c.get(f'/{strip.name}/p/' + encode_token(f'{up}/opds/v1.2/upstream500'))
+    check('the refusal comes before the upstream is asked', r.status_code == 404, f'status={r.status_code}')
+
+    ctx = rewrite.Ctx(profile=strip.name, public_base='http://proxy.test', base_url=f'{up}/opds/v2/catalog')
+    doc = {
+        'links': [{'rel': 'self', 'href': '/opds/v2/catalog', 'type': 'application/opds+json'}],
+        'publications': [
+            {
+                'metadata': {'title': 'Vol 1'},
+                'links': [
+                    {
+                        'rel': 'http://opds-spec.org/acquisition',
+                        'href': '/opds/v1.2/books/7/file',
+                        'type': 'application/vnd.comicbook+zip',
+                    },
+                    {'rel': [PSE_REL], 'href': '/opds/v1.2/books/7/stream', 'type': 'image/jpeg'},
+                    {'href': '/opds/v1.2/books/7/pages/{pageNumber}', 'type': 'image/jpeg', 'templated': True},
+                ],
+            }
+        ],
+    }
+    body = json.dumps(doc).encode()
+    on = json.loads(rewrite.rewrite(body, 'application/opds+json', ctx, 'image/png'))
+    off = json.loads(rewrite.rewrite(body, 'application/opds+json', ctx, 'image/png', stream=False))
+    check(
+        'premise: both OPDS 2 stream links map to /p/ when streaming',
+        sum('/p/' in link['href'] for link in on['publications'][0]['links']) == 2,
+    )
+    kinds = [link['href'].split('/')[4] for link in off['publications'][0]['links']]
+    check('OPDS 2 drops a stream link found by rel or by placeholder, and only those', kinds == ['dl'], f'{kinds}')
+    check('the feed-level links are untouched', '/f/' in off['links'][0]['href'])
+
+
 async def check_browse(c) -> None:
     up = 'http://127.0.0.1:8899'
     r = await c.get('/kobo-clara-hd-2e-bw/browse')
@@ -4790,6 +4863,9 @@ async def main() -> int:
         )
         r = await c.get(f'/kindle-scribe-colorsoft/pf/{pf}', params={'maxWidth': '{maxWidth}'})
         check('/pf/ tolerates an unsubstituted maxWidth', r.status_code == 200, f'status={r.status_code}')
+
+        print('webtoon profiles do not stream')
+        await check_no_stream(c)
 
         print('browse pages')
         await check_browse(c)
