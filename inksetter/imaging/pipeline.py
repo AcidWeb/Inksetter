@@ -47,6 +47,8 @@ PIPELINE_VERSION = '2'
 
 _BAYER_N = 8
 
+NO_HEIGHT_CAP = 10_000_000
+
 
 def _bayer(n: int = _BAYER_N) -> np.ndarray:
     m = np.array([[0]], dtype=np.float32)
@@ -490,7 +492,7 @@ def _geometry(buf: bytes, p: Profile, tw: int, th: int, mono: bool, page: pyvips
                 )
         im = im.thumbnail_image(
             tw,
-            height=10_000_000 if width_fit else th,
+            height=NO_HEIGHT_CAP if width_fit else th,
             size='down',
             linear=p.linear_light,
         )
@@ -733,10 +735,28 @@ def _norm_grid(buf: bytes, w: int = 72, h: int = 96) -> np.ndarray:
     return (a - a.mean()) / (float(a.std()) + 1e-6)
 
 
+def open_image(buf: bytes) -> pyvips.Image:
+    return _open(buf)
+
+
+def fit_to_width(im: pyvips.Image, width: int, p: Profile) -> pyvips.Image:
+    scale = width / im.width
+    if scale < 1.0:
+        im = im.thumbnail_image(width, height=NO_HEIGHT_CAP, size='down', linear=p.linear_light)
+    elif scale > 1.0:
+        im = im.resize(scale, kernel=p.upscale_kernel)
+    if im.width > width:
+        im = im.crop(0, 0, width, im.height)
+    elif im.width < width:
+        im = im.embed(0, 0, width, im.height, extend='copy')
+    return im
+
+
 def render_page(
     buf: bytes,
     p: Profile,
     max_width: int | None = None,
+    source: pyvips.Image | None = None,
 ) -> tuple[bytes, str]:
     if p.fmt == 'raw':
         log.debug('render: fmt=raw, %d kB passed through untouched', len(buf) // 1024)
@@ -751,9 +771,9 @@ def render_page(
 
     if not p.is_colour:
         log.debug('render: %s %dx%d, mono profile -> %s', p.name, tw, th, p.fmt)
-        return _summarise(_render_mono(buf, p, tw, th, p.fmt), buf, p, started, 'mono')
+        return _summarise(_render_mono(buf, p, tw, th, p.fmt, page=source), buf, p, started, 'mono')
 
-    page = _open(buf).autorot()
+    page = source if source is not None else _open(buf).autorot()
     if p.auto_mono and (chroma := _chroma_of(page)) < p.mono_chroma_threshold:
         log.debug(
             'render: %s %dx%d, chroma %.3f < %.1f -> mono %s',

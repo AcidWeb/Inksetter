@@ -2888,6 +2888,465 @@ def check_profile_source() -> None:
 LF = chr(10)
 
 
+def _strip_cbz(heights, width=800, gutter=None, noise=0) -> bytes:
+    gutters = [gutter] if isinstance(gutter, tuple) else list(gutter or [])
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w') as z:
+        z.writestr('ComicInfo.xml', '<ComicInfo/>')
+        for i, h in enumerate(heights):
+            yy, xx = np.mgrid[0:h, 0:width]
+            rgb = np.full((h, width, 3), (240, 238, 232), np.uint8)
+            rgb[(yy // 5 + xx // 5) % 3 == 0] = (40 + (i * 7) % 180, 90, 200 - (i * 5) % 150)
+            rgb[((yy % 97) < 3) & (xx < width * 3 // 4)] = (25, 25, 30)
+            for g in gutters:
+                at, row = g[0], g[1]
+                depth = g[2] if len(g) > 2 else 24
+                colour = np.array(g[3] if len(g) > 3 else (255, 255, 255), np.int16)
+                grain = g[4] if len(g) > 4 else noise
+                if at == i:
+                    span = rgb[row : row + depth]
+                    jitter = np.random.default_rng(i).integers(0, grain + 1, span.shape)
+                    span[:] = np.clip(colour - jitter, 0, 255).astype(np.uint8)
+            z.writestr(
+                f'{i:04d}.png', pyvips.Image.new_from_memory(rgb.tobytes(), width, h, 3, 'uchar').pngsave_buffer()
+            )
+    return buf.getvalue()
+
+
+def _pages_of(blob: bytes):
+    z = zipfile.ZipFile(io.BytesIO(blob))
+    out = []
+    for n in sorted(z.namelist()):
+        if n.lower().endswith(('.png', '.jpg')):
+            im = pyvips.Image.new_from_buffer(z.read(n), '')
+            out.append((n, im.width, im.height))
+    return out
+
+
+def _panel_strip(*segments, width=1272, seed=7):
+    rng = np.random.default_rng(seed)
+    parts = []
+    for kind, n in segments:
+        if kind == 'art':
+            parts.append(rng.integers(0, 256, (n, width, 3), dtype=np.uint8))
+        elif kind == 'white':
+            parts.append(np.full((n, width, 3), 255, np.uint8))
+        elif kind == 'grey':
+            parts.append(np.full((n, width, 3), 154, np.uint8))
+        elif kind == 'bubble':
+            b = np.full((n, width, 3), 255, np.uint8)
+            b[:, 387:391] = 20
+            b[:, 1203:1208] = 20
+            parts.append(b)
+    return np.concatenate(parts)
+
+
+def check_seam_defects() -> None:
+    p = profiles.PROFILES['kindle-colorsoft-webtoon']
+    L = round(p.width * p.aspect)
+
+    row = _panel_strip(('bubble', 1))
+    check(
+        'the test bubble reproduces the trap: invisible to every-8th-column sampling',
+        int(row[:, ::8].max()) - int(row[:, ::8].min()) == 0,
+    )
+    check(
+        'but its outline is seen at full resolution, so it is not quiet',
+        int(cbz._spread(row)[0]) > cbz.STRIP_QUIET and not cbz._gutter(row)[0],
+        f'spread {int(cbz._spread(row)[0])}',
+    )
+    first, bub, mid, gap = round(0.60 * L), round(0.03 * L), round(0.42 * L), round(0.10 * L)
+    blk = _panel_strip(('art', first), ('bubble', bub), ('art', mid), ('white', gap), ('art', L))
+    at = cbz._seam(blk, L)
+    check(
+        'a page is not cut through a bubble whose outline falls between samples',
+        at == first + bub + mid,
+        f'cut at {at}, bubble {first}..{first + bub}, gutter from {first + bub + mid}',
+    )
+
+    minrun = max(1, round(L * cbz.STRIP_GUTTER_MIN))
+    short = 8
+    check('an eight-row gap between lines is under the gutter minimum', short < minrun, f'minimum {minrun}')
+    blk = _panel_strip(
+        ('art', round(0.80 * L)), ('white', short), ('art', round(0.25 * L) - short), ('white', gap), ('art', L)
+    )
+    at = cbz._seam(blk, L)
+    check(
+        'a blank run too short to be a gutter - a gap between lines of text - is not cut in',
+        at == round(0.80 * L) + round(0.25 * L),
+        f'cut at {at}, short run of {short} at {round(0.80 * L)}, minimum {minrun}',
+    )
+
+    lo = int(L * cbz.STRIP_GUTTER_FLOOR)
+    blk = _panel_strip(('art', lo - 150), ('white', 150 + short), ('art', 2 * L))
+    at = cbz._seam(blk, L)
+    check(
+        'a gutter reaching only a few rows into the window is measured whole',
+        at == lo + short - 1,
+        f'cut at {at}, gutter {lo - 150}..{lo + short}, window from {lo}',
+    )
+
+    edge = round(1.05 * L)
+    blk = _panel_strip(('art', edge), ('grey', 1), ('white', round(0.40 * L)), ('art', L))
+    at = cbz._seam(blk, L)
+    check(
+        'a gutter that opens on a flat grey line is entered past the line',
+        at == edge + 1,
+        f'cut at {at}, grey line at {edge}, white from {edge + 1}',
+    )
+    blk = _panel_strip(('art', edge), ('grey', round(0.20 * L)), ('art', round(0.20 * L)), ('white', gap), ('art', L))
+    check(
+        'and a flat run with no blank page in it is still entered at its top',
+        cbz._seam(blk, L) == edge,
+        f'cut at {cbz._seam(blk, L)}, grey run from {edge}',
+    )
+
+
+def check_reslice() -> None:
+    p = profiles.PROFILES['kindle-colorsoft-webtoon']
+    limit = round(p.width * p.aspect)
+    floor = int(limit * cbz.STRIP_MIN_FILL)
+    check('the webtoon profiles ask to be re-cut', p.reslice and p.fit == 'width')
+
+    heights = [1280, 1000, 1000, 1, 1280, 640, 1000]
+    src = _strip_cbz(heights)
+    pages = _pages_of(b''.join(cbz.repack_iter(io.BytesIO(src), p, 1)))
+
+    check('a re-cut strip still produces pages', bool(pages), f'{len(pages)}')
+    check(
+        'every page is exactly the panel width', {w for _, w, _ in pages} == {p.width}, f'{ {w for _, w, _ in pages} }'
+    )
+    over = [h for _, _, h in pages if h > limit]
+    check('and none is taller than the panel, so the zoom stays 1.0', not over, f'{over}')
+    short = [h for _, _, h in pages[:-1] if h < floor]
+    check('nor shorter than the fill floor, bar the last', not short, f'{short}')
+
+    scaled = 0
+    for i in range(len(heights)):
+        one = pyvips.Image.new_from_buffer(zipfile.ZipFile(io.BytesIO(src)).read(f'{i:04d}.png'), '')
+        scaled += pipeline.fit_to_width(one, p.width, p).height
+    check(
+        'every row of the strip comes out again, once',
+        sum(h for _, _, h in pages) == scaled,
+        f'{sum(h for _, _, h in pages)} out vs {scaled} in',
+    )
+    check('a one-pixel entry does not derail it', 1 in heights and len(pages) >= 3)
+    check(
+        'the page numbers are wide enough to sort past 9999',
+        all(re.fullmatch(r'\d{5}\.(png|jpg)', n) for n, _, _ in pages),
+        f'{pages[0][0]}',
+    )
+    check('non-image entries are still carried over', 'ComicInfo.xml' in zipfile.ZipFile(io.BytesIO(src)).namelist())
+
+    scale = p.width / 800
+    band, deep = 990, 24
+    lo, hi = round(band * scale), round((band + deep) * scale)
+    check('the gutter really is inside the window', floor <= lo and hi <= limit, f'{lo}..{hi} in {floor}..{limit}')
+    gut = _strip_cbz([1280, 1280], gutter=(0, band))
+    cut = _pages_of(b''.join(cbz.repack_iter(io.BytesIO(gut), p, 1)))[0][2]
+    check(
+        'the cut is drawn to a quiet row rather than the nominal one',
+        lo - 6 <= cut <= hi + 6,
+        f'cut at {cut}, gutter spans {lo}..{hi}, panel would be {limit}',
+    )
+    check(
+        'and to the far side of it, so the page fills up',
+        cut >= (lo + hi) // 2,
+        f'cut at {cut}, gutter spans {lo}..{hi}',
+    )
+
+    high = _strip_cbz([1280, 1280], gutter=(0, 200))
+    first = _pages_of(b''.join(cbz.repack_iter(io.BytesIO(high), p, 1)))[0][2]
+    check(
+        'a quiet row above the floor cannot drag the cut up to it',
+        first >= floor,
+        f'page came out {first} tall, floor is {floor}',
+    )
+
+    reach = round(limit * cbz.STRIP_OVERSHOOT)
+    low = int(limit * cbz.STRIP_GUTTER_FLOOR)
+
+    def at(frac):
+        return round(frac * limit / scale)
+
+    def band(frac):
+        return round(at(frac) * scale), round((at(frac) + 24) * scale)
+
+    def tiles(blob):
+        z = zipfile.ZipFile(io.BytesIO(blob))
+        order = sorted(z.namelist(), key=cbz.natural_key)
+        return [len(t[3]) for t in cbz._strip_tiles(z, order, p, lambda _n: None) if t[0] == 'tile']
+
+    lo60, hi60 = band(0.60)
+    t = tiles(_strip_cbz([1280, 1280], gutter=(0, at(0.60))))
+    check(
+        'a gutter well above the old 85% floor now ends the page',
+        lo60 - 4 <= t[0] <= hi60 + 4 and t[0] < floor,
+        f'page {t[0]}, gutter {lo60}..{hi60}, old floor {floor}',
+    )
+    lo30, hi30 = band(0.30)
+    t = tiles(_strip_cbz([1280, 1280], gutter=(0, at(0.30))))
+    check(
+        'but one below the gutter floor still does not',
+        t[0] >= low and not (lo30 - 4 <= t[0] <= hi30 + 4),
+        f'page {t[0]}, gutter {lo30}..{hi30}, gutter floor {low}',
+    )
+    lo105, _ = band(1.05)
+    t = tiles(_strip_cbz([1280, 1280], gutter=(0, at(1.05))))
+    check(
+        'with nothing above the fold, a gutter just past it is taken',
+        limit < t[0] <= reach and lo105 - 4 <= t[0] <= lo105 + 4,
+        f'page {t[0]}, gutter starts {lo105}, panel {limit}, reach {reach}',
+    )
+    check(
+        'no page is shrunk below half size',
+        1 / cbz.STRIP_OVERSHOOT >= 0.50 - 1e-9,
+        f'overshoot {cbz.STRIP_OVERSHOOT} shrinks to {1 / cbz.STRIP_OVERSHOOT:.0%}',
+    )
+    beyond = at(cbz.STRIP_OVERSHOOT + 0.10)
+    t_far = tiles(_strip_cbz([1280, 1280], gutter=(0, beyond) if beyond < 1280 else (1, beyond - 1280)))
+    check(
+        'a gutter further past it than the overshoot is not',
+        round(beyond * scale) > reach and t_far[0] <= limit,
+        f'page {t_far[0]}, gutter at {round(beyond * scale)}, reach {reach}',
+    )
+    t = tiles(_strip_cbz([1280, 1280], gutter=[(0, at(0.60)), (0, at(1.05))]))
+    check(
+        'given a gutter either side of the fold, the unshrunk one wins',
+        lo60 - 4 <= t[0] <= hi60 + 4,
+        f'page {t[0]}',
+    )
+
+    t = tiles(_strip_cbz([1280, 1280], gutter=(0, at(0.60)), noise=12))
+    check(
+        'a gutter with a little JPEG noise in it still counts as one',
+        lo60 - 4 <= t[0] <= hi60 + 4,
+        f'page {t[0]}, gutter {lo60}..{hi60}',
+    )
+    lead_rows = round((limit + 4) / scale)
+    t = tiles(_strip_cbz([lead_rows, 1280], gutter=(1, at(1.05) - lead_rows)))
+    check(
+        'a gutter past the fold is seen even when it is still in the next slice',
+        limit < t[0] <= reach and lo105 - 4 <= t[0] <= lo105 + 4,
+        f'page {t[0]}, gutter starts {lo105}, first slice ends at {round(lead_rows * scale)}',
+    )
+    t = tiles(_strip_cbz([at(1.05)]))
+    check(
+        'the strip running out is no reason to shrink its last page',
+        len(t) == 2 and max(t) <= limit,
+        f'{t}',
+    )
+
+    def strip_of(blob):
+        z = zipfile.ZipFile(io.BytesIO(blob))
+        parts = [cbz._strip_rows(z.read(n), p) for n in sorted(z.namelist(), key=cbz.natural_key) if cbz.is_image(n)]
+        return np.concatenate([x for x in parts if x is not None])
+
+    def cut(blob):
+        z = zipfile.ZipFile(io.BytesIO(blob))
+        order = sorted(z.namelist(), key=cbz.natural_key)
+        return [t[3] for t in cbz._strip_tiles(z, order, p, lambda _n: None) if t[0] == 'tile']
+
+    def blank_rows(rows):
+        s = rows.astype(np.int16)
+        lo, hi = s.min(axis=(1, 2)), s.max(axis=(1, 2))
+        return (hi - lo <= cbz.STRIP_QUIET) & ((lo >= 235) | (hi <= 30))
+
+    def only_gutter_gone(blob):
+        """Walk the strip and the output together: whatever the output skips must be blank gutter."""
+        strip, out = strip_of(blob), np.concatenate(cut(blob))
+        blank = blank_rows(strip)
+        i = j = gone = 0
+        while j < len(out):
+            if i == len(strip):
+                return False, gone, 'output ran past the strip'
+            if np.array_equal(strip[i], out[j]):
+                i, j = i + 1, j + 1
+            elif blank[i]:
+                i, gone = i + 1, gone + 1
+            else:
+                return False, gone, f'artwork row {i} is missing'
+        rest = blank[i:]
+        return bool(rest.all()), gone + len(rest), 'artwork dropped off the end' if not rest.all() else ''
+
+    margin = round(limit * cbz.STRIP_TOP_MARGIN)
+
+    faint = _strip_cbz([1280, 1280], gutter=[(0, at(1.05), 60), (0, at(1.05) + 60, 80, (252, 252, 252), 16)])
+    band = strip_of(faint)[round((at(1.05) + 64) * scale) : round((at(1.05) + 136) * scale)]
+    light = band.min(axis=(1, 2)) >= 235
+    check(
+        'the faint band is light everywhere and blank nowhere, as intended',
+        bool(light.all()) and not blank_rows(band).any(),
+        f'{int(light.sum())}/{len(band)} light, {int(blank_rows(band).sum())} blank',
+    )
+    fp = cut(faint)
+    kept = fp[1][margin:]
+    check(
+        'faint artwork under a gutter is not swallowed with it',
+        len(kept) and not blank_rows(kept[:1]).any() and bool((kept[:40].min(axis=(1, 2)) >= 235).all()),
+        f'row after the margin blank: {bool(blank_rows(kept[:1]).any())}',
+    )
+
+    everything = [
+        _strip_cbz(heights),
+        _strip_cbz([1280, 1280], gutter=(0, at(1.05))),
+        _strip_cbz([1280, 1000, 1280, 640], gutter=[(0, at(1.05)), (2, 300)]),
+        _strip_cbz([1280, 1280], gutter=(0, at(1.05), 150)),
+        _strip_cbz([1500, 1280], gutter=[(0, 1120, 380), (1, 0, 100)]),
+        faint,
+    ]
+    verdicts = [only_gutter_gone(b) for b in everything]
+    check(
+        'no row of artwork is ever lost; only blank gutter is dropped',
+        all(ok for ok, _, _ in verdicts),
+        '; '.join(f'fixture {k}: {why}' for k, (ok, _, why) in enumerate(verdicts) if not ok),
+    )
+    check(
+        'and some gutter really was dropped, so that is not vacuous',
+        sum(g for _, g, _ in verdicts) > 0,
+        f'{[g for _, g, _ in verdicts]} rows',
+    )
+    tallest = max(len(t) for b in everything for t in cut(b))
+    check('and no tile ever runs past the overshoot', tallest <= reach, f'tallest {tallest}, reach {reach}')
+
+    def blank_at_top(tile):
+        g = blank_rows(tile)
+        return len(g) if g.all() else int(np.argmin(g))
+
+    t = cut(_strip_cbz([1280, 1280], gutter=(0, at(1.05), 150)))
+    check(
+        'a page that would open on a deep gutter keeps only the margin of it',
+        blank_at_top(t[1]) == margin,
+        f'{blank_at_top(t[1])} blank rows at the top, margin {margin}',
+    )
+    t = cut(_strip_cbz([1500, 1280], gutter=[(0, 1120, 380), (1, 0, 12)]))
+    check(
+        'even when that gutter runs on into the next entry',
+        blank_at_top(t[1]) == margin and round(12 * scale) < margin,
+        f'{blank_at_top(t[1])} blank rows at the top, margin {margin}, second entry adds {round(12 * scale)}',
+    )
+    night = cut(_strip_cbz([1280, 1280], gutter=(0, at(1.05), 150, (6, 6, 8))))
+    check(
+        'black gutter is dropped the same as white',
+        blank_at_top(night[1]) == margin,
+        f'{blank_at_top(night[1])} blank rows at the top',
+    )
+    t = cut(_strip_cbz([1280, 1280], gutter=(0, 0, 150)))
+    check(
+        'the first page of the strip does not open on gutter either',
+        blank_at_top(t[0]) == margin,
+        f'{blank_at_top(t[0])} blank rows at the top',
+    )
+    t = cut(_strip_cbz([1280, 1280], gutter=(0, at(0.60))))
+    check(
+        'a gutter shorter than the margin is left as it is',
+        0 < blank_at_top(t[1]) <= margin,
+        f'{blank_at_top(t[1])} blank rows at the top',
+    )
+    grey = cut(_strip_cbz([1280, 1280], gutter=(0, at(1.05), 150, (128, 128, 128))))
+    check(
+        'a flat grey run at the top of a page is artwork, and stays',
+        blank_at_top(grey[1]) == 0 and len(grey[1]) and cbz._spread(grey[1][:100]).max() <= cbz.STRIP_QUIET,
+        f'{blank_at_top(grey[1])} blank rows at the top',
+    )
+    mid = cut(_strip_cbz([1280, 1280], gutter=(0, at(0.30), 60)))
+    held = strip_of(_strip_cbz([1280, 1280], gutter=(0, at(0.30), 60)))
+    check(
+        'a gutter in the middle of a page is left whole',
+        int(blank_rows(mid[0]).sum()) == int(blank_rows(held[: len(mid[0])]).sum()) > margin,
+        f'{int(blank_rows(mid[0]).sum())} blank rows kept',
+    )
+    grey_line = [
+        (0, at(1.05), 1, (154, 154, 154)),
+        (0, at(1.05) + 1, 1280 - at(1.05) - 1),
+        (1, 0, 400),
+    ]
+    g4 = cut(_strip_cbz([1280, 1280], gutter=grey_line))
+    worst = max(float(blank_rows(t).mean()) for t in g4[:-1])
+    check(
+        'no page is left holding nothing but gutter',
+        worst < 0.90,
+        f'{len(g4)} pages, the blankest {worst:.0%} blank',
+    )
+    end = cut(_strip_cbz([1280, 800], gutter=(1, 400, 400)))
+    check(
+        'a strip that ends on gutter leaves no blank last page',
+        not blank_rows(end[-1]).all(),
+        f'{len(end)} pages, last {len(end[-1])} rows',
+    )
+
+    tall = zipfile.ZipFile(
+        io.BytesIO(b''.join(cbz.repack_iter(io.BytesIO(_strip_cbz([1280, 1280], gutter=(0, at(1.05)))), p, 1)))
+    )
+    first = pyvips.Image.new_from_buffer(tall.read('00001.png'), '').colourspace('srgb')
+    a = np.ndarray(buffer=first.write_to_memory(), dtype=np.uint8, shape=(first.height, first.width, first.bands))
+    check(
+        'a page that ran past the fold still ships at exactly the panel size',
+        (first.width, first.height) == (p.width, limit),
+        f'{first.width}x{first.height}',
+    )
+
+    def pad_width(cols, edge):
+        n = 0
+        for c in cols:
+            if not (a[:, c] == a[:, edge]).all():
+                break
+            n += 1
+        return n
+
+    left = pad_width(range(first.width), 0)
+    right = pad_width(range(first.width - 1, -1, -1), first.width - 1)
+    content = first.width - left - right
+    check(
+        'shrunk to fit and padded, rather than cropped',
+        left >= 10 and right >= 10 and abs(left - right) <= 2,
+        f'pad {left} left, {right} right',
+    )
+    check(
+        'by no more than the overshoot allows',
+        content >= p.width / cbz.STRIP_OVERSHOOT - 2,
+        f'content {content} px of {p.width}, floor {p.width / cbz.STRIP_OVERSHOOT:.0f}',
+    )
+
+    covered = sorted(
+        n
+        for n in zipfile.ZipFile(
+            io.BytesIO(b''.join(cbz.repack_iter(io.BytesIO(src), p, 1, cover=fake_page(9, 800, 1200))))
+        ).namelist()
+        if n[0].isdigit()
+    )
+    check(
+        'a prepended cover is numbered as wide as the pages after it',
+        len({len(n.split('.')[0]) for n in covered}) == 1 and covered[0].startswith('00000.'),
+        f'{covered[:3]}',
+    )
+    check(
+        'so it sorts first by digits alone, not by a full stop outranking a 1',
+        covered == sorted(covered, key=lambda n: int(n.split('.')[0])),
+    )
+
+    box = profiles.PROFILES['kindle-colorsoft']
+    boxed = sorted(
+        n
+        for n in zipfile.ZipFile(
+            io.BytesIO(b''.join(cbz.repack_iter(io.BytesIO(src), box, 1, cover=fake_page(9, 800, 1200))))
+        ).namelist()
+        if n[0].isdigit()
+    )
+    check('a paged profile still names its cover 0000', boxed[0].split('.')[0] == '0000', f'{boxed[:2]}')
+    plain = _pages_of(b''.join(cbz.repack_iter(io.BytesIO(src), box, 1)))
+    check(
+        'a paged profile is left alone by all of this',
+        len(plain) == len(heights) and all(re.fullmatch(r'\d{4}\.(png|jpg)', n) for n, _, _ in plain),
+        f'{len(plain)} pages, first {plain[0][0]}',
+    )
+    off = dataclasses.replace(p, reslice=False)
+    check(
+        'and so is a strip profile with the re-cut turned off',
+        len(_pages_of(b''.join(cbz.repack_iter(io.BytesIO(src), off, 1)))) == len(heights),
+    )
+
+
 def check_family_duplicates() -> None:
     def kin(a: str, b: str) -> bool:
         first, second = a.split('-'), b.split('-')
@@ -3414,6 +3873,25 @@ async def check_browse(c) -> None:
     check(
         'an unknown profile reads as a page in a browser too',
         r.status_code == 404 and 'Not found' in r.text and 'unknown profile' in r.text,
+    )
+    mangled = '/kobo-clara-hd-2e-bw/b/!!!not-a-token'
+    r = await c.get(mangled, headers=html_accept)
+    check(
+        'a mangled link reads as a page in a browser, not raw json',
+        r.status_code == 400 and r.headers['content-type'].startswith('text/html') and 'Bad request' in r.text,
+        f'{r.status_code} {r.headers["content-type"]}',
+    )
+    r = await c.get('/kobo-clara-hd-2e-bw/b/<script>alert(1)', headers=html_accept)
+    check(
+        'and a hostile token echoed back on that page is escaped',
+        r.status_code == 400 and '<script>' not in r.text and '&lt;script&gt;' in r.text,
+        f'{r.status_code}',
+    )
+    r = await c.get(mangled)
+    check(
+        'while a reader is still told in json',
+        r.status_code == 400 and r.headers['content-type'].startswith('application/json'),
+        r.headers['content-type'],
     )
 
     home = (await c.get('/')).text
@@ -4384,6 +4862,8 @@ async def main() -> int:
     print('module boundary')
     check_module_boundary()
     print('profile config')
+    check_seam_defects()
+    check_reslice()
     check_family_duplicates()
     check_profile_config()
     print('profile source')

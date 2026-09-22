@@ -61,6 +61,8 @@ class Profile:
     #   none   ship whatever size the resize produced
     #   width  scale to EXACTLY the panel width, keep the source aspect, never pad.
     fit: str = 'box'
+    # Ignore where the archive happens to cut the strip and re-cut.
+    reslice: bool = False
     # Enlarge a source too small to fill the panel.
     #   panel  resize up to the panel box, capped by upscale_max
     #   none   ship it small and let the reader deal with it

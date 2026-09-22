@@ -163,6 +163,8 @@ fit = "width"
 autocrop = false
 rotate_wide = false
 strip_folio = false
+auto_mono = false
+reslice = true
 
 # Clara Colour, 2024. 6".
 [profiles.kobo-clara-colour-webtoon]

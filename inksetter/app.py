@@ -110,17 +110,21 @@ def _ctx(request: Request, profile: str, upstream_url: str) -> rewrite.Ctx:
     return rewrite.Ctx(profile=profile, public_base=_public_base(request), base_url=upstream_url)
 
 
+def _error(request: Request, status: int, detail: str, headers: dict[str, str] | None = None) -> Response:
+    if 'text/html' in request.headers.get('accept', ''):
+        body = web.error(status, detail, _public_base(request))
+        return HTMLResponse(body, status_code=status, headers=headers)
+    return JSONResponse({'error': detail}, status_code=status, headers=headers)
+
+
 @app.exception_handler(UpstreamError)
 async def _upstream_error(request: Request, exc: UpstreamError):
-    if 'text/html' in request.headers.get('accept', ''):
-        body = web.error(exc.status, str(exc), _public_base(request))
-        return HTMLResponse(body, status_code=exc.status, headers=exc.headers)
-    return JSONResponse({'error': str(exc)}, status_code=exc.status, headers=exc.headers)
+    return _error(request, exc.status, str(exc), exc.headers)
 
 
 @app.exception_handler(rewrite.TokenError)
-async def _token_error(request: Request, exc: rewrite.TokenError):  # noqa: ARG001 - handler signature
-    return JSONResponse({'error': str(exc)}, status_code=400)
+async def _token_error(request: Request, exc: rewrite.TokenError):
+    return _error(request, 400, str(exc))
 
 
 @app.api_route('/healthz', methods=['GET', 'HEAD'])
