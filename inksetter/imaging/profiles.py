@@ -15,6 +15,7 @@ DESCREENS = frozenset({'none', 'mono', 'always'})
 PANELS = frozenset({'mono', 'kaleido'})
 DEFRINGES = frozenset({'diagonal', 'none'})
 FITS = frozenset({'box', 'none'})
+COLOUR_PADS = frozenset({'border', 'mono'})
 UPSCALES = frozenset({'panel', 'none'})
 UPSCALE_KERNELS = frozenset({'linear', 'nearest', 'cubic', 'mitchell', 'lanczos3'})
 UPSCALE_MAX_CEILING = 8.0
@@ -60,6 +61,10 @@ class Profile:
     #   box    every page is panel-sized, centred on its own margin colour
     #   none   ship whatever size the resize produced
     fit: str = 'box'
+    # What the colour path pads with. The mono path always decides as mono does.
+    #   border  the median colour of the page border
+    #   mono    white or black, decided from the sides the pad touches
+    colour_pad: str = 'border'
     # Ignore where the archive happens to cut the strip and re-cut.
     reslice: bool = False
     # Enlarge a source too small to fill the panel.
@@ -210,6 +215,8 @@ def validate(p: Profile, where: str = 'profile') -> Profile:
         problems.append(f'defringe_deadband={p.defringe_deadband} must be >= 0')
     if p.fit not in FITS:
         problems.append(f'fit={p.fit!r} is not one of {", ".join(sorted(FITS))}')
+    if p.colour_pad not in COLOUR_PADS:
+        problems.append(f'colour_pad={p.colour_pad!r} is not one of {", ".join(sorted(COLOUR_PADS))}')
     if p.upscale not in UPSCALES:
         problems.append(f'upscale={p.upscale!r} is not one of {", ".join(sorted(UPSCALES))}')
     if p.upscale_kernel not in UPSCALE_KERNELS:

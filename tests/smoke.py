@@ -677,6 +677,8 @@ def check_fit_and_upscale() -> None:
 
     for field, bad in (
         ('fit', 'letterbox'),
+        ('fit', 'width'),
+        ('colour_pad', 'grey'),
         ('upscale', 'always'),
         ('upscale_kernel', 'bilinear'),
         ('upscale_max', 99.0),
@@ -1681,6 +1683,70 @@ def check_colour_pad_ring() -> None:
         not mm.any() or len(np.unique(ma[mm])) == 1,
         f'{len(np.unique(ma[mm])) if mm.any() else 1} values',
     )
+
+
+def check_webtoon_pad() -> None:
+    strip = profiles.PROFILES['kindle-colorsoft-webtoon']
+    paged = dataclasses.replace(profiles.PROFILES['kindle-colorsoft'], auto_mono=False)
+    mono = profiles.PROFILES['kobo-clara-hd-2e-bw']
+    limit = round(strip.width * strip.aspect)
+    check(
+        'every webtoon profile pads as a mono page does',
+        all(p.colour_pad == 'mono' for p in profiles.PROFILES.values() if p.reslice),
+    )
+    check(
+        'and every paged profile keeps the border colour',
+        all(p.colour_pad == 'border' for p in profiles.PROFILES.values() if not p.reslice),
+    )
+
+    rng = np.random.default_rng(11)
+
+    def page(w: int, h: int, side) -> np.ndarray:
+        a = rng.integers(0, 256, (h, w, 3), dtype=np.uint8)
+        if side is not None:
+            a[:, :60] = side
+            a[:, -60:] = side
+        return a
+
+    def pad_of(blob: bytes, cols: int):
+        im = pyvips.Image.new_from_buffer(blob, '')
+        a = np.ndarray(buffer=im.write_to_memory(), dtype=np.uint8, shape=(im.height, im.width, im.bands))
+        edge = np.concatenate([a[:, :cols], a[:, -cols:]], axis=1).reshape(-1, im.bands)
+        values = np.unique(edge, axis=0)
+        return tuple(int(v) for v in values[0]) if len(values) == 1 else None
+
+    cases = (
+        ('dark grey', (90, 90, 90), 0, True),
+        ('light grey', (170, 170, 170), 255, True),
+        ('flat red', (200, 60, 60), 255, True),
+        ('busy', None, 255, True),
+        ('black', (8, 8, 8), 0, False),
+    )
+    for label, side, level, differs in cases:
+        tall = page(strip.width, round(limit * 1.6), side)
+        blob = pyvips.Image.new_from_memory(tall.tobytes(), tall.shape[1], tall.shape[0], 3, 'uchar').pngsave_buffer()
+        want = (level,) * 3
+
+        got, _ = cbz._render(('tile', 1, 'x.png', tall), strip)
+        check(f'a page past the fold with {label} sides pads {level}', pad_of(got, 100) == want, f'{pad_of(got, 100)}')
+
+        ref, _ = pipeline.render_page(blob, mono)
+        check(
+            f'premise: a mono page with {label} sides pads {level}', pad_of(ref, 100) == (level,), f'{pad_of(ref, 100)}'
+        )
+
+        if differs:
+            ctl, _ = pipeline.render_page(blob, paged)
+            check(
+                f'premise: the border rule would pad {label} sides otherwise',
+                len(pad_of(ctl, 100) or ()) == 3 and pad_of(ctl, 100) != want,
+                f'{pad_of(ctl, 100)}',
+            )
+
+        cover = page(800, 1200, side)
+        cblob = pyvips.Image.new_from_memory(cover.tobytes(), 800, 1200, 3, 'uchar').pngsave_buffer()
+        got, _ = pipeline.render_page(cblob, profiles.embedded_cover_for(strip))
+        check(f'a prepended cover with {label} sides pads {level}', pad_of(got, 40) == want, f'{pad_of(got, 40)}')
 
 
 def check_strip_width() -> None:
@@ -4970,6 +5036,7 @@ async def main() -> int:
     print('colour pad ring')
     check_png_effort()
     check_colour_pad_ring()
+    check_webtoon_pad()
     print('pad seam')
     check_strip_width()
     check_pad_seam()

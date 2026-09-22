@@ -503,7 +503,7 @@ def _geometry(buf: bytes, p: Profile, tw: int, th: int, mono: bool, page: pyvips
     if p.fit == 'box' and (im.width < tw or im.height < th):
         x, y = (tw - im.width) // 2, (th - im.height) // 2
         content = (x, y, im.width, im.height)
-        pad = _mono_pad_level(im, im.width < tw, im.height < th) if mono else None
+        pad = _mono_pad_level(im, im.width < tw, im.height < th) if mono or p.colour_pad == 'mono' else None
         im = _pad_to_box(im, tw, th, pad)
         if chatty:
             step('pad', f'content {content}, level {pad}')
@@ -675,7 +675,7 @@ def _render_colour(buf: bytes, p: Profile, tw: int, th: int, page: pyvips.Image 
             out.width,
             out.height,
             extend='background',
-            background=_border_background(inner),
+            background=_border_background(inner) if geom.pad is None else [geom.pad] * out.bands,
         )
 
     if p.fmt == 'jpegc':

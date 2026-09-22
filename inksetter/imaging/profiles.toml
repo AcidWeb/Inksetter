@@ -159,6 +159,7 @@ height = 1680
 
 [mixins.kaleido-webtoon]
 base = "kaleido"
+colour_pad = "mono"
 autocrop = false
 rotate_wide = false
 strip_folio = false
