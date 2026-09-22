@@ -195,6 +195,42 @@ height = 1680
 
 
 # --------------------------------------------------------------------------
+# Webtoons: vertical strips, read in KOReader's continuous mode.
+# --------------------------------------------------------------------------
+
+[mixins.kaleido-webtoon]
+base = "kaleido"
+fit = "width"
+autocrop = false
+rotate_wide = false
+strip_folio = false
+
+# Clara Colour, 2024. 6".
+[profiles.kobo-clara-colour-webtoon]
+base = "kaleido-webtoon"
+width = 1072
+height = 1448
+
+# Libra Colour, 2024. 7".
+[profiles.kobo-libra-colour-webtoon]
+base = "kaleido-webtoon"
+width = 1264
+height = 1680
+
+# Colorsoft, 2024. 7".
+[profiles.kindle-colorsoft-webtoon]
+base = "kaleido-webtoon"
+width = 1272
+height = 1696
+
+# Scribe Colorsoft, 2025. 11".
+[profiles.kindle-scribe-colorsoft-webtoon]
+base = "kaleido-webtoon"
+width = 1986
+height = 2648
+
+
+# --------------------------------------------------------------------------
 # Escape hatch: no image processing at all, feed rewriting only.
 # --------------------------------------------------------------------------
 

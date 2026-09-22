@@ -476,7 +476,8 @@ def _geometry(buf: bytes, p: Profile, tw: int, th: int, mono: bool, page: pyvips
             step('rotate', 'landscape spread onto a portrait panel')
 
     upscale = 1.0
-    scale = min(tw / im.width, th / im.height)
+    width_fit = p.fit == 'width'
+    scale = (tw / im.width) if width_fit else min(tw / im.width, th / im.height)
     if scale < 1.0:
         if p.descreen == 'always' or (p.descreen == 'mono' and mono):
             before = (im.width, im.height)
@@ -487,9 +488,19 @@ def _geometry(buf: bytes, p: Profile, tw: int, th: int, mono: bool, page: pyvips
                     f'{im.width * im.height / 1e6:.2f} Mpx, ceiling {p.descreen_max_megapixels:.0f}'
                     + ('' if (im.width, im.height) == before else ' (resized?)'),
                 )
-        im = im.thumbnail_image(tw, height=th, size='down', linear=p.linear_light)
+        im = im.thumbnail_image(
+            tw,
+            height=10_000_000 if width_fit else th,
+            size='down',
+            linear=p.linear_light,
+        )
         if chatty:
             step('downscale', f'scale {scale:.3f}')
+    elif width_fit and scale > 1.0:
+        upscale = scale
+        im = im.resize(upscale, kernel=p.upscale_kernel)
+        if chatty:
+            step('upscale', f'{upscale:.3f}x by {p.upscale_kernel}, to the panel width')
     elif p.upscale == 'panel' and scale > 1.005:
         upscale = min(scale, p.upscale_max)
         im = im.resize(upscale, kernel=p.upscale_kernel)

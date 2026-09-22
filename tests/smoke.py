@@ -1605,6 +1605,67 @@ def check_colour_pad_ring() -> None:
     )
 
 
+def check_width_fit() -> None:
+    strips = {n: p for n, p in profiles.PROFILES.items() if p.fit == 'width'}
+    check('the table carries webtoon profiles', bool(strips), 'none define fit = "width"')
+    prof = profiles.PROFILES['kindle-colorsoft-webtoon']
+    box = profiles.PROFILES['kindle-colorsoft']
+    check(
+        'every webtoon profile fits by width and leaves the strip alone',
+        all(p.fit == 'width' and not p.autocrop and not p.rotate_wide for p in strips.values()),
+        f'{[(n, p.fit, p.autocrop, p.rotate_wide) for n, p in strips.items() if p.autocrop or p.rotate_wide]}',
+    )
+    check(
+        'and the control shares its panel, differing only in the fit',
+        (box.width, box.height) == (prof.width, prof.height) and box.fit == 'box',
+        f'{box.width}x{box.height} fit={box.fit} vs {prof.width}x{prof.height} fit={prof.fit}',
+    )
+
+    def strip(w: int, h: int) -> bytes:
+        a = np.full((h, w), 255, np.uint8)
+        a[h // 4 : 3 * h // 4, w // 4 : 3 * w // 4] = 40
+        return pyvips.Image.new_from_memory(a.tobytes(), w, h, 1, 'uchar').pngsave_buffer()
+
+    seen = []
+    for sh in (400, 1000, 1280, 2400):
+        geom = pipeline._geometry(strip(800, sh), prof, prof.width, prof.height, mono=True)
+        seen.append((geom.image.width, geom.image.height, geom.pad, round(geom.content[2] / 800, 4)))
+    widths = {s[0] for s in seen}
+    check('every slice lands on exactly the panel width', widths == {prof.width}, f'{sorted(widths)}')
+    check('no slice is padded', all(s[2] is None for s in seen), f'{[s[2] for s in seen]}')
+    check('and they share one scale factor', len({s[3] for s in seen}) == 1, f'{[s[3] for s in seen]}')
+    for (_w, h, _p, _s), src_h in zip(seen, (400, 1000, 1280, 2400), strict=True):
+        want = round(src_h * prof.width / 800)
+        check(
+            f'a {src_h} px slice keeps its aspect ({want} px tall)',
+            abs(h - want) <= 1,
+            f'got {h}, wanted {want}',
+        )
+
+    geom = pipeline._geometry(strip(800, 330), prof, prof.width, prof.height, mono=True)
+    check(
+        'a short slice is not blown up to the panel height',
+        geom.image.height < prof.height // 2,
+        f'{geom.image.width}x{geom.image.height}',
+    )
+
+    narrow = dataclasses.replace(prof, upscale_max=1.1)
+    geom = pipeline._geometry(strip(400, 900), narrow, narrow.width, narrow.height, mono=True)
+    check(
+        'upscale_max does not cap a width fit',
+        geom.image.width == narrow.width,
+        f'{geom.image.width} != {narrow.width} (would need {narrow.width / 400:.2f}x, cap {narrow.upscale_max})',
+    )
+
+    box = profiles.PROFILES['kobo-clara-bw']
+    g = pipeline._geometry(strip(800, 1000), box, box.width, box.height, mono=True)
+    check(
+        'a box-fit profile still pads to the full panel',
+        (g.image.width, g.image.height) == (box.width, box.height) and g.pad is not None,
+        f'{g.image.width}x{g.image.height} pad={g.pad}',
+    )
+
+
 def check_pad_seam() -> None:
     prof = profiles.PROFILES['kindle-colorsoft']
     tw = prof.width
@@ -2518,7 +2579,11 @@ def check_every_profile_geometry() -> None:
             continue
         blob, _ = pipeline.render_page(fixture, prof)
         im = pyvips.Image.new_from_buffer(blob, '')
-        if (im.width, im.height) != (prof.width, prof.height):
+        if prof.fit == 'width':
+            want_h = round(2400 * prof.width / 1600)
+            if im.width != prof.width or abs(im.height - want_h) > 1:
+                wrong.append(f'{name} wanted {prof.width}x{want_h} got {im.width}x{im.height}')
+        elif (im.width, im.height) != (prof.width, prof.height):
             wrong.append(f'{name} wanted {prof.width}x{prof.height} got {im.width}x{im.height}')
         if prof.fmt == 'png4':
             grey = np.ndarray(
@@ -2828,16 +2893,25 @@ def _folio_page(number: str = '123', attached: bool = False, w: int = 900) -> by
     return pyvips.Image.new_from_memory(a.tobytes(), w, h, 1, 'uchar').pngsave_buffer()
 
 
+def _paged() -> dict:
+    return {n: p for n, p in profiles.PROFILES.items() if p.fit != 'width'}
+
+
 def check_strip_folio() -> None:
     off = dataclasses.replace(profiles.PROFILES['kobo-clara-bw'], strip_folio=False)
     on = dataclasses.replace(off, strip_folio=True)
     numbered, blank = _folio_page(), _folio_page(number='')
     attached = _folio_page(attached=True)
 
+    paged = {n: p for n, p in profiles.PROFILES.items() if p.fit != 'width'}
     check(
-        'every device profile strips folios',
-        all(p.strip_folio for p in profiles.PROFILES.values()),
-        f'off: {[n for n, p in profiles.PROFILES.items() if not p.strip_folio]}',
+        'every paged device profile strips folios',
+        all(p.strip_folio for p in paged.values()),
+        f'off: {[n for n, p in paged.items() if not p.strip_folio]}',
+    )
+    check(
+        'and the webtoon profiles do not',
+        not any(p.strip_folio for n, p in profiles.PROFILES.items() if p.fit == 'width'),
     )
     check(
         'cover profiles do not',
@@ -2862,7 +2936,7 @@ def check_strip_folio() -> None:
         importlib.reload(profiles)
         check(
             'OCR_ENABLED=false turns the pass off for every profile',
-            not any(p.strip_folio for p in profiles.PROFILES.values()),
+            not any(p.strip_folio for p in _paged().values()),
             f'still on: {[n for n, p in profiles.PROFILES.items() if p.strip_folio]}',
         )
         check(
@@ -2872,7 +2946,7 @@ def check_strip_folio() -> None:
         for junk in ('typo', 'yes', ''):
             os.environ['OCR_ENABLED'] = junk
             importlib.reload(profiles)
-            if not all(p.strip_folio for p in profiles.PROFILES.values()):
+            if not all(p.strip_folio for p in _paged().values()):
                 break
         else:
             junk = None
@@ -2882,7 +2956,7 @@ def check_strip_folio() -> None:
         importlib.reload(profiles)
     check(
         'and the table comes back',
-        all(p.strip_folio for p in profiles.PROFILES.values()),
+        all(p.strip_folio for p in _paged().values()),
     )
     check(
         'a folio-free page is untouched by the strip',
@@ -3616,6 +3690,7 @@ async def main() -> int:
     check_png_effort()
     check_colour_pad_ring()
     print('pad seam')
+    check_width_fit()
     check_pad_seam()
     print('edge lines')
     check_edge_line()

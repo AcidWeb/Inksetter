@@ -14,7 +14,7 @@ DITHERS = frozenset({'bayer', 'none'})
 DESCREENS = frozenset({'none', 'mono', 'always'})
 PANELS = frozenset({'mono', 'kaleido'})
 DEFRINGES = frozenset({'diagonal', 'none'})
-FITS = frozenset({'box', 'none'})
+FITS = frozenset({'box', 'none', 'width'})
 UPSCALES = frozenset({'panel', 'none'})
 UPSCALE_KERNELS = frozenset({'linear', 'nearest', 'cubic', 'mitchell', 'lanczos3'})
 UPSCALE_MAX_CEILING = 8.0
@@ -57,8 +57,9 @@ class Profile:
     # Rotate landscape spreads to fill a portrait panel.
     rotate_wide: bool = True
     # Pad the finished page out to EXACTLY width x height.
-    #   box   every page is panel-sized, centred on its own margin colour
-    #   none  ship whatever size the resize produced
+    #   box    every page is panel-sized, centred on its own margin colour
+    #   none   ship whatever size the resize produced
+    #   width  scale to EXACTLY the panel width, keep the source aspect, never pad.
     fit: str = 'box'
     # Enlarge a source too small to fill the panel.
     #   panel  resize up to the panel box, capped by upscale_max

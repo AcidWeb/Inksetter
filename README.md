@@ -32,7 +32,7 @@ Currently, if the proxy uses Kavita as the OPDS source, two additional features 
 ## Current limitations
 
 * Only CBZ files are supported.
-* Manhwa/Webtoon format (long vertical strips) is currently unsuported.
+* Webtoon format (long vertical strips) support is limited. Please check the [wiki](https://github.com/AcidWeb/Inksetter/wiki) for more details.
 * Very big CBZ (1GB+) archives might fail to download if source OPDS server don't support HTTP range requests.
 
 ## Performance
