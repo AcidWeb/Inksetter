@@ -1683,60 +1683,50 @@ def check_colour_pad_ring() -> None:
     )
 
 
-def check_width_fit() -> None:
-    strips = {n: p for n, p in profiles.PROFILES.items() if p.fit == 'width'}
-    check('the table carries webtoon profiles', bool(strips), 'none define fit = "width"')
+def check_strip_width() -> None:
+    strips = {n: p for n, p in profiles.PROFILES.items() if p.reslice}
+    check('the table carries webtoon profiles', bool(strips), 'none sets reslice = true')
     prof = profiles.PROFILES['kindle-colorsoft-webtoon']
     box = profiles.PROFILES['kindle-colorsoft']
     check(
-        'every webtoon profile fits by width and leaves the strip alone',
-        all(p.fit == 'width' and not p.autocrop and not p.rotate_wide for p in strips.values()),
-        f'{[(n, p.fit, p.autocrop, p.rotate_wide) for n, p in strips.items() if p.autocrop or p.rotate_wide]}',
+        'every webtoon profile leaves the strip alone',
+        all(not p.autocrop and not p.rotate_wide for p in strips.values()),
+        f'{[(n, p.autocrop, p.rotate_wide) for n, p in strips.items() if p.autocrop or p.rotate_wide]}',
     )
     check(
-        'and the control shares its panel, differing only in the fit',
-        (box.width, box.height) == (prof.width, prof.height) and box.fit == 'box',
-        f'{box.width}x{box.height} fit={box.fit} vs {prof.width}x{prof.height} fit={prof.fit}',
+        'and the control shares its panel but is not re-cut',
+        (box.width, box.height) == (prof.width, prof.height) and not box.reslice,
+        f'{box.width}x{box.height} vs {prof.width}x{prof.height}',
     )
 
-    def strip(w: int, h: int) -> bytes:
+    def strip(w: int, h: int) -> pyvips.Image:
         a = np.full((h, w), 255, np.uint8)
         a[h // 4 : 3 * h // 4, w // 4 : 3 * w // 4] = 40
-        return pyvips.Image.new_from_memory(a.tobytes(), w, h, 1, 'uchar').pngsave_buffer()
+        return pyvips.Image.new_from_memory(a.tobytes(), w, h, 1, 'uchar')
 
-    seen = []
-    for sh in (400, 1000, 1280, 2400):
-        geom = pipeline._geometry(strip(800, sh), prof, prof.width, prof.height, mono=True)
-        seen.append((geom.image.width, geom.image.height, geom.pad, round(geom.content[2] / 800, 4)))
-    widths = {s[0] for s in seen}
-    check('every slice lands on exactly the panel width', widths == {prof.width}, f'{sorted(widths)}')
-    check('no slice is padded', all(s[2] is None for s in seen), f'{[s[2] for s in seen]}')
-    check('and they share one scale factor', len({s[3] for s in seen}) == 1, f'{[s[3] for s in seen]}')
-    for (_w, h, _p, _s), src_h in zip(seen, (400, 1000, 1280, 2400), strict=True):
+    tall = (400, 1000, 1280, 2400)
+    seen = [pipeline.fit_to_width(strip(800, sh), prof.width, prof) for sh in tall]
+    widths = {im.width for im in seen}
+    check('the strip reader puts every slice on exactly the panel width', widths == {prof.width}, f'{sorted(widths)}')
+    for im, src_h in zip(seen, tall, strict=True):
         want = round(src_h * prof.width / 800)
         check(
             f'a {src_h} px slice keeps its aspect ({want} px tall)',
-            abs(h - want) <= 1,
-            f'got {h}, wanted {want}',
+            abs(im.height - want) <= 1,
+            f'got {im.height}, wanted {want}',
         )
 
-    geom = pipeline._geometry(strip(800, 330), prof, prof.width, prof.height, mono=True)
-    check(
-        'a short slice is not blown up to the panel height',
-        geom.image.height < prof.height // 2,
-        f'{geom.image.width}x{geom.image.height}',
-    )
-
     narrow = dataclasses.replace(prof, upscale_max=1.1)
-    geom = pipeline._geometry(strip(400, 900), narrow, narrow.width, narrow.height, mono=True)
+    im = pipeline.fit_to_width(strip(400, 900), narrow.width, narrow)
+    want = round(900 * narrow.width / 400)
     check(
-        'upscale_max does not cap a width fit',
-        geom.image.width == narrow.width,
-        f'{geom.image.width} != {narrow.width} (would need {narrow.width / 400:.2f}x, cap {narrow.upscale_max})',
+        'upscale_max does not cap the strip reader',
+        im.width == narrow.width and abs(im.height - want) <= 1,
+        f'{im.width}x{im.height}, wanted {narrow.width}x{want} ({narrow.width / 400:.2f}x, cap {narrow.upscale_max})',
     )
 
     box = profiles.PROFILES['kobo-clara-hd-2e-bw']
-    g = pipeline._geometry(strip(800, 1000), box, box.width, box.height, mono=True)
+    g = pipeline._geometry(strip(800, 1000).pngsave_buffer(), box, box.width, box.height, mono=True)
     check(
         'a box-fit profile still pads to the full panel',
         (g.image.width, g.image.height) == (box.width, box.height) and g.pad is not None,
@@ -2657,11 +2647,7 @@ def check_every_profile_geometry() -> None:
             continue
         blob, _ = pipeline.render_page(fixture, prof)
         im = pyvips.Image.new_from_buffer(blob, '')
-        if prof.fit == 'width':
-            want_h = round(2400 * prof.width / 1600)
-            if im.width != prof.width or abs(im.height - want_h) > 1:
-                wrong.append(f'{name} wanted {prof.width}x{want_h} got {im.width}x{im.height}')
-        elif (im.width, im.height) != (prof.width, prof.height):
+        if (im.width, im.height) != (prof.width, prof.height):
             wrong.append(f'{name} wanted {prof.width}x{prof.height} got {im.width}x{im.height}')
         if prof.fmt == 'png4':
             grey = np.ndarray(
@@ -3006,7 +2992,7 @@ def check_reslice() -> None:
     p = profiles.PROFILES['kindle-colorsoft-webtoon']
     limit = round(p.width * p.aspect)
     floor = int(limit * cbz.STRIP_MIN_FILL)
-    check('the webtoon profiles ask to be re-cut', p.reslice and p.fit == 'width')
+    check('the webtoon profiles ask to be re-cut', p.reslice)
 
     heights = [1280, 1000, 1000, 1, 1280, 640, 1000]
     src = _strip_cbz(heights)
@@ -3308,12 +3294,15 @@ def check_reslice() -> None:
         f'content {content} px of {p.width}, floor {p.width / cbz.STRIP_OVERSHOOT:.0f}',
     )
 
-    covered = sorted(
-        n
-        for n in zipfile.ZipFile(
-            io.BytesIO(b''.join(cbz.repack_iter(io.BytesIO(src), p, 1, cover=fake_page(9, 800, 1200))))
-        ).namelist()
-        if n[0].isdigit()
+    wrapped = zipfile.ZipFile(
+        io.BytesIO(b''.join(cbz.repack_iter(io.BytesIO(src), p, 1, cover=fake_page(9, 800, 1200))))
+    )
+    covered = sorted(n for n in wrapped.namelist() if n[0].isdigit())
+    front = pyvips.Image.new_from_buffer(wrapped.read(covered[0]), '')
+    check(
+        'a prepended 2:3 cover fills exactly one screen, so page 1 opens at zoom 1.0',
+        (front.width, front.height) == (p.width, limit),
+        f'{front.width}x{front.height} for a {p.width}x{limit} screen',
     )
     check(
         'a prepended cover is numbered as wide as the pages after it',
@@ -3497,7 +3486,7 @@ def _folio_page(number: str = '123', attached: bool = False, w: int = 900) -> by
 
 
 def _paged() -> dict:
-    return {n: p for n, p in profiles.PROFILES.items() if p.fit != 'width'}
+    return {n: p for n, p in profiles.PROFILES.items() if not p.reslice}
 
 
 def check_strip_folio() -> None:
@@ -3506,7 +3495,7 @@ def check_strip_folio() -> None:
     numbered, blank = _folio_page(), _folio_page(number='')
     attached = _folio_page(attached=True)
 
-    paged = {n: p for n, p in profiles.PROFILES.items() if p.fit != 'width'}
+    paged = {n: p for n, p in profiles.PROFILES.items() if not p.reslice}
     check(
         'every paged device profile strips folios',
         all(p.strip_folio for p in paged.values()),
@@ -3514,7 +3503,7 @@ def check_strip_folio() -> None:
     )
     check(
         'and the webtoon profiles do not',
-        not any(p.strip_folio for n, p in profiles.PROFILES.items() if p.fit == 'width'),
+        not any(p.strip_folio for n, p in profiles.PROFILES.items() if p.reslice),
     )
     check(
         'cover profiles do not',
@@ -3698,9 +3687,7 @@ def _decoded(token: str) -> tuple[str, str | None]:
 async def check_no_stream(c) -> None:
     up = 'http://127.0.0.1:8899'
     strip = profiles.PROFILES['kindle-colorsoft-webtoon']
-    check('premise: the webtoon profile is re-sliced', strip.resliced)
-    check('a strip kept whole is not re-sliced', not dataclasses.replace(strip, reslice=False).resliced)
-    check('a paged fit is never re-sliced, whatever it asks', not dataclasses.replace(strip, fit='box').resliced)
+    check('premise: the webtoon profile is re-cut', strip.reslice)
 
     r = await c.get(f'/{strip.name}/catalog')
     feed = r.text
@@ -3715,28 +3702,52 @@ async def check_no_stream(c) -> None:
     check('no upstream host leaks from a webtoon feed', up not in feed)
 
     token = encode_token(f'{up}/opds/v1.2/books/7/pages/{{pageNumber}}?zero_based=true&maxWidth={{maxWidth}}')
+    fixed = encode_token(f'{up}/opds/v1.2/books/7/pages/50')
+    divina = encode_token(f'{up}/opds/v2/books/7/manifest')
+    webpub = encode_token(f'{up}/opds/v2/books/8/manifest')
     kept = dataclasses.replace(strip, name='smoke-webtoon-kept', reslice=False)
     profiles.PROFILES[kept.name] = kept
     try:
         r = await c.get(f'/{kept.name}/catalog')
         found = re.search(rf'/{kept.name}/p/([\w-]+)\?page=', r.text)
-        check('a width-fit profile that keeps the strip still streams', found is not None and 'pse:count="3"' in r.text)
+        check('the same profile with the re-cut off streams again', found is not None and 'pse:count="3"' in r.text)
         check(
             'premise: the refusal below uses the token the feed offers', found is not None and found.group(1) == token
         )
         r = await c.get(f'/{kept.name}/p/{token}', params={'page': 0, 'maxWidth': strip.width})
         check('and its stream serves a page', r.status_code == 200 and r.headers['content-type'].startswith('image/'))
+        order = (await c.get(f'/{kept.name}/f/{divina}')).json().get('readingOrder', [])
+        listed = [e['href'].split('/pf/')[-1] for e in order if '/pf/' in e['href']]
+        check('premise: its Divina manifest lists every page through /pf/', len(listed) == 3, f'{len(listed)}')
+        check('premise: the refusal below uses a token the manifest offers', fixed in listed)
+        r = await c.get(f'/{kept.name}/pf/{fixed}')
+        check('and /pf/ serves them', r.status_code == 200 and r.headers['content-type'].startswith('image/'))
+        res = (await c.get(f'/{kept.name}/f/{webpub}')).json().get('resources', [])
+        check('premise: a webpub routes its images through /pf/ too', any('/pf/' in e['href'] for e in res))
     finally:
         del profiles.PROFILES[kept.name]
 
-    r = await c.get(f'/{strip.name}/p/{token}', params={'page': 0, 'maxWidth': strip.width})
-    check('the stream route refuses a webtoon profile', r.status_code == 404, f'status={r.status_code}')
-    said = r.json().get('error', '') if r.headers.get('content-type', '').startswith('application/json') else ''
-    check('and says to download the book instead', 'download' in said, f'{said!r}')
-    r = await c.request('HEAD', f'/{strip.name}/p/{token}', params={'page': 0})
-    check('HEAD is refused alike', r.status_code == 404, f'status={r.status_code}')
-    r = await c.get(f'/{strip.name}/p/' + encode_token(f'{up}/opds/v1.2/upstream500'))
-    check('the refusal comes before the upstream is asked', r.status_code == 404, f'status={r.status_code}')
+    for route, tok in (('p', token), ('pf', fixed)):
+        r = await c.get(f'/{strip.name}/{route}/{tok}', params={'page': 0, 'maxWidth': strip.width})
+        check(f'/{route}/ refuses a webtoon profile', r.status_code == 404, f'status={r.status_code}')
+        said = r.json().get('error', '') if r.headers.get('content-type', '').startswith('application/json') else ''
+        check(f'and /{route}/ says to download the book instead', 'download' in said, f'{said!r}')
+        r = await c.request('HEAD', f'/{strip.name}/{route}/{tok}', params={'page': 0})
+        check(f'HEAD on /{route}/ is refused alike', r.status_code == 404, f'status={r.status_code}')
+        r = await c.get(f'/{strip.name}/{route}/' + encode_token(f'{up}/opds/v1.2/upstream500'))
+        check(
+            f'the /{route}/ refusal comes before the upstream is asked', r.status_code == 404, f'status={r.status_code}'
+        )
+
+    man = (await c.get(f'/{strip.name}/f/{divina}')).json()
+    check(
+        'a webtoon Divina manifest lists no page to stream',
+        man.get('readingOrder') == [] and '/pf/' not in json.dumps(man),
+        f'{len(man.get("readingOrder", []))} entries',
+    )
+    book = (await c.get(f'/{strip.name}/f/{webpub}')).json()
+    kinds = [e['href'].split('/')[4] for e in book.get('readingOrder', []) + book.get('resources', [])]
+    check('a webpub keeps its chapter and stylesheet and loses only the page image', kinds == ['dl', 'dl'], f'{kinds}')
 
     ctx = rewrite.Ctx(profile=strip.name, public_base='http://proxy.test', base_url=f'{up}/opds/v2/catalog')
     doc = {
@@ -4138,7 +4149,7 @@ def check_landing_groups() -> None:
     )
     check(
         'a webtoon profile is filed as webtoon, not as the colour panel it runs on',
-        {n for n, p in profiles.PROFILES.items() if p.fit == 'width'} == set(by_group['Webtoon'])
+        {n for n, p in profiles.PROFILES.items() if p.reslice} == set(by_group['Webtoon'])
         and all(profiles.PROFILES[n].panel == 'kaleido' for n in by_group['Webtoon']),
         f'{sorted(by_group["Webtoon"])}',
     )
@@ -4960,7 +4971,7 @@ async def main() -> int:
     check_png_effort()
     check_colour_pad_ring()
     print('pad seam')
-    check_width_fit()
+    check_strip_width()
     check_pad_seam()
     print('edge lines')
     check_edge_line()

@@ -14,7 +14,7 @@ DITHERS = frozenset({'bayer', 'none'})
 DESCREENS = frozenset({'none', 'mono', 'always'})
 PANELS = frozenset({'mono', 'kaleido'})
 DEFRINGES = frozenset({'diagonal', 'none'})
-FITS = frozenset({'box', 'none', 'width'})
+FITS = frozenset({'box', 'none'})
 UPSCALES = frozenset({'panel', 'none'})
 UPSCALE_KERNELS = frozenset({'linear', 'nearest', 'cubic', 'mitchell', 'lanczos3'})
 UPSCALE_MAX_CEILING = 8.0
@@ -59,7 +59,6 @@ class Profile:
     # Pad the finished page out to EXACTLY width x height.
     #   box    every page is panel-sized, centred on its own margin colour
     #   none   ship whatever size the resize produced
-    #   width  scale to EXACTLY the panel width, keep the source aspect, never pad.
     fit: str = 'box'
     # Ignore where the archive happens to cut the strip and re-cut.
     reslice: bool = False
@@ -151,10 +150,6 @@ class Profile:
         if self.fmt == 'jpegc':
             return 'jpeg'
         return self.auto_mono_fmt if self.auto_mono_fmt in ('png4', 'png8') else 'png4'
-
-    @property
-    def resliced(self) -> bool:
-        return self.reslice and self.fit == 'width'
 
     @property
     def chroma_sigma(self) -> float:

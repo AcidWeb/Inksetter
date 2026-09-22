@@ -179,9 +179,9 @@ def _strip_tiles(zin, names, p: Profile, note):
         yield cut_one(last)
 
 
-@functools.lru_cache(maxsize=8)
-def _boxed(p: Profile) -> Profile:
-    return dataclasses.replace(p, fit='box')
+@functools.lru_cache(maxsize=16)
+def _refit(p: Profile, fit: str) -> Profile:
+    return dataclasses.replace(p, fit=fit)
 
 
 def _tile_image(a: np.ndarray) -> pyvips.Image:
@@ -192,7 +192,7 @@ def _render(job, profile: Profile):
     if job[0] == 'tile':
         tile = job[3]
         tall = len(tile) > round(profile.width * profile.aspect)
-        return render_page(b'', _boxed(profile) if tall else profile, source=_tile_image(tile))
+        return render_page(b'', _refit(profile, 'box' if tall else 'none'), source=_tile_image(tile))
     return render_page(job[3], profile)
 
 
@@ -321,7 +321,7 @@ def repack_iter(
         except Exception:
             meta_blob = None
 
-    strip = profile.resliced
+    strip = profile.reslice
     pad = STRIP_PAD if strip else 4
     if strip:
         log.info('repack: re-cutting the strip into %d px pages', round(profile.width * profile.aspect))

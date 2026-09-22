@@ -454,7 +454,7 @@ GROUPS = (
 def group_of(p: Profile) -> str:
     if p.fmt == 'raw':
         return 'No processing'
-    if p.fit == 'width':
+    if p.reslice:
         return 'Webtoon'
     return 'Colour' if p.panel == 'kaleido' else 'Black and white'
 

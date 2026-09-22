@@ -298,7 +298,9 @@ def _walk_json(
                 item
                 for item in node
                 if not (
-                    isinstance(item, dict) and isinstance(item.get('href'), str) and _json_kind(item, container) == 'p'
+                    isinstance(item, dict)
+                    and isinstance(item.get('href'), str)
+                    and _json_kind(item, container) in ('p', 'pf')
                 )
             ]
         for item in node:
