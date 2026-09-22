@@ -521,7 +521,7 @@ def low_freq_modulation(blob: bytes, y0f: float, y1f: float) -> float:
 
 
 def check_descreen() -> None:
-    clara = profiles.PROFILES['kobo-clara-bw']
+    clara = profiles.PROFILES['kobo-clara-hd-2e-bw']
     on = dataclasses.replace(clara, autocrop=False, descreen='always')
     off = dataclasses.replace(clara, autocrop=False, descreen='none')
 
@@ -613,7 +613,7 @@ def plain_page(w: int, h: int, level: int = 235) -> bytes:
 
 
 def check_fit_and_upscale() -> None:
-    clara = dataclasses.replace(profiles.PROFILES['kobo-clara-bw'], autocrop=False)
+    clara = dataclasses.replace(profiles.PROFILES['kobo-clara-hd-2e-bw'], autocrop=False)
     tw, th = clara.width, clara.height
 
     for label, (w, h) in (
@@ -701,7 +701,7 @@ def check_dither_ties() -> None:
     mid = pipeline._quantise16(np.full((400, 400), 127, np.uint8), 'bayer')
     check('a value between rungs still dithers', len(np.unique(mid)) > 1, f'{len(np.unique(mid))} indices')
 
-    clara = dataclasses.replace(profiles.PROFILES['kobo-clara-bw'], autocrop=False)
+    clara = dataclasses.replace(profiles.PROFILES['kobo-clara-hd-2e-bw'], autocrop=False)
     for level in (255, 0):
         page = pyvips.Image.new_from_memory(
             np.full((1600, 1103), level, np.uint8).tobytes(), 1103, 1600, 1, 'uchar'
@@ -717,7 +717,7 @@ def check_dither_ties() -> None:
 
 
 def check_path_awareness() -> None:
-    clara = dataclasses.replace(profiles.PROFILES['kobo-clara-bw'], autocrop=False)
+    clara = dataclasses.replace(profiles.PROFILES['kobo-clara-hd-2e-bw'], autocrop=False)
     toned = screentone_page()
 
     m_on, _ = pipeline.render_page(toned, dataclasses.replace(clara, descreen='mono'))
@@ -756,7 +756,7 @@ def check_mask_cache_and_padding() -> None:
         f'{info.misses} miss(es), {info.hits} hit(s)',
     )
 
-    clara = profiles.PROFILES['kobo-clara-bw']
+    clara = profiles.PROFILES['kobo-clara-hd-2e-bw']
     blob, _ = pipeline.render_page(plain_page(1170, 1300), clara)
     im = pyvips.Image.new_from_buffer(blob, '')
     a = np.ndarray(buffer=im.write_to_memory(), dtype=np.uint8, shape=(im.height, im.width))
@@ -834,7 +834,7 @@ def check_defringe() -> None:
         all(q.defringe == 'diagonal' for q in profiles.PROFILES.values() if q.is_colour),
     )
     try:
-        profiles.validate(dataclasses.replace(profiles.PROFILES['kobo-clara-bw'], defringe='diagonal'))
+        profiles.validate(dataclasses.replace(profiles.PROFILES['kobo-clara-hd-2e-bw'], defringe='diagonal'))
         check('defringe on a mono panel is rejected', False, 'accepted')
     except ValueError as exc:
         check('defringe on a mono panel is rejected', 'filter array' in str(exc), str(exc)[:56])
@@ -922,7 +922,7 @@ def check_logging() -> None:
             _logs.configure()
 
     page = fake_page(0, 900, 1300)
-    prof = profiles.PROFILES['kobo-clara-bw']
+    prof = profiles.PROFILES['kobo-clara-hd-2e-bw']
     plog = _logging.getLogger('inksetter.imaging.pipeline')
     for level, want_stage in ((_logging.DEBUG, True), (_logging.INFO, False)):
         records: list = []
@@ -1153,7 +1153,7 @@ def check_repack_parallel() -> None:
         z.writestr('001.jpg', fake_page(1, 1100, 1500))
     raw = src.getvalue()
 
-    prof = profiles.PROFILES['kobo-clara-bw']
+    prof = profiles.PROFILES['kobo-clara-hd-2e-bw']
 
     def run(workers):
         out = _io.BytesIO()
@@ -1324,7 +1324,7 @@ async def check_comicinfo() -> None:
 
     from inksetter.imaging import cbz as _cbz
 
-    prof = profiles.PROFILES['kobo-clara-bw']
+    prof = profiles.PROFILES['kobo-clara-hd-2e-bw']
 
     bare = _io.BytesIO()
     with _zf.ZipFile(bare, 'w') as z:
@@ -1668,10 +1668,12 @@ def check_colour_pad_ring() -> None:
         frac < 0.01,
         f'{frac:.3%} of {mask.sum()} pad pixels',
     )
-    mono_out, _ = pipeline.render_page(blob, profiles.PROFILES['kobo-clara-bw'])
+    mono_out, _ = pipeline.render_page(blob, profiles.PROFILES['kobo-clara-hd-2e-bw'])
     mi = pyvips.Image.new_from_buffer(mono_out, '')
     ma = np.ndarray(buffer=mi.write_to_memory(), dtype=np.uint8, shape=(mi.height, mi.width))
-    mcx, mcy, mcw, mch = pipeline._geometry(blob, profiles.PROFILES['kobo-clara-bw'], 1072, 1448, mono=True).content
+    mcx, mcy, mcw, mch = pipeline._geometry(
+        blob, profiles.PROFILES['kobo-clara-hd-2e-bw'], 1072, 1448, mono=True
+    ).content
     mm = np.ones(ma.shape, bool)
     mm[mcy : mcy + mch, mcx : mcx + mcw] = False
     check(
@@ -1733,7 +1735,7 @@ def check_width_fit() -> None:
         f'{geom.image.width} != {narrow.width} (would need {narrow.width / 400:.2f}x, cap {narrow.upscale_max})',
     )
 
-    box = profiles.PROFILES['kobo-clara-bw']
+    box = profiles.PROFILES['kobo-clara-hd-2e-bw']
     g = pipeline._geometry(strip(800, 1000), box, box.width, box.height, mono=True)
     check(
         'a box-fit profile still pads to the full panel',
@@ -1904,7 +1906,7 @@ def check_pad_seam() -> None:
 
 
 def check_edge_line() -> None:
-    prof = profiles.PROFILES['kobo-clara-bw']
+    prof = profiles.PROFILES['kobo-clara-hd-2e-bw']
     thr = prof.autocrop_threshold
     w, h = 800, 1200
 
@@ -1986,7 +1988,7 @@ def check_edge_line() -> None:
 
 
 def check_dark_margin_crop() -> None:
-    prof = profiles.PROFILES['kobo-clara-bw']
+    prof = profiles.PROFILES['kobo-clara-hd-2e-bw']
     w, h, inset = 900, 1300, 90
 
     def bordered(ink_border: bool, paper_left: bool = False) -> pyvips.Image:
@@ -2037,7 +2039,7 @@ def check_dark_margin_crop() -> None:
 
 def check_autocrop_open() -> None:
     w, h = 900, 1300
-    prof = profiles.PROFILES['kobo-clara-bw']
+    prof = profiles.PROFILES['kobo-clara-hd-2e-bw']
 
     def page(mark=None, art_to_edge=False) -> bytes:
         a = np.full((h, w), 255, np.uint8)
@@ -2112,7 +2114,7 @@ def check_cover_delivery() -> None:
 
     from inksetter.imaging import cbz as _cbz
 
-    prof = profiles.PROFILES['kobo-clara-bw']
+    prof = profiles.PROFILES['kobo-clara-hd-2e-bw']
     raw = _cbz_bytes(3)
     page1 = _zf.ZipFile(_io.BytesIO(raw)).read('p000.jpg')
 
@@ -2286,7 +2288,7 @@ def check_cover_token() -> None:
         rewrite.decode_token(encode_token(url, cover)) == url,
     )
 
-    ctx = rewrite.Ctx(profile='kobo-clara-bw', public_base='http://p', base_url='http://up/f')
+    ctx = rewrite.Ctx(profile='kobo-clara-hd-2e-bw', public_base='http://p', base_url='http://up/f')
     feed = (
         b'<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom">'
         b'<link rel="self" href="/self"/>'
@@ -2419,7 +2421,7 @@ def check_concurrency_defaults() -> None:
 def check_png_compression() -> None:
     from inksetter.cache import render_key as _rk
 
-    prof = profiles.PROFILES['kobo-clara-bw']
+    prof = profiles.PROFILES['kobo-clara-hd-2e-bw']
     check('default png_compression is 7', prof.png_compression == 7, str(prof.png_compression))
 
     for bad in (-1, 10):
@@ -2548,7 +2550,7 @@ def check_repack_streaming() -> None:
 
     from inksetter.imaging import cbz as _cbz
 
-    prof = profiles.PROFILES['kobo-clara-bw']
+    prof = profiles.PROFILES['kobo-clara-hd-2e-bw']
 
     src = _io.BytesIO()
     with _zf.ZipFile(src, 'w') as z:
@@ -2604,7 +2606,7 @@ async def check_repack_slot() -> None:
     from inksetter import app as _app
     from inksetter.imaging import cbz as _cbz
 
-    prof = profiles.PROFILES['kobo-clara-bw']
+    prof = profiles.PROFILES['kobo-clara-hd-2e-bw']
     src = _io.BytesIO()
     with _zf.ZipFile(src, 'w') as z:
         for i in range(6):
@@ -2747,7 +2749,7 @@ def check_fft_padding() -> None:
         f'max {d.max()}, mean {d.mean():.4f}, pixels differing {100 * (d > 0).mean():.3f}%',
     )
 
-    mono = profiles.PROFILES['kobo-clara-bw']
+    mono = profiles.PROFILES['kobo-clara-hd-2e-bw']
     page = fake_page(9, 2400, 3200)
     a = pipeline.render_page(page, mono)[0]
     pipeline._next_fast_len = lambda k, limit=7: k  # noqa: ARG005
@@ -2762,12 +2764,12 @@ def check_big_panel_cap() -> None:
     raised = {n for n, p in profiles.PROFILES.items() if p.upscale_max > 2.0}
     check(
         'only the Scribe-class panels raise the cap',
-        raised == {'kindle-scribe-1', 'kindle-scribe-2', 'kindle-scribe-3', 'kindle-scribe-colorsoft'},
+        raised == {'kindle-scribe-1-2', 'kindle-scribe-3', 'kindle-scribe-colorsoft'},
         f'{sorted(raised)}',
     )
     check(
         'the smaller panels keep the conservative default',
-        profiles.PROFILES['kobo-clara-bw'].upscale_max == 2.0
+        profiles.PROFILES['kobo-clara-hd-2e-bw'].upscale_max == 2.0
         and profiles.PROFILES['kindle-colorsoft'].upscale_max == 2.0,
     )
     ksc = profiles.PROFILES['kindle-scribe-colorsoft']
@@ -2777,7 +2779,7 @@ def check_big_panel_cap() -> None:
         f'{ksc.upscale_max} {ksc.panel} {ksc.defringe} {ksc.fmt}',
     )
     small = fake_page(4, 760, 1200)
-    for name, want_capped in (('kindle-scribe-3', 2.2), ('kobo-clara-bw', None)):
+    for name, want_capped in (('kindle-scribe-3', 2.2), ('kobo-clara-hd-2e-bw', None)):
         prof = profiles.PROFILES[name]
         g = pipeline._geometry(small, prof, prof.width, prof.height, True)
         if want_capped:
@@ -2808,14 +2810,14 @@ def check_profile_source() -> None:
     wrote_stray = False
     try:
         if not stray.exists():
-            stray.write_text('[profiles.kobo-clara-bw]\nwidth = 1\nheight = 1\n', encoding='utf-8')
+            stray.write_text('[profiles.kobo-clara-hd-2e-bw]\nwidth = 1\nheight = 1\n', encoding='utf-8')
             wrote_stray = True
         os.environ['PROFILES_FILE'] = str(stray)
         importlib.reload(profiles)
         check(
             'PROFILES_FILE is ignored',
-            profiles.PROFILES['kobo-clara-bw'].width == before['kobo-clara-bw'].width,
-            f'width={profiles.PROFILES["kobo-clara-bw"].width}',
+            profiles.PROFILES['kobo-clara-hd-2e-bw'].width == before['kobo-clara-hd-2e-bw'].width,
+            f'width={profiles.PROFILES["kobo-clara-hd-2e-bw"].width}',
         )
         check('a stray profiles.toml in the cwd is ignored', set(profiles.PROFILES) == set(before))
     finally:
@@ -2865,7 +2867,7 @@ def check_profile_source() -> None:
     for label, body, needle in (
         ('base cycle', '[profiles.a]\nbase = "b"\n[profiles.b]\nbase = "a"\n', 'cycle'),
         ('unknown base', '[profiles.x]\nwidth = 9\nheight = 9\nbase = "nope"\n', 'unknown base'),
-        ('mistyped section', '[profile.kobo-clara-bw]\ngamma = 1.2\n', 'unknown section'),
+        ('mistyped section', '[profile.kobo-clara-hd-2e-bw]\ngamma = 1.2\n', 'unknown section'),
         ('name in both tables', '[mixins.dup]\ngamma = 1.1\n[profiles.dup]\nwidth = 9\nheight = 9\n', 'both'),
         ('profile with no size', '[profiles.sizeless]\ngamma = 1.1\n', 'missing'),
         ('profiles is a scalar', 'profiles = 3\n', 'table of tables'),
@@ -2884,6 +2886,72 @@ def check_profile_source() -> None:
 
 
 LF = chr(10)
+
+
+def check_family_duplicates() -> None:
+    def kin(a: str, b: str) -> bool:
+        first, second = a.split('-'), b.split('-')
+        shared = 0
+        for x, y in zip(first, second, strict=False):
+            if x != y:
+                break
+            shared += 1
+        return shared >= 2
+
+    def shape(p) -> tuple:
+        return tuple(sorted((f.name, getattr(p, f.name)) for f in dataclasses.fields(p) if f.name != 'name'))
+
+    names = sorted(profiles.PROFILES)
+    twinned = [
+        (a, b)
+        for i, a in enumerate(names)
+        for b in names[i + 1 :]
+        if kin(a, b) and shape(profiles.PROFILES[a]) == shape(profiles.PROFILES[b])
+    ]
+    check(
+        'the family test sees past a generation suffix',
+        kin('kobo-elipsa', 'kobo-elipsa-2e')
+        and kin('kindle-pw-3-4', 'kindle-pw-5')
+        and not kin('kobo-clara-hd-2e-bw', 'kobo-glo-hd')
+        and not kin('kobo-forma', 'kobo-sage'),
+    )
+    check(
+        'no device family carries the same profile twice over',
+        not twinned,
+        '; '.join(f'{a} = {b}' for a, b in twinned),
+    )
+    subject = profiles.PROFILES[sorted(n for n, p in profiles.PROFILES.items() if p.fmt == 'png4')[0]]
+    clone = dataclasses.replace(subject, name='some-other-device')
+    page = fake_page(0, 900, 1200)
+    check(
+        'renaming a profile does not move a single pixel',
+        pipeline.render_page(page, subject) == pipeline.render_page(page, clone),
+    )
+    merged = {
+        'kindle-pw-3-4',
+        'kindle-oasis-2-3',
+        'kindle-basic-1-2',
+        'kindle-scribe-1-2',
+        'kobo-clara-hd-2e-bw',
+        'kobo-libra-h2o-2',
+        'kobo-elipsa',
+    }
+    check(
+        'the generations that share a panel share a profile',
+        merged <= set(profiles.PROFILES),
+        f'missing {sorted(merged - set(profiles.PROFILES))}',
+    )
+    check(
+        'and the models that only look alike kept their own',
+        {'kobo-glo-hd', 'kobo-aura-one', 'kobo-forma', 'kobo-sage', 'kindle-voyage', 'kindle-oasis-1'}
+        <= set(profiles.PROFILES),
+    )
+    check(
+        'and the panels that only look alike stayed apart',
+        profiles.PROFILES['kindle-pw-6'].panel != profiles.PROFILES['kindle-colorsoft'].panel
+        and (profiles.PROFILES['kindle-pw-6'].width, profiles.PROFILES['kindle-pw-6'].height)
+        == (profiles.PROFILES['kindle-colorsoft'].width, profiles.PROFILES['kindle-colorsoft'].height),
+    )
 
 
 def check_profile_config() -> None:
@@ -2974,7 +3042,7 @@ def _paged() -> dict:
 
 
 def check_strip_folio() -> None:
-    off = dataclasses.replace(profiles.PROFILES['kobo-clara-bw'], strip_folio=False)
+    off = dataclasses.replace(profiles.PROFILES['kobo-clara-hd-2e-bw'], strip_folio=False)
     on = dataclasses.replace(off, strip_folio=True)
     numbered, blank = _folio_page(), _folio_page(number='')
     attached = _folio_page(attached=True)
@@ -2994,7 +3062,7 @@ def check_strip_folio() -> None:
         not profiles.COVER.strip_folio and not profiles.COVER_COLOUR.strip_folio,
         f'cover={profiles.COVER.strip_folio} colour={profiles.COVER_COLOUR.strip_folio}',
     )
-    _dev = profiles.PROFILES['kobo-clara-bw']
+    _dev = profiles.PROFILES['kobo-clara-hd-2e-bw']
     _emb = profiles.embedded_cover_for(_dev)
     check(
         'nor the cover prepended into an archive',
@@ -3006,7 +3074,7 @@ def check_strip_folio() -> None:
         _emb.upscale_max == profiles.UPSCALE_MAX_CEILING,
         f'upscale_max={_emb.upscale_max}',
     )
-    before_key = cache_mod.render_key('u', profiles.PROFILES['kobo-clara-bw'], None)
+    before_key = cache_mod.render_key('u', profiles.PROFILES['kobo-clara-hd-2e-bw'], None)
     os.environ['OCR_ENABLED'] = 'false'
     try:
         importlib.reload(profiles)
@@ -3017,7 +3085,7 @@ def check_strip_folio() -> None:
         )
         check(
             'and that reaches the cache key, so nothing is re-rendered',
-            cache_mod.render_key('u', profiles.PROFILES['kobo-clara-bw'], None) != before_key,
+            cache_mod.render_key('u', profiles.PROFILES['kobo-clara-hd-2e-bw'], None) != before_key,
         )
         for junk in ('typo', 'yes', ''):
             os.environ['OCR_ENABLED'] = junk
@@ -3170,14 +3238,14 @@ def _decoded(token: str) -> tuple[str, str | None]:
 
 async def check_browse(c) -> None:
     up = 'http://127.0.0.1:8899'
-    r = await c.get('/kobo-clara-bw/browse')
+    r = await c.get('/kobo-clara-hd-2e-bw/browse')
     html = r.text
     check('browse root served as html', r.status_code == 200 and 'text/html' in r.headers['content-type'])
     check('no upstream host reaches the page', up not in html)
     check('no upstream path reaches the page', '/opds/v1.2/' not in html)
-    check('the page names the profile it rendered for', 'kobo-clara-bw' in html and '1072' in html)
+    check('the page names the profile it rendered for', 'kobo-clara-hd-2e-bw' in html and '1072' in html)
 
-    dl = re.findall(r'/kobo-clara-bw/dl/([\w-]+)', html)
+    dl = re.findall(r'/kobo-clara-hd-2e-bw/dl/([\w-]+)', html)
     check('the acquisition entry offers one download', len(dl) == 1, f'{len(dl)} links')
     token = dl[0] if dl else ''
     check(
@@ -3188,7 +3256,7 @@ async def check_browse(c) -> None:
         'the download token carries the cover, as the feed route does',
         _decoded(token)[1] == f'{up}/opds/v1.2/books/7/thumbnail',
     )
-    check('the cover is rendered through the img route', len(re.findall(r'/kobo-clara-bw/img/[\w-]+', html)) == 1)
+    check('the cover is rendered through the img route', len(re.findall(r'/kobo-clara-hd-2e-bw/img/[\w-]+', html)) == 1)
     box = math.gcd(profiles.COVER.width, profiles.COVER.height)
     check(
         'the css cover box is the cover profile box, so nothing is cropped',
@@ -3203,29 +3271,29 @@ async def check_browse(c) -> None:
     check('a search form is offered', form is not None)
     action = form.group(1) if form else ''
     stok = action.rsplit('/', 1)[-1]
-    check('the search form targets the browse search route', '/kobo-clara-bw/bs/' in action)
+    check('the search form targets the browse search route', '/kobo-clara-hd-2e-bw/bs/' in action)
     check(
         'the search token is the description document, not a filled template',
         _decoded(stok)[0] == f'{up}/opds/v1.2/search',
     )
-    r = await c.get(f'/kobo-clara-bw/bs/{stok}', params={'q': 'dune'})
+    r = await c.get(f'/kobo-clara-hd-2e-bw/bs/{stok}', params={'q': 'dune'})
     check('search resolves the description and runs the query', 'hits:dune' in r.text)
     check('the search box keeps the term', 'value="dune"' in r.text)
 
     ntok = encode_token(f'{up}/opds/v1.2/nav')
-    nav = (await c.get(f'/kobo-clara-bw/b/{ntok}')).text
+    nav = (await c.get(f'/kobo-clara-hd-2e-bw/b/{ntok}')).text
     check('a feed with no acquisitions renders as a grid', 'class="grid"' in nav)
-    check('navigation entries link into the browse route', '/kobo-clara-bw/b/' in nav)
-    check('navigation entries do not link into the machine-readable feed route', '/kobo-clara-bw/f/' not in nav)
+    check('navigation entries link into the browse route', '/kobo-clara-hd-2e-bw/b/' in nav)
+    check('navigation entries do not link into the machine-readable feed route', '/kobo-clara-hd-2e-bw/f/' not in nav)
     check('an entry title is escaped', '<script>' not in nav and '&lt;script&gt;' in nav)
     check('a summary stands in when there is no page count', 'twelve of them' in nav)
     check(
         'the next link is offered as a browse link',
-        f'/kobo-clara-bw/b/{encode_token(f"{up}/opds/v1.2/nav?p=2")}' in nav,
+        f'/kobo-clara-hd-2e-bw/b/{encode_token(f"{up}/opds/v1.2/nav?p=2")}' in nav,
     )
     check(
         'the up link is offered as a browse link',
-        f'/kobo-clara-bw/b/{encode_token(f"{up}/opds/v1.2/catalog")}' in nav,
+        f'/kobo-clara-hd-2e-bw/b/{encode_token(f"{up}/opds/v1.2/catalog")}' in nav,
     )
     check(
         "an entry's own navigation link is not hoisted into the pager",
@@ -3233,14 +3301,14 @@ async def check_browse(c) -> None:
     )
 
     gtok = encode_token(f'{up}/opds/v1.2/negotiate')
-    r = await c.get(f'/kobo-clara-bw/b/{gtok}', headers={'accept': 'text/html,application/xhtml+xml'})
+    r = await c.get(f'/kobo-clara-hd-2e-bw/b/{gtok}', headers={'accept': 'text/html,application/xhtml+xml'})
     check(
         "the browser's Accept is not forwarded upstream",
         'upstream html' not in r.text and 'Download CBZ' in r.text,
     )
 
     v2 = encode_token(f'{up}/opds/v2/catalog')
-    r = await c.get(f'/kobo-clara-bw/b/{v2}')
+    r = await c.get(f'/kobo-clara-hd-2e-bw/b/{v2}')
     check(
         'an OPDS 2.0 upstream gets an explanation, not a traceback',
         r.status_code == 200 and 'do not render' in r.text,
@@ -3256,27 +3324,27 @@ async def check_browse(c) -> None:
     check('and the page it renders says so', r.status_code == 200 and 'original' in r.text)
     check('browse on an unknown profile is 404', (await c.get('/nope/browse')).status_code == 404)
 
-    r = await c.get(f'/kobo-clara-bw/dl/{token}')
+    r = await c.get(f'/kobo-clara-hd-2e-bw/dl/{token}')
     check('a download link taken from the page returns a cbz', r.content[:4] == b'PK\x03\x04')
 
-    r = await c.get(f'/kobo-clara-bw/dl/{token}', params={'job': 'job-1'})
-    state = (await c.get('/kobo-clara-bw/dl-status/job-1')).json()
+    r = await c.get(f'/kobo-clara-hd-2e-bw/dl/{token}', params={'job': 'job-1'})
+    state = (await c.get('/kobo-clara-hd-2e-bw/dl-status/job-1')).json()
     check('a finished repack reports itself done', state['stage'] == 'done', f'{state}')
     check('and it got through every page', state['done'] == state['total'] == 3, f'{state}')
     check('the download itself is unaffected by being watched', r.content[:4] == b'PK\x03\x04')
     check(
         'an unknown job is a 404, not an empty answer',
-        (await c.get('/kobo-clara-bw/dl-status/never-started')).status_code == 404,
+        (await c.get('/kobo-clara-hd-2e-bw/dl-status/never-started')).status_code == 404,
     )
     check(
         'the status route checks the profile like every other',
         (await c.get('/nope/dl-status/job-1')).status_code == 404,
     )
     bad = encode_token(f'{up}/opds/v1.2/missing')
-    await c.get(f'/kobo-clara-bw/dl/{bad}', params={'job': 'job-2'})
+    await c.get(f'/kobo-clara-hd-2e-bw/dl/{bad}', params={'job': 'job-2'})
     check(
         'a download that never arrives is reported as failed',
-        (await c.get('/kobo-clara-bw/dl-status/job-2')).json()['stage'] == 'error',
+        (await c.get('/kobo-clara-hd-2e-bw/dl-status/job-2')).json()['stage'] == 'error',
     )
     ptok = encode_token(f'{up}/opds/v1.2/books/7/file')
     await c.get(f'/passthrough/dl/{ptok}', params={'job': 'job-3'})
@@ -3291,42 +3359,42 @@ async def check_browse(c) -> None:
     )
 
     guard = encode_token(f'{up}/opds/v1.2/guarded')
-    r = await c.get(f'/kobo-clara-bw/b/{guard}')
+    r = await c.get(f'/kobo-clara-hd-2e-bw/b/{guard}')
     check('a guarded upstream still answers 401', r.status_code == 401, f'status={r.status_code}')
     check(
         'and the challenge is forwarded, so the browser can prompt',
         r.headers.get('www-authenticate') == 'Basic realm="Komga", charset="UTF-8"',
         repr(r.headers.get('www-authenticate')),
     )
-    r = await c.get(f'/kobo-clara-bw/b/{guard}', headers={'authorization': 'Basic Zm9vOmJhcg=='})
+    r = await c.get(f'/kobo-clara-hd-2e-bw/b/{guard}', headers={'authorization': 'Basic Zm9vOmJhcg=='})
     check(
         'the credentials the browser then sends get through',
         r.status_code == 200 and 'Download CBZ' in r.text,
         f'status={r.status_code}',
     )
-    r = await c.get(f'/kobo-clara-bw/f/{guard}')
+    r = await c.get(f'/kobo-clara-hd-2e-bw/f/{guard}')
     check(
         'the same challenge reaches a reader on the feed route',
         r.status_code == 401 and 'realm="Komga"' in r.headers.get('www-authenticate', ''),
     )
-    r = await c.get(f'/kobo-clara-bw/b/{encode_token(f"{up}/opds/v1.2/silent401")}')
+    r = await c.get(f'/kobo-clara-hd-2e-bw/b/{encode_token(f"{up}/opds/v1.2/silent401")}')
     check(
         'a 401 with no challenge of its own is still given one',
         r.status_code == 401 and r.headers.get('www-authenticate') == 'Basic realm="Inksetter"',
         repr(r.headers.get('www-authenticate')),
     )
-    r = await c.get(f'/kobo-clara-bw/b/{encode_token(f"{up}/opds/v1.2/forbidden")}')
+    r = await c.get(f'/kobo-clara-hd-2e-bw/b/{encode_token(f"{up}/opds/v1.2/forbidden")}')
     check(
         'a 403 is not dressed up as a login prompt',
         r.status_code == 403 and 'www-authenticate' not in {k.lower() for k in r.headers},
     )
-    r = await c.get(f'/kobo-clara-bw/b/{encode_token(f"{up}/opds/v1.2/missing")}')
+    r = await c.get(f'/kobo-clara-hd-2e-bw/b/{encode_token(f"{up}/opds/v1.2/missing")}')
     check(
         'and neither is a 404',
         r.status_code == 404 and 'www-authenticate' not in {k.lower() for k in r.headers},
     )
     html_accept = {'accept': 'text/html,application/xhtml+xml'}
-    r = await c.get(f'/kobo-clara-bw/b/{guard}', headers=html_accept)
+    r = await c.get(f'/kobo-clara-hd-2e-bw/b/{guard}', headers=html_accept)
     check(
         'a browser that cancels the prompt gets a page, not raw json',
         'Sign in required' in r.text and r.text.lstrip()[:1] == '<',
@@ -3336,7 +3404,7 @@ async def check_browse(c) -> None:
         'and that page still carries the challenge',
         r.headers.get('www-authenticate') == 'Basic realm="Komga", charset="UTF-8"',
     )
-    r = await c.get(f'/kobo-clara-bw/f/{guard}')
+    r = await c.get(f'/kobo-clara-hd-2e-bw/f/{guard}')
     check(
         'while a reader is still answered in json',
         r.headers['content-type'].startswith('application/json') and 'upstream status 401' in r.text,
@@ -3349,8 +3417,8 @@ async def check_browse(c) -> None:
     )
 
     home = (await c.get('/')).text
-    check('the index links each profile into the browse pages', '/kobo-clara-bw/browse' in home)
-    check('the index still shows the catalog URL for readers', '/kobo-clara-bw/catalog' in home)
+    check('the index links each profile into the browse pages', '/kobo-clara-hd-2e-bw/browse' in home)
+    check('the index still shows the catalog URL for readers', '/kobo-clara-hd-2e-bw/catalog' in home)
     check('the index does not name itself twice in the tab', '<title>Inksetter</title>' in home)
 
 
@@ -3395,7 +3463,7 @@ def check_repack_progress() -> None:
     out = b''.join(
         cbz.repack_iter(
             io.BytesIO(blob),
-            profiles.PROFILES['kobo-clara-bw'],
+            profiles.PROFILES['kobo-clara-hd-2e-bw'],
             1,
             progress=lambda done, total: seen.append((done, total)),
         )
@@ -3409,7 +3477,7 @@ def check_repack_progress() -> None:
     b1 = b''.join(
         cbz.repack_iter(
             io.BytesIO(big),
-            profiles.PROFILES['kobo-clara-bw'],
+            profiles.PROFILES['kobo-clara-hd-2e-bw'],
             1,
             progress=lambda done, total: one.append((done, total)),
         )
@@ -3417,7 +3485,7 @@ def check_repack_progress() -> None:
     b2 = b''.join(
         cbz.repack_iter(
             io.BytesIO(big),
-            profiles.PROFILES['kobo-clara-bw'],
+            profiles.PROFILES['kobo-clara-hd-2e-bw'],
             3,
             progress=lambda done, total: many.append((done, total)),
         )
@@ -3431,7 +3499,7 @@ def check_repack_progress() -> None:
     b3 = b''.join(
         cbz.repack_iter(
             io.BytesIO(blob),
-            profiles.PROFILES['kobo-clara-bw'],
+            profiles.PROFILES['kobo-clara-hd-2e-bw'],
             1,
             cover=cover,
             progress=lambda done, total: counted.append((done, total)),
@@ -3440,7 +3508,7 @@ def check_repack_progress() -> None:
     check('a prepended cover is counted as a page too', counted[-1] == (5, 5), f'{counted[-1]}')
     check('and it really is in the archive', len(zipfile.ZipFile(io.BytesIO(b3)).namelist()) == 6)
 
-    no_cb = b''.join(cbz.repack_iter(io.BytesIO(blob), profiles.PROFILES['kobo-clara-bw'], 1))
+    no_cb = b''.join(cbz.repack_iter(io.BytesIO(blob), profiles.PROFILES['kobo-clara-hd-2e-bw'], 1))
     check('watching a repack does not change what it produces', _entries_of(no_cb) == _entries_of(out))
 
 
@@ -3477,7 +3545,7 @@ async def check_logo(c) -> None:
     check('the logo is square and has transparency', im.width == im.height and im.hasalpha(), f'{im.width}x{im.height}')
 
     home = (await c.get('/')).text
-    feed = (await c.get('/kobo-clara-bw/browse')).text
+    feed = (await c.get('/kobo-clara-hd-2e-bw/browse')).text
     for name, html in (('landing', home), ('browse', feed)):
         check(f'the {name} page declares the icon', 'rel="icon" type="image/png"' in html)
         check(f'the {name} page points the icon at the served route', f'/{web.LOGO}"' in html)
@@ -3560,16 +3628,16 @@ def check_landing_groups() -> None:
 
 
 def check_progress_script() -> None:
-    p = profiles.PROFILES['kobo-clara-bw']
-    item = web.Item(title='V1', href='/kobo-clara-bw/dl/tok', cover=None, note='', download=True)
+    p = profiles.PROFILES['kobo-clara-hd-2e-bw']
+    item = web.Item(title='V1', href='/kobo-clara-hd-2e-bw/dl/tok', cover=None, note='', download=True)
     feed = web.Feed(title='S', items=(item,), search=None, up=None, nxt=None, prev=None)
     html = web.page(feed, p, 'http://proxy.test')
     check('a page with downloads carries the script', '<script>' in html)
     check(
         'and points it at the status route for this profile',
-        'data-status="http://proxy.test/kobo-clara-bw/dl-status/"' in html,
+        'data-status="http://proxy.test/kobo-clara-hd-2e-bw/dl-status/"' in html,
     )
-    check('the plain link survives for a browser without js', 'href="/kobo-clara-bw/dl/tok"' in html)
+    check('the plain link survives for a browser without js', 'href="/kobo-clara-hd-2e-bw/dl/tok"' in html)
 
     shown = list(web.STAGE_LABELS.values())
     check(
@@ -3598,7 +3666,7 @@ def check_progress_script() -> None:
         {'starting', 'fetching', 'repacking', 'done', 'error'} <= set(web.STAGE_LABELS),
     )
 
-    nav = web.Item(title='S', href='/kobo-clara-bw/b/tok', cover=None, note='', download=False)
+    nav = web.Item(title='S', href='/kobo-clara-hd-2e-bw/b/tok', cover=None, note='', download=False)
     grid = web.page(
         web.Feed(title='S', items=(nav,), search=None, up=None, nxt=None, prev=None), p, 'http://proxy.test'
     )
@@ -3617,7 +3685,7 @@ async def check_trail(c) -> None:
     up = 'http://127.0.0.1:8899'
     nav = encode_token(f'{up}/opds/v1.2/nav')
 
-    top = (await c.get(f'/kobo-clara-bw/b/{nav}')).text
+    top = (await c.get(f'/kobo-clara-hd-2e-bw/b/{nav}')).text
     links, here = _crumbs(top)
     check(
         'with no trail yet, only the feed\'s own rel="up" stands in',
@@ -3636,7 +3704,7 @@ async def check_trail(c) -> None:
     )
     check(
         'and that crumb points back at the parent',
-        len(links) > 1 and f'/kobo-clara-bw/b/{nav}' in links[1][0],
+        len(links) > 1 and f'/kobo-clara-hd-2e-bw/b/{nav}' in links[1][0],
         links[1][0] if len(links) > 1 else 'no crumb',
     )
 
@@ -3673,7 +3741,7 @@ async def check_trail(c) -> None:
         nxt.group(1) if nxt else 'no next',
     )
 
-    junk = await c.get(f'/kobo-clara-bw/b/{nav}', params={web.TRAIL_PARAM: 'not~valid~base64!!'})
+    junk = await c.get(f'/kobo-clara-hd-2e-bw/b/{nav}', params={web.TRAIL_PARAM: 'not~valid~base64!!'})
     check(
         'a corrupt trail is dropped, not fatal',
         junk.status_code == 200 and _crumbs(junk.text)[1] == 'Shelves',
@@ -3682,7 +3750,7 @@ async def check_trail(c) -> None:
     check('and is never echoed back into a link', 'not~valid~base64' not in junk.text)
 
     hostile = web.encode_trail([('javascript:alert(1)', 'Evil'), ('../../etc', 'Worse')])
-    r = await c.get(f'/kobo-clara-bw/b/{nav}', params={web.TRAIL_PARAM: hostile})
+    r = await c.get(f'/kobo-clara-hd-2e-bw/b/{nav}', params={web.TRAIL_PARAM: hostile})
     check(
         'a trail cannot smuggle a link of its own onto the page',
         'javascript:' not in r.text and '../../etc' not in r.text,
@@ -3690,7 +3758,7 @@ async def check_trail(c) -> None:
 
     pairs12 = [(encode_token(f'{up}/opds/v1.2/n{i}'), f'L{i}') for i in range(12)]
     long_trail = web.encode_trail(pairs12)
-    links, _ = _crumbs((await c.get(f'/kobo-clara-bw/b/{nav}', params={web.TRAIL_PARAM: long_trail})).text)
+    links, _ = _crumbs((await c.get(f'/kobo-clara-hd-2e-bw/b/{nav}', params={web.TRAIL_PARAM: long_trail})).text)
     check(
         'a trail cannot grow without bound',
         len(links) == web.TRAIL_MAX + 1,
@@ -3723,7 +3791,7 @@ async def main() -> int:
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url='http://proxy.test', timeout=60) as c:
         print('feed rewriting')
-        r = await c.get('/kobo-clara-bw/catalog')
+        r = await c.get('/kobo-clara-hd-2e-bw/catalog')
         feed = r.text
         check('catalog served', r.status_code == 200)
         check('{pageNumber} survives', '{pageNumber}' in feed)
@@ -3733,17 +3801,17 @@ async def main() -> int:
         check('PSE type matches output', 'type="image/png"' in feed)
         check('no upstream host leaks', '127.0.0.1:8899' not in feed)
 
-        pse = re.search(r'/kobo-clara-bw/p/([\w-]+)\?page=', feed).group(1)
-        img = re.search(r'/kobo-clara-bw/img/([\w-]+)', feed).group(1)
-        dl = re.search(r'/kobo-clara-bw/dl/([\w-]+)', feed).group(1)
-        osd = re.search(r'/kobo-clara-bw/osd/([\w-]+)', feed).group(1)
+        pse = re.search(r'/kobo-clara-hd-2e-bw/p/([\w-]+)\?page=', feed).group(1)
+        img = re.search(r'/kobo-clara-hd-2e-bw/img/([\w-]+)', feed).group(1)
+        dl = re.search(r'/kobo-clara-hd-2e-bw/dl/([\w-]+)', feed).group(1)
+        osd = re.search(r'/kobo-clara-hd-2e-bw/osd/([\w-]+)', feed).group(1)
 
         print('page rendering')
         t = time.time()
-        r1 = await c.get(f'/kobo-clara-bw/p/{pse}', params={'page': 0, 'maxWidth': 1072})
+        r1 = await c.get(f'/kobo-clara-hd-2e-bw/p/{pse}', params={'page': 0, 'maxWidth': 1072})
         cold = time.time() - t
         t = time.time()
-        r2 = await c.get(f'/kobo-clara-bw/p/{pse}', params={'page': 0, 'maxWidth': 1072})
+        r2 = await c.get(f'/kobo-clara-hd-2e-bw/p/{pse}', params={'page': 0, 'maxWidth': 1072})
         warm = time.time() - t
         w, h, levels = grey_levels(r1.content)
         check('png returned', r1.headers['content-type'] == 'image/png')
@@ -3764,7 +3832,7 @@ async def main() -> int:
         )
 
         flat = dataclasses.replace(
-            profiles.PROFILES['kobo-clara-bw'],
+            profiles.PROFILES['kobo-clara-hd-2e-bw'],
             autocrop=False,
             black=0,
             white=255,
@@ -3787,26 +3855,26 @@ async def main() -> int:
 
         await asyncio.sleep(2.0)
         t = time.time()
-        r3 = await c.get(f'/kobo-clara-bw/p/{pse}', params={'page': 1, 'maxWidth': 1072})
+        r3 = await c.get(f'/kobo-clara-hd-2e-bw/p/{pse}', params={'page': 1, 'maxWidth': 1072})
         pf = time.time() - t
         check('next page prefetched', r3.status_code == 200 and pf < 0.2, f'{pf * 1000:.0f}ms')
 
-        r = await c.get(f'/kobo-clara-bw/p/{pse}', params={'page': 0, 'maxWidth': 600})
+        r = await c.get(f'/kobo-clara-hd-2e-bw/p/{pse}', params={'page': 0, 'maxWidth': 600})
         w2, _, _ = grey_levels(r.content)
         check('maxWidth clamps down', w2 <= 600, f'width={w2}')
 
         print('covers, search, download')
-        r = await c.get(f'/kobo-clara-bw/img/{img}')
+        r = await c.get(f'/kobo-clara-hd-2e-bw/img/{img}')
         check('cover shrunk', r.status_code == 200 and len(r.content) < 30_000, f'{len(r.content)}B')
 
-        r = await c.get(f'/kobo-clara-bw/osd/{osd}')
+        r = await c.get(f'/kobo-clara-hd-2e-bw/osd/{osd}')
         check('{searchTerms} survives', '{searchTerms}' in r.text)
-        s = re.search(r'/kobo-clara-bw/s/([\w-]+)\?q=', r.text).group(1)
-        r = await c.get(f'/kobo-clara-bw/s/{s}', params={'q': 'sample query'})
+        s = re.search(r'/kobo-clara-hd-2e-bw/s/([\w-]+)\?q=', r.text).group(1)
+        r = await c.get(f'/kobo-clara-hd-2e-bw/s/{s}', params={'q': 'sample query'})
         check('search term reaches upstream', 'hits:sample query' in r.text)
 
         raw = await c.get(f'/passthrough/dl/{dl}')
-        packed = await c.get(f'/kobo-clara-bw/dl/{dl}')
+        packed = await c.get(f'/kobo-clara-hd-2e-bw/dl/{dl}')
         names = zipfile.ZipFile(io.BytesIO(packed.content)).namelist()
         check(
             'repack shrinks volume',
@@ -3845,28 +3913,30 @@ async def main() -> int:
 
         print('opds 2.0 and readium manifests')
         r = await c.get(
-            '/kobo-clara-bw/f/' + encode_token('http://127.0.0.1:8899/opds/nego'),
+            '/kobo-clara-hd-2e-bw/f/' + encode_token('http://127.0.0.1:8899/opds/nego'),
             headers={'accept': 'application/opds+json, application/atom+xml, */*'},
         )
         check(
             'Accept forwarded (negotiation works)', 'opds+json' in r.headers['content-type'], r.headers['content-type']
         )
         v2 = r.json()
-        check('v2 self link rewritten', '/kobo-clara-bw/f/' in v2['links'][0]['href'])
+        check('v2 self link rewritten', '/kobo-clara-hd-2e-bw/f/' in v2['links'][0]['href'])
         srch = next(x for x in v2['links'] if x.get('rel') == 'search')
         check(
             'form-style search normalised', '{query}' in srch['href'] and '{?query}' not in srch['href'], srch['href']
         )
         check('search link stays templated', srch.get('templated') is True)
-        check('v2 cover routed to img', '/kobo-clara-bw/img/' in v2['publications'][0]['images'][0]['href'])
+        check('v2 cover routed to img', '/kobo-clara-hd-2e-bw/img/' in v2['publications'][0]['images'][0]['href'])
         check(
             'v2 acquisition routed to dl',
-            any('/kobo-clara-bw/dl/' in x['href'] for x in v2['publications'][0]['links']),
+            any('/kobo-clara-hd-2e-bw/dl/' in x['href'] for x in v2['publications'][0]['links']),
         )
 
-        stok = re.search(r'/kobo-clara-bw/s/([\w-]+)', srch['href']).group(1)
+        stok = re.search(r'/kobo-clara-hd-2e-bw/s/([\w-]+)', srch['href']).group(1)
         r = await c.get(
-            f'/kobo-clara-bw/s/{stok}', params={'query': 'sample query'}, headers={'accept': 'application/opds+json'}
+            f'/kobo-clara-hd-2e-bw/s/{stok}',
+            params={'query': 'sample query'},
+            headers={'accept': 'application/opds+json'},
         )
         check('v2 search term reaches upstream', 'v2hits:sample query' in r.text, r.text[:60])
 
@@ -3886,16 +3956,16 @@ async def main() -> int:
         check('readingOrder page is not a thumbnail', pw > 640)
 
         etok = encode_token('http://127.0.0.1:8899/opds/v2/books/8/manifest')
-        eman = (await c.get(f'/kobo-clara-bw/f/{etok}')).json()
+        eman = (await c.get(f'/kobo-clara-hd-2e-bw/f/{etok}')).json()
         check(
             'epub readingOrder NOT sent to image pipeline',
-            '/kobo-clara-bw/dl/' in eman['readingOrder'][0]['href'],
-            eman['readingOrder'][0]['href'].split('/kobo-clara-bw/')[-1][:6],
+            '/kobo-clara-hd-2e-bw/dl/' in eman['readingOrder'][0]['href'],
+            eman['readingOrder'][0]['href'].split('/kobo-clara-hd-2e-bw/')[-1][:6],
         )
-        check('css resource passed through', '/kobo-clara-bw/dl/' in eman['resources'][0]['href'])
-        check('image resource still rendered', '/kobo-clara-bw/pf/' in eman['resources'][1]['href'])
+        check('css resource passed through', '/kobo-clara-hd-2e-bw/dl/' in eman['resources'][0]['href'])
+        check('image resource still rendered', '/kobo-clara-hd-2e-bw/pf/' in eman['resources'][1]['href'])
         ctok = re.search(r'/dl/([\w-]+)', eman['readingOrder'][0]['href']).group(1)
-        r = await c.get(f'/kobo-clara-bw/dl/{ctok}')
+        r = await c.get(f'/kobo-clara-hd-2e-bw/dl/{ctok}')
         check('xhtml chapter served untouched', 'chapter one' in r.text)
 
         print('HEAD')
@@ -3905,20 +3975,20 @@ async def main() -> int:
         for label, path in (
             ('healthz', '/healthz'),
             ('index', '/'),
-            ('catalog', '/kobo-clara-bw/catalog'),
-            ('feed', f'/kobo-clara-bw/f/{feed_tok}'),
-            ('osd', f'/kobo-clara-bw/osd/{osd}'),
-            ('page', f'/kobo-clara-bw/p/{pse}?page=1'),
-            ('cover', f'/kobo-clara-bw/img/{img}'),
-            ('download', f'/kobo-clara-bw/dl/{dl}'),
+            ('catalog', '/kobo-clara-hd-2e-bw/catalog'),
+            ('feed', f'/kobo-clara-hd-2e-bw/f/{feed_tok}'),
+            ('osd', f'/kobo-clara-hd-2e-bw/osd/{osd}'),
+            ('page', f'/kobo-clara-hd-2e-bw/p/{pse}?page=1'),
+            ('cover', f'/kobo-clara-hd-2e-bw/img/{img}'),
+            ('download', f'/kobo-clara-hd-2e-bw/dl/{dl}'),
         ):
             r = await c.request('HEAD', path)
             check(f'HEAD {label} is not 405', r.status_code == 200, f'status={r.status_code}')
             check(f'HEAD {label} has no body', not r.content, f'{len(r.content)} bytes')
 
-        await c.get(f'/kobo-clara-bw/p/{pse}?page=2')
-        g = await c.get(f'/kobo-clara-bw/p/{pse}?page=2')
-        h = await c.request('HEAD', f'/kobo-clara-bw/p/{pse}?page=2')
+        await c.get(f'/kobo-clara-hd-2e-bw/p/{pse}?page=2')
+        g = await c.get(f'/kobo-clara-hd-2e-bw/p/{pse}?page=2')
+        h = await c.request('HEAD', f'/kobo-clara-hd-2e-bw/p/{pse}?page=2')
         keys = ('content-type', 'content-length')
         check(
             'HEAD on a page reports the same headers as GET',
@@ -3927,8 +3997,8 @@ async def main() -> int:
         )
 
         ptok2 = encode_token('http://127.0.0.1:8899/opds/v1.2/plain.cbz')
-        hg = await c.get(f'/kobo-clara-bw/dl/{ptok2}')
-        hh = await c.request('HEAD', f'/kobo-clara-bw/dl/{ptok2}')
+        hg = await c.get(f'/kobo-clara-hd-2e-bw/dl/{ptok2}')
+        hh = await c.request('HEAD', f'/kobo-clara-hd-2e-bw/dl/{ptok2}')
         check(
             'HEAD on a download matches the GET content-type',
             hh.headers.get('content-type') == hg.headers.get('content-type') == 'application/vnd.comicbook+zip',
@@ -3959,9 +4029,9 @@ async def main() -> int:
             ('upstream 4xx', 'http://127.0.0.1:8899/opds/v1.2/missing', 404),
             ('blocked host', 'http://169.254.169.254/latest/', 403),
         ):
-            r = await c.request('HEAD', '/kobo-clara-bw/dl/' + encode_token(target))
+            r = await c.request('HEAD', '/kobo-clara-hd-2e-bw/dl/' + encode_token(target))
             check(f'HEAD forwards {label}', r.status_code == want, f'status={r.status_code} want={want}')
-        r = await c.request('HEAD', '/kobo-clara-bw/dl/!!!not-base64!!!')
+        r = await c.request('HEAD', '/kobo-clara-hd-2e-bw/dl/!!!not-base64!!!')
         check('HEAD on a malformed token is 400', r.status_code == 400, f'status={r.status_code}')
         r = await c.request('HEAD', '/nope/catalog')
         check('HEAD on an unknown profile is 404', r.status_code == 404, f'status={r.status_code}')
@@ -3969,14 +4039,14 @@ async def main() -> int:
         print('guards')
         r = await c.get('/nope/catalog')
         check('unknown profile 404', r.status_code == 404)
-        r = await c.get('/kobo-clara-bw/f/' + encode_token('http://169.254.169.254/latest/'))
+        r = await c.get('/kobo-clara-hd-2e-bw/f/' + encode_token('http://169.254.169.254/latest/'))
         check('SSRF blocked', r.status_code == 403)
         r = await c.get('/healthz')
         check('healthz', r.status_code == 200)
 
         print('regressions')
 
-        r = await c.get('/kobo-clara-bw/f/' + encode_token('http://127.0.0.1:8899/opds/v1.2/redirect'))
+        r = await c.get('/kobo-clara-hd-2e-bw/f/' + encode_token('http://127.0.0.1:8899/opds/v1.2/redirect'))
         check('SSRF blocked across a redirect', r.status_code == 403, f'status={r.status_code}')
 
         from inksetter.opds import upstream as _upmod
@@ -3994,7 +4064,7 @@ async def main() -> int:
                 ('image', 'img'),
                 ('download', 'dl'),
             ):
-                r = await c.get(f'/kobo-clara-bw/{route}/' + encode_token(f'{dead}/x.cbz'))
+                r = await c.get(f'/kobo-clara-hd-2e-bw/{route}/' + encode_token(f'{dead}/x.cbz'))
                 check(
                     f'an unreachable upstream is 502 on the {label} route',
                     r.status_code == 502,
@@ -4009,7 +4079,7 @@ async def main() -> int:
             _upmod.settings = real_settings
 
         for label, tok in (('not base64', '!!!not-base64!!!'), ('bad utf-8', '_w==')):
-            r = await c.get(f'/kobo-clara-bw/f/{tok}')
+            r = await c.get(f'/kobo-clara-hd-2e-bw/f/{tok}')
             check(f'malformed token ({label}) is 400', r.status_code == 400, f'status={r.status_code}')
 
         gz = encode_token('http://127.0.0.1:8899/opds/v1.2/gz/file.cbz')
@@ -4036,7 +4106,9 @@ async def main() -> int:
             f'{len(r.content)}B vs source {len(fake_page(0))}B',
         )
 
-        ctx = rewrite.Ctx(profile='kobo-clara-bw', public_base='http://proxy.test', base_url='http://127.0.0.1:8899/m')
+        ctx = rewrite.Ctx(
+            profile='kobo-clara-hd-2e-bw', public_base='http://proxy.test', base_url='http://127.0.0.1:8899/m'
+        )
         nested = json.loads(
             rewrite.rewrite_json(
                 json.dumps(
@@ -4056,7 +4128,7 @@ async def main() -> int:
         )
         check(
             'nav link nested in readingOrder stays a feed',
-            '/kobo-clara-bw/f/' in nested['readingOrder'][0]['links'][0]['href'],
+            '/kobo-clara-hd-2e-bw/f/' in nested['readingOrder'][0]['links'][0]['href'],
             nested['readingOrder'][0]['links'][0]['href'].split('clara')[-1][:6],
         )
 
@@ -4079,7 +4151,7 @@ async def main() -> int:
         )
         check(
             'alternate encoding of a page stays a page',
-            '/kobo-clara-bw/pf/' in alt['readingOrder'][0]['alternate'][0]['href'],
+            '/kobo-clara-hd-2e-bw/pf/' in alt['readingOrder'][0]['alternate'][0]['href'],
             alt['readingOrder'][0]['alternate'][0]['href'].split('clara')[-1][:6],
         )
 
@@ -4093,7 +4165,7 @@ async def main() -> int:
 
         CREDS_SEEN.clear()
         r = await c.get(
-            '/kobo-clara-bw/dl/' + encode_token('http://127.0.0.1:8899/opds/v1.2/sidehop'),
+            '/kobo-clara-hd-2e-bw/dl/' + encode_token('http://127.0.0.1:8899/opds/v1.2/sidehop'),
             headers={'authorization': 'Basic c2VjcmV0', 'cookie': 'session=abc'},
         )
         check('cross-origin redirect is refused', r.status_code == 403, f'status={r.status_code}')
@@ -4119,7 +4191,7 @@ async def main() -> int:
 
         CREDS_SEEN.clear()
         await c.get(
-            '/kobo-clara-bw/dl/' + encode_token('http://127.0.0.1:8899/opds/v1.2/collect'),
+            '/kobo-clara-hd-2e-bw/dl/' + encode_token('http://127.0.0.1:8899/opds/v1.2/collect'),
             headers={'authorization': 'Basic c2VjcmV0'},
         )
         check(
@@ -4129,14 +4201,14 @@ async def main() -> int:
         )
 
         for label, path in (('empty', 'empty-feed'), ('binary', 'binary-feed')):
-            r = await c.get('/kobo-clara-bw/f/' + encode_token(f'http://127.0.0.1:8899/opds/v1.2/{path}'))
+            r = await c.get('/kobo-clara-hd-2e-bw/f/' + encode_token(f'http://127.0.0.1:8899/opds/v1.2/{path}'))
             check(
                 f'{label} body under a feed content-type is not a 500', r.status_code < 500, f'status={r.status_code}'
             )
 
-        r = await c.get('/kobo-clara-bw/dl/' + encode_token('http://127.0.0.1:8899/opds/v1.2/tarball.tgz'))
+        r = await c.get('/kobo-clara-hd-2e-bw/dl/' + encode_token('http://127.0.0.1:8899/opds/v1.2/tarball.tgz'))
         check('gzip is not mistaken for a zip', r.status_code == 200, f'status={r.status_code}')
-        r = await c.get('/kobo-clara-bw/dl/' + encode_token('http://127.0.0.1:8899/opds/v1.2/corrupt.cbz'))
+        r = await c.get('/kobo-clara-hd-2e-bw/dl/' + encode_token('http://127.0.0.1:8899/opds/v1.2/corrupt.cbz'))
         check(
             'corrupt archive falls back to passthrough',
             r.status_code == 200 and r.content.startswith(b'PK\x03\x04'),
@@ -4144,9 +4216,13 @@ async def main() -> int:
         )
 
         before = dict(_RANGED)
-        ranged = await c.get('/kobo-clara-bw/dl/' + encode_token('http://127.0.0.1:8899/opds/v1.2/ranged/file.cbz'))
+        ranged = await c.get(
+            '/kobo-clara-hd-2e-bw/dl/' + encode_token('http://127.0.0.1:8899/opds/v1.2/ranged/file.cbz')
+        )
         used = _RANGED['requests'] - before['requests']
-        plain = await c.get('/kobo-clara-bw/dl/' + encode_token('http://127.0.0.1:8899/opds/v1.2/norange/file.cbz'))
+        plain = await c.get(
+            '/kobo-clara-hd-2e-bw/dl/' + encode_token('http://127.0.0.1:8899/opds/v1.2/norange/file.cbz')
+        )
         check('a range download succeeds', ranged.status_code == 200, f'status={ranged.status_code}')
         check('so does one that must fall back', plain.status_code == 200, f'status={plain.status_code}')
         check('the range path was actually taken', used > 0, f'{used} range requests')
@@ -4171,7 +4247,7 @@ async def main() -> int:
             f'{ranged.headers.get("content-length")!r}',
         )
 
-        r = await c.get('/kobo-clara-bw/f/' + encode_token('http://127.0.0.1:8899/opds/v1.2/withicon'))
+        r = await c.get('/kobo-clara-hd-2e-bw/f/' + encode_token('http://127.0.0.1:8899/opds/v1.2/withicon'))
         check('feed with an icon still serves', r.status_code == 200, f'status={r.status_code}')
         check(
             'no upstream credential survives in the feed text',
@@ -4182,26 +4258,26 @@ async def main() -> int:
             m = re.search(rf'<{tag}>([^<]*)</{tag}>', r.text)
             check(
                 f'<{tag}> is rewritten through the proxy',
-                bool(m) and '/kobo-clara-bw/img/' in m.group(1),
+                bool(m) and '/kobo-clara-hd-2e-bw/img/' in m.group(1),
                 (m.group(1)[:70] if m else 'element gone'),
             )
 
         for label, path in (('undecodable', 'notanimage'), ('empty body', 'emptyimage')):
-            r = await c.get('/kobo-clara-bw/p/' + encode_token(f'http://127.0.0.1:8899/opds/v1.2/{path}'))
+            r = await c.get('/kobo-clara-hd-2e-bw/p/' + encode_token(f'http://127.0.0.1:8899/opds/v1.2/{path}'))
             check(
                 f'{label} upstream page is 502, not 500',
                 r.status_code == 502,
                 f'status={r.status_code} {r.text[:60]}',
             )
-        r = await c.get('/kobo-clara-bw/p/' + encode_token('http://127.0.0.1:8899/opds/v1.2/upstream500'))
+        r = await c.get('/kobo-clara-hd-2e-bw/p/' + encode_token('http://127.0.0.1:8899/opds/v1.2/upstream500'))
         check('upstream 5xx becomes 502', r.status_code == 502, f'status={r.status_code}')
-        r = await c.get('/kobo-clara-bw/p/' + encode_token('http://127.0.0.1:8899/opds/v1.2/missing'))
+        r = await c.get('/kobo-clara-hd-2e-bw/p/' + encode_token('http://127.0.0.1:8899/opds/v1.2/missing'))
         check('upstream 4xx is forwarded as itself', r.status_code == 404, f'status={r.status_code}')
 
         from inksetter.imaging.pipeline import UnreadableImage as _Unreadable
 
         try:
-            pipeline.render_page(b'<html>no</html>', profiles.PROFILES['kobo-clara-bw'])
+            pipeline.render_page(b'<html>no</html>', profiles.PROFILES['kobo-clara-hd-2e-bw'])
             check('an unreadable page raises UnreadableImage', False, 'no error raised')
         except _Unreadable as exc:
             check('an unreadable page raises UnreadableImage', True, str(exc)[:50])
@@ -4209,7 +4285,7 @@ async def main() -> int:
             check('an unreadable page raises UnreadableImage', False, f'{type(exc).__name__}')
 
         ptok = encode_token('http://127.0.0.1:8899/opds/v1.2/plain.cbz')
-        rp = await c.get(f'/kobo-clara-bw/dl/{ptok}')
+        rp = await c.get(f'/kobo-clara-hd-2e-bw/dl/{ptok}')
         inner = zipfile.ZipFile(io.BytesIO(rp.content))
         check(
             'repacked download is a readable cbz',
@@ -4228,7 +4304,7 @@ async def main() -> int:
             f'header={r0.headers.get("content-length")!r} body={len(r0.content)}',
         )
 
-        r = await c.get(f'/kobo-clara-bw/p/{pse}', params={'page': '{pageNumber}', 'maxWidth': '{maxWidth}'})
+        r = await c.get(f'/kobo-clara-hd-2e-bw/p/{pse}', params={'page': '{pageNumber}', 'maxWidth': '{maxWidth}'})
         check(
             'unsubstituted placeholders still serve page 0',
             r.status_code == 200 and r.headers['content-type'] == 'image/png',
@@ -4254,7 +4330,7 @@ async def main() -> int:
     check('jpegc repack names JPEG pages .jpg', pages and all(n.endswith('.jpg') for n in pages), f'{pages}')
     check('jpegc repack really contains JPEG', all(zf.read(n)[:3] == b'\xff\xd8\xff' for n in pages))
     zf4 = zipfile.ZipFile(
-        io.BytesIO(b''.join(cbz.repack_iter(io.BytesIO(_cbz_bytes(2)), profiles.PROFILES['kobo-clara-bw'])))
+        io.BytesIO(b''.join(cbz.repack_iter(io.BytesIO(_cbz_bytes(2)), profiles.PROFILES['kobo-clara-hd-2e-bw'])))
     )
     check('png4 repack still names pages .png', all(n.endswith('.png') for n in zf4.namelist() if n[0].isdigit()))
 
@@ -4262,7 +4338,7 @@ async def main() -> int:
     with zipfile.ZipFile(bomb, 'w', zipfile.ZIP_DEFLATED) as z:
         z.writestr('big.jpg', bytes(8 * 1024**2))
     try:
-        cbz.repack_to(io.BytesIO(bomb.getvalue()), io.BytesIO(), profiles.PROFILES['kobo-clara-bw'])
+        cbz.repack_to(io.BytesIO(bomb.getvalue()), io.BytesIO(), profiles.PROFILES['kobo-clara-hd-2e-bw'])
         check('a highly compressible archive is no longer refused', True)
     except ValueError as exc:
         check('a highly compressible archive is no longer refused', False, str(exc)[:52])
@@ -4277,7 +4353,7 @@ async def main() -> int:
 
     from inksetter.cache import render_key as _rk
 
-    _a = profiles.PROFILES['kobo-libra-2']
+    _a = profiles.PROFILES['kobo-libra-h2o-2']
     check(
         'renamed clone of a profile shares its cache key',
         _rk('http://u/p', _a, None) == _rk('http://u/p', dataclasses.replace(_a, name='clone'), None),
@@ -4308,6 +4384,7 @@ async def main() -> int:
     print('module boundary')
     check_module_boundary()
     print('profile config')
+    check_family_duplicates()
     check_profile_config()
     print('profile source')
     check_profile_source()
