@@ -16,7 +16,7 @@ from .imaging.pipeline import PIPELINE_VERSION
 _KEY_IGNORED_FIELDS = frozenset({'name', 'reslice'})
 
 
-def render_key(url: str, profile: Profile, max_width: int | None) -> str:
+def render_key(url: str, profile: Profile, max_width: int | None, credentials: str = '') -> str:
     fields = {k: v for k, v in dataclasses.asdict(profile).items() if k not in _KEY_IGNORED_FIELDS}
     h = hashlib.sha256()
     h.update(PIPELINE_VERSION.encode())
@@ -26,6 +26,9 @@ def render_key(url: str, profile: Profile, max_width: int | None) -> str:
     h.update(str(max_width or 0).encode())
     h.update(b'\0')
     h.update(url.encode())
+    if credentials:
+        h.update(b'\0')
+        h.update(credentials.encode())
     return h.hexdigest()
 
 

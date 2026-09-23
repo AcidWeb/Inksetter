@@ -26,7 +26,7 @@ from .imaging import cbz, profiles
 from .imaging.pipeline import UnreadableImage, render_page
 from .imaging.profiles import Profile, cover_for
 from .opds import rewrite
-from .opds.upstream import FORWARD_RESPONSE, UpstreamError, client, open_range, request_headers
+from .opds.upstream import CREDENTIAL_REQUEST, FORWARD_RESPONSE, UpstreamError, client, open_range, request_headers
 from .settings import settings
 
 logs.configure()
@@ -167,7 +167,7 @@ async def _serve_feed(request: Request, profile_name: str, url: str) -> Response
     resp = await client.get(url, request_headers(request.headers, forward_accept=True))
     ctype = resp.headers.get('content-type', '')
     page_mime = None if p.fmt == 'raw' else p.mime
-    if rewrite.is_feed(ctype):
+    if rewrite.is_feed(ctype, resp.content):
         body = rewrite.rewrite(resp.content, ctype, _ctx(request, profile_name, url), page_mime, not p.reslice)
     else:
         body = resp.content
@@ -263,8 +263,12 @@ async def browse_search(profile: str, token: str, request: Request, q: str = '')
 # --------------------------------------------------------------------------
 
 
+def _credentials(headers: dict[str, str]) -> str:
+    return '\n'.join(f'{k}={headers[k]}' for k in sorted(CREDENTIAL_REQUEST) if headers.get(k))
+
+
 async def _render_cached(url: str, p: Profile, max_width: int | None, headers: dict[str, str]) -> tuple[bytes, str]:
-    key = render_key(url, p, max_width)
+    key = render_key(url, p, max_width, _credentials(headers))
     hit = await asyncio.to_thread(cache.get, key)
     if hit is not None:
         return hit
@@ -314,7 +318,7 @@ async def page(profile: str, token: str, request: Request, page: str = '0', maxW
         url = build(n)
         prefetcher.spawn(
             _prefetch(url, p, max_width or None, headers),
-            render_key(url, p, max_width or None),
+            render_key(url, p, max_width or None, _credentials(headers)),
         )
 
     return Response(
@@ -325,7 +329,7 @@ async def page(profile: str, token: str, request: Request, page: str = '0', maxW
 
 
 async def _prefetch(url: str, p: Profile, max_width: int | None, headers: dict[str, str]) -> None:
-    key = render_key(url, p, max_width)
+    key = render_key(url, p, max_width, _credentials(headers))
     try:
         await _render_cached(url, p, max_width, headers)
     except Exception:

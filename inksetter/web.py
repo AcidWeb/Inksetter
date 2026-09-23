@@ -212,7 +212,8 @@ def _q(href: str, trail: str) -> str:
 def _map(href: str | None, kind: str, ctx: Ctx, cover: str | None = None) -> str | None:
     if not href:
         return None
-    return rewrite.map_href(href, BROWSE_KIND.get(kind, kind), ctx, cover=cover) or None
+    mapped = rewrite.map_href(href, BROWSE_KIND.get(kind, kind), ctx, cover=cover)
+    return mapped if mapped and mapped.startswith(f'{ctx.public_base}/') else None
 
 
 def _text(el, tag: str) -> str:

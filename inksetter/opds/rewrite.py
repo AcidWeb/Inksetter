@@ -55,6 +55,8 @@ JSON_TYPES = (
 PAGE_CONTAINERS = ('readingOrder', 'resources')
 SAME_RESOURCE_KEYS = ('alternate',)
 SEARCH_VARIABLES = frozenset({'searchTerms', 'query', 'search'})
+GENERIC_TYPES = frozenset({'', 'text/plain', 'application/octet-stream', 'binary/octet-stream'})
+_SEAL = '~key~'
 EXPRESSION = re.compile(r'\{([?&]?)([^{}]*)\}')
 
 
@@ -62,8 +64,17 @@ class TokenError(ValueError):
     pass
 
 
+def _secret() -> str:
+    from .. import kavita
+
+    return kavita.api_key()
+
+
 def encode_token(url: str, cover: str | None = None) -> str:
     raw = f'{url}\n{cover}' if cover else url
+    secret = _secret()
+    if secret:
+        raw = raw.replace(secret, _SEAL)
     return base64.urlsafe_b64encode(raw.encode('utf-8')).decode('ascii').rstrip('=')
 
 
@@ -82,6 +93,9 @@ def decode_parts(token: str) -> tuple[str, str | None]:
         raw = base64.urlsafe_b64decode(token + pad).decode('utf-8')
     except (binascii.Error, UnicodeDecodeError, ValueError) as exc:
         raise TokenError(f'malformed token: {token[:24]}') from exc
+    secret = _secret()
+    if secret:
+        raw = raw.replace(_SEAL, secret)
     url, _, cover = raw.partition('\n')
     if not _fetchable(url):
         raise TokenError(f'malformed token: {token[:24]}')
@@ -235,6 +249,9 @@ def rewrite_atom(body: bytes, ctx: Ctx, page_mime: str | None, stream: bool = Tr
     if root is None:
         return body
 
+    if root.tag == f'{{{OSD_NS}}}OpenSearchDescription':
+        return _rewrite_osd(root, ctx)
+
     for tag in ('icon', 'logo'):
         for el in root.iter(f'{{{ATOM}}}{tag}'):
             href = (el.text or '').strip()
@@ -274,6 +291,10 @@ def rewrite_opensearch(body: bytes, ctx: Ctx) -> bytes:
     root = root_or_none(body)
     if root is None:
         return body
+    return _rewrite_osd(root, ctx)
+
+
+def _rewrite_osd(root, ctx: Ctx) -> bytes:
     for url in root.iter(f'{{{OSD_NS}}}Url'):
         tpl = url.get('template')
         if tpl:
@@ -390,7 +411,7 @@ def rewrite(body: bytes, content_type: str, ctx: Ctx, page_mime: str | None, str
         return rewrite_json(body, ctx, page_mime, stream)
     if 'xml' in ct:
         return rewrite_atom(body, ctx, page_mime, stream)
-    head = body.lstrip()[:1]
+    head = _head(body)
     if head == b'{':
         return rewrite_json(body, ctx, page_mime, stream)
     if head == b'<':
@@ -398,6 +419,12 @@ def rewrite(body: bytes, content_type: str, ctx: Ctx, page_mime: str | None, str
     return body
 
 
-def is_feed(content_type: str) -> bool:
+def _head(body: bytes) -> bytes:
+    return body.lstrip(b' \t\r\n\xef\xbb\xbf')[:1]
+
+
+def is_feed(content_type: str, body: bytes = b'') -> bool:
     ct = (content_type or '').lower()
-    return 'xml' in ct or 'opensearchdescription' in ct or any(j in ct for j in JSON_TYPES)
+    if 'xml' in ct or 'opensearchdescription' in ct or any(j in ct for j in JSON_TYPES):
+        return True
+    return ct.split(';')[0].strip() in GENERIC_TYPES and _head(body) in (b'<', b'{')

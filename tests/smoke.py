@@ -525,6 +525,73 @@ BROKEN_HREF_FEED = FEED.replace(
 )
 
 
+SEAL_KEY = 'SealTest42key'
+
+
+@upstream.get('/api/opds/{key}/feed')
+def _kavita_like_feed(key: str):
+    if key != SEAL_KEY:
+        return Response('unknown key', status_code=401)
+    body = f"""<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+ <title>Kavita-like</title>
+ <icon>/api/opds/{key}/favicon</icon>
+ <link rel="self" type="application/atom+xml;profile=opds-catalog" href="/api/opds/{key}/feed"/>
+ <link rel="search" type="application/opensearchdescription+xml" href="/api/opds/{key}/search"/>
+ <entry><title>Shelf</title>
+  <link rel="subsection" type="application/atom+xml;profile=opds-catalog" href="/api/opds/{key}/feed?shelf=1"/>
+ </entry>
+ <entry><title>Vol 1</title>
+  <link rel="http://opds-spec.org/image" type="image/jpeg" href="/api/opds/{key}/image?seriesId=1&amp;apiKey={key}"/>
+  <link rel="http://opds-spec.org/acquisition" type="application/vnd.comicbook+zip"
+        href="/api/opds/{key}/series/1/volume/2/chapter/3/download/x.cbz"/>
+ </entry>
+</feed>"""
+    return Response(body, media_type='application/atom+xml;profile=opds-catalog')
+
+
+GUARDED_PAGE = {'hits': 0}
+
+
+@upstream.get('/opds/v1.2/guarded-page')
+def _guarded_page(authorization: str = Header(default='')):
+    GUARDED_PAGE['hits'] += 1
+    if authorization != 'Basic Zm9vOmJhcg==':
+        return Response('denied', status_code=401, headers={'www-authenticate': 'Basic realm="Komga"'})
+    return Response(fake_page(4), media_type='image/jpeg')
+
+
+@upstream.get('/opds/v1.2/untyped/{shape}/{kind}')
+def _untyped(shape: str, kind: str):
+    body = {'atom': FEED, 'bom': '﻿' + FEED, 'json': json.dumps(FEED_V2)}[shape]
+    media = {'plain': 'text/plain', 'octet': 'application/octet-stream', 'none': None}[kind]
+    return Response(body, media_type=media)
+
+
+@upstream.get('/opds/v1.2/osd-as-xml')
+def _osd_as_xml():
+    body = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<OpenSearchDescription xmlns="http://a9.com/-/spec/opensearch/1.1/">'
+        '<Url type="application/atom+xml" template="/opds/v1.2/search?query={searchTerms}"/>'
+        '</OpenSearchDescription>'
+    )
+    return Response(body, media_type='application/xml')
+
+
+@upstream.get('/opds/v1.2/hostile')
+def _hostile():
+    body = FEED.replace(
+        '<entry><title>Vol 1</title>',
+        '<entry><title>Trap</title><link rel="subsection" type="application/atom+xml;profile=opds-catalog" '
+        'href="javascript:alert(document.domain)"/></entry>'
+        '<entry><title>Trap 2</title><link rel="subsection" type="application/atom+xml;profile=opds-catalog" '
+        'href="data:text/html,&lt;script&gt;alert(1)&lt;/script&gt;"/></entry>'
+        '<entry><title>Vol 1</title>',
+    )
+    return Response(body, media_type='application/atom+xml;profile=opds-catalog')
+
+
 @upstream.get('/opds/v1.2/badhref')
 def _bad_href():
     return Response(BROKEN_HREF_FEED, media_type='application/atom+xml;profile=opds-catalog')
@@ -4226,6 +4293,89 @@ async def check_epub(c) -> None:
             )
 
 
+def _raw_token(token: str) -> str:
+    return base64.urlsafe_b64decode(token + '=' * (-len(token) % 4)).decode('utf-8', 'replace')
+
+
+async def check_security(c) -> None:
+    from inksetter import kavita
+
+    up = 'http://127.0.0.1:8899'
+    real = kavita.settings
+    kavita.settings = dataclasses.replace(settings_mod.settings, upstream_catalog=f'{up}/api/opds/{SEAL_KEY}')
+    try:
+        check('premise: the catalog carries a Kavita key', kavita.api_key() == SEAL_KEY)
+        start = encode_token(f'{up}/api/opds/{SEAL_KEY}/feed')
+        check('a token does not carry the upstream key', SEAL_KEY not in _raw_token(start), _raw_token(start))
+        check(
+            'and decodes back to the URL it was made from',
+            rewrite.decode_token(start) == f'{up}/api/opds/{SEAL_KEY}/feed',
+        )
+        r = await c.get(f'/kobo-clara-hd-2e-bw/f/{start}')
+        check('a feed behind the key is served through a sealed token', r.status_code == 200, f'status={r.status_code}')
+        tokens = re.findall(r'/kobo-clara-hd-2e-bw/\w+/([\w-]+)', r.text)
+        check('premise: the rewritten feed is full of tokens', len(tokens) >= 5, f'{len(tokens)}')
+        leaked = [t for t in tokens if SEAL_KEY in _raw_token(t)]
+        check('no link, icon or token in the feed carries the key', SEAL_KEY not in r.text and not leaked, f'{leaked}')
+        shelf = next((t for t in tokens if 'shelf=1' in rewrite.decode_token(t)), '')
+        r = await c.get(f'/kobo-clara-hd-2e-bw/f/{shelf}')
+        check('and following a link still reaches the keyed upstream', r.status_code == 200, f'status={r.status_code}')
+        old = base64.urlsafe_b64encode(f'{up}/api/opds/{SEAL_KEY}/feed'.encode()).decode().rstrip('=')
+        r = await c.get(f'/kobo-clara-hd-2e-bw/f/{old}')
+        check('a token issued before sealing still works', r.status_code == 200, f'status={r.status_code}')
+
+        b = await c.get(f'/kobo-clara-hd-2e-bw/b/{start}')
+        crumbs = re.findall(r'[?&](?:amp;)?t=([\w-]+)', b.text)
+        inside = [_raw_token(t) for t in re.findall(r'/kobo-clara-hd-2e-bw/\w+/([\w-]+)', b.text)]
+        check('premise: the browse page links through tokens', b.status_code == 200 and len(inside) >= 2)
+        check(
+            'the browse page carries no key, in its text, its links or its trail',
+            SEAL_KEY not in b.text
+            and not any(SEAL_KEY in x for x in inside)
+            and not any(SEAL_KEY in _raw_token(t) for t in crumbs),
+        )
+    finally:
+        kavita.settings = real
+
+    tok = encode_token(f'{up}/opds/v1.2/guarded-page')
+    alice = {'authorization': 'Basic Zm9vOmJhcg=='}
+    r = await c.get(f'/kobo-clara-hd-2e-bw/img/{tok}', headers=alice)
+    check('premise: the right credentials fetch the guarded page', r.status_code == 200, f'status={r.status_code}')
+    r = await c.get(f'/kobo-clara-hd-2e-bw/img/{tok}')
+    check('a reader without credentials is not served the cached page', r.status_code == 401, f'status={r.status_code}')
+    r = await c.get(f'/kobo-clara-hd-2e-bw/img/{tok}', headers={'authorization': 'Basic bWFsbG9yeTp4'})
+    check('nor is a reader with other credentials', r.status_code == 401, f'status={r.status_code}')
+    before = GUARDED_PAGE['hits']
+    r = await c.get(f'/kobo-clara-hd-2e-bw/img/{tok}', headers=alice)
+    check(
+        'while the reader who fetched it is still served from the cache',
+        r.status_code == 200 and GUARDED_PAGE['hits'] == before,
+        f'status={r.status_code}, {GUARDED_PAGE["hits"] - before} upstream request(s)',
+    )
+
+    for shape in ('atom', 'bom', 'json'):
+        for kind in ('plain', 'octet', 'none'):
+            r = await c.get(f'/kobo-clara-hd-2e-bw/f/{encode_token(f"{up}/opds/v1.2/untyped/{shape}/{kind}")}')
+            check(
+                f'a {shape} feed served as {kind} is still rewritten',
+                r.status_code == 200 and up not in r.text and '/kobo-clara-hd-2e-bw/' in r.text,
+                f'status={r.status_code} {r.text[:60]!r}',
+            )
+    r = await c.get(f'/kobo-clara-hd-2e-bw/f/{encode_token(f"{up}/opds/v1.2/osd-as-xml")}')
+    check(
+        'an OpenSearch description served as plain XML is rewritten as one',
+        '/kobo-clara-hd-2e-bw/s/' in r.text and '/opds/v1.2/search' not in r.text,
+        r.text[-160:],
+    )
+
+    b = await c.get(f'/kobo-clara-hd-2e-bw/b/{encode_token(f"{up}/opds/v1.2/hostile")}')
+    check('premise: the hostile feed is browsed', b.status_code == 200 and 'Vol 1' in b.text, f'status={b.status_code}')
+    check(
+        'a browse page links only to the proxy, never to a javascript: or data: URL',
+        'javascript:' not in b.text and 'data:text' not in b.text,
+    )
+
+
 def _host_key_of(url: str) -> str | None:
     from inksetter.opds.upstream import host_key
 
@@ -5455,6 +5605,9 @@ async def main() -> int:
 
         print('epub downloads')
         await check_epub(c)
+
+        print('security')
+        await check_security(c)
 
         print('browse pages')
         await check_browse(c)
