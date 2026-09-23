@@ -125,7 +125,7 @@ class Profile:
     palette: bool = True
     palette_colours: int = 256
     # The quantiser's speed/quality dial
-    png_effort: int = 4
+    png_effort: int = 7
     # Rainbow fringing related settings
     # Approach adapted from Kindle Comic Converter (ISC).
     #   diagonal  attenuate high diagonal frequencies

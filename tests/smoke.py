@@ -1877,7 +1877,7 @@ def _rich_colour_page(w: int = 900, h: int = 1200) -> bytes:
 
 def check_png_effort() -> None:
     prof = profiles.PROFILES['kindle-colorsoft']
-    check('the shipped default is the measured one', prof.png_effort == 4, f'{prof.png_effort}')
+    check('the shipped default is the measured one', prof.png_effort == 7, f'{prof.png_effort}')
 
     src = _rich_colour_page()
     lo, _ = pipeline.render_page(src, dataclasses.replace(prof, png_effort=1))
@@ -3428,6 +3428,53 @@ def check_search_templates() -> None:
         target,
     )
     check('so it is no longer advertised as templated', 'templated' not in link, f'{link}')
+
+
+def check_rounding() -> None:
+    clara = profiles.PROFILES['kobo-clara-hd-2e-bw']
+    plain = dataclasses.replace(
+        clara,
+        fmt='png8',
+        black=0,
+        white=255,
+        gamma=1.12,
+        usm_amount=0.0,
+        autocrop=False,
+        strip_folio=False,
+        descreen='none',
+    )
+    level = 100
+    exact = 255.0 * (level / 255.0) ** (1.0 / plain.gamma)
+    check('premise: the tone curve lands this level past the half', exact - int(exact) >= 0.5, f'{exact:.3f}')
+    flat = np.full((plain.height, plain.width), level, np.uint8)
+    blob = pyvips.Image.new_from_memory(flat.tobytes(), plain.width, plain.height, 1, 'uchar').pngsave_buffer()
+    out = pyvips.Image.new_from_buffer(pipeline.render_page(blob, plain)[0], '')
+    got = np.unique(np.ndarray(buffer=out.write_to_memory(), dtype=np.uint8, shape=(out.height, out.width)))
+    check(
+        'a mono page is rounded to 8 bits, not truncated',
+        got.tolist() == [round(exact)],
+        f'{got.tolist()} for {exact:.3f}',
+    )
+
+    yy, xx = np.mgrid[0:1200, 0:900]
+    grain = np.random.default_rng(4).uniform(-15, 15, (1200, 900))
+    tone = np.where((yy // 2 + xx // 2) % 2 == 0, 90.0, 170.0) + grain
+    bands = [tone, tone * 0.8 + 20, tone * 0.6 + 50]
+    grey = pyvips.Image.new_from_memory(np.clip(tone, 0, 255).astype(np.uint8).tobytes(), 900, 1200, 1, 'uchar')
+    colour = pyvips.Image.new_from_memory(
+        np.dstack([np.clip(b, 0, 255).astype(np.uint8) for b in bands]).tobytes(), 900, 1200, 3, 'uchar'
+    )
+    for label, im in (('grey', grey), ('colour', colour)):
+        cleaned = pipeline.descreen(im, clara, 0.3)
+        before = np.ndarray(buffer=im.write_to_memory(), dtype=np.uint8, shape=(1200, 900, im.bands)).astype(float)
+        after = np.ndarray(buffer=cleaned.write_to_memory(), dtype=np.uint8, shape=(1200, 900, im.bands)).astype(float)
+        check(
+            f'premise: descreen notches the {label} screentone',
+            after.std() < before.std() - 5,
+            f'{before.std():.1f} -> {after.std():.1f}',
+        )
+        drift = float(np.abs(after.mean(axis=(0, 1)) - before.mean(axis=(0, 1))).max())
+        check(f'descreen keeps the {label} page at its own mean level', drift < 0.25, f'drift {drift:.3f}')
 
 
 def check_bit_depth() -> None:
@@ -5869,6 +5916,7 @@ async def main() -> int:
     print('profile config')
     check_seam_defects()
     check_search_templates()
+    check_rounding()
     check_bit_depth()
     check_lazy_decode()
     check_reslice()

@@ -43,7 +43,7 @@ if not os.environ.get('VIPS_CONCURRENCY'):
     pyvips.concurrency_set(vips_threads(os.cpu_count() or 4))
 
 # Bump this whenever anything in this module changes in a way that alters output pixels. Bump invalidates the cache.
-PIPELINE_VERSION = '4'
+PIPELINE_VERSION = '5'
 
 _BAYER_N = 8
 
@@ -197,11 +197,11 @@ def descreen(im: pyvips.Image, p: Profile, scale: float = 1.0) -> pyvips.Image:
             if p.descreen_deadband > 0:
                 filtered = np.where(np.abs(filtered - plane) < p.descreen_deadband, plane, filtered)
             if im.bands == 1:
-                out = np.clip(filtered, 0, 255).astype(np.uint8)
+                out = np.clip(np.rint(filtered), 0, 255).astype(np.uint8)
                 return pyvips.Image.new_from_memory(out.tobytes(), im.width, im.height, 1, 'uchar')
             delta = (filtered - plane).astype(np.float32)
             correction = pyvips.Image.new_from_memory(delta.tobytes(), im.width, im.height, 1, 'float')
-            return (im.cast('float') + correction).cast('uchar')
+            return (im.cast('float') + correction).rint().cast('uchar')
     except pyvips.Error, MemoryError, ValueError:
         return im
 
@@ -614,7 +614,7 @@ def _render_mono(
     if g.bands > 1:
         g = g.colourspace('b-w')
     g = _unsharp(_tone(g.cast('float'), p, 255.0), p, geom.upscale)
-    g = defringe(g, p, 255.0).cast('uchar')
+    g = defringe(g, p, 255.0).rint().cast('uchar')
 
     if fmt == 'jpeg':
         return (
