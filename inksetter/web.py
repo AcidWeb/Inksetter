@@ -4,7 +4,6 @@ Basic web OPDS client.
 
 import json
 import base64
-import binascii
 from html import escape
 from dataclasses import dataclass
 from urllib.parse import quote
@@ -184,7 +183,7 @@ def decode_trail(value: str) -> tuple[tuple[str, str], ...]:
         return ()
     try:
         raw = base64.urlsafe_b64decode(value + '=' * (-len(value) % 4)).decode('utf-8')
-    except binascii.Error, UnicodeDecodeError, ValueError:
+    except ValueError:
         return ()
     out = []
     for line in raw.split('\n')[:TRAIL_MAX]:
@@ -228,11 +227,11 @@ def _human_bytes(raw: str | None) -> str:
         return ''
     if n <= 0:
         return ''
-    for unit in ('B', 'KB', 'MB', 'GB'):
-        if n < 1024 or unit == 'GB':
+    for unit in ('B', 'KB', 'MB'):
+        if n < 1024:
             return f'{n:.0f} {unit}' if unit == 'B' else f'{n:.1f} {unit}'
         n /= 1024
-    return ''
+    return f'{n:.1f} GB'
 
 
 def _note(entry, acquisition) -> str:
@@ -329,7 +328,7 @@ def _cover_tag(item: Item) -> str:
     return f'<img class="cover" loading="lazy" alt="" src="{escape(item.cover)}">'
 
 
-def _rows(items, trail: str, status: str = '') -> str:
+def _rows(items, trail: str, status: str) -> str:
     out = []
     for item in items:
         note = f'<div class="s">{escape(item.note)}</div>' if item.note else ''
@@ -341,8 +340,7 @@ def _rows(items, trail: str, status: str = '') -> str:
             title = f'<a class="t" href="{href}">{escape(item.title)}</a>'
             action = ''
         out.append(f'<li>{_cover_tag(item)}<div class="m">{title}{note}</div>{action}</li>')
-    tag = f'<ul data-status="{escape(status)}">' if status else '<ul>'
-    return f'{tag}{"".join(out)}</ul>'
+    return f'<ul data-status="{escape(status)}">{"".join(out)}</ul>'
 
 
 def _grid(items, trail: str) -> str:
@@ -463,15 +461,13 @@ def group_of(p: Profile) -> str:
 def index(base: str, entries) -> str:
     held: dict[str, list] = {title: [] for title, _ in GROUPS}
     for name, p in entries:
-        held.setdefault(group_of(p), []).append((name, p))
+        held[group_of(p)].append((name, p))
 
-    blurbs = dict(GROUPS)
     parts = ['<p class="lede">Open a profile to browse and download here, or add its catalog URL to a reader.</p>']
-    for title in list(blurbs) + [t for t in held if t not in blurbs]:
+    for title, blurb in GROUPS:
         members = held[title]
         if not members:
             continue
-        blurb = blurbs.get(title, '')
         rows = ''.join(
             f'<li><div class="m">'
             f'<a class="t" href="{escape(base)}/{quote(n)}/browse">{escape(n)}</a>'

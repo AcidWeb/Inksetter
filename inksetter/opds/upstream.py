@@ -24,7 +24,6 @@ FORWARD_RESPONSE = (
     'last-modified',
     'etag',
 )
-CHALLENGE = {401: 'www-authenticate'}
 DEFAULT_CHALLENGE = 'Basic realm="Inksetter"'
 MAX_REDIRECTS = 5
 TIMEOUT = 30.0
@@ -73,16 +72,14 @@ def _upstream_failure(exc: Exception) -> UpstreamError:
     return UpstreamError(502, f'upstream answered badly: {type(exc).__name__}')
 
 
-def _status_error(status: int, headers=None) -> UpstreamError:
+def _status_error(status: int, headers) -> UpstreamError:
     if status >= 500:
         return UpstreamError(502, f'upstream is failing: status {status}')
     if status == 407:
         return UpstreamError(502, 'the outbound proxy wants credentials; the reader cannot give them')
-    challenge = CHALLENGE.get(status)
-    if challenge is None:
+    if status != 401:
         return UpstreamError(status)
-    offered = (headers or {}).get(challenge) or (DEFAULT_CHALLENGE if status == 401 else '')
-    return UpstreamError(status, headers={challenge: offered} if offered else None)
+    return UpstreamError(401, headers={'www-authenticate': headers.get('www-authenticate') or DEFAULT_CHALLENGE})
 
 
 def _redirect_target(url: str, resp: httpx.Response) -> str | None:
@@ -150,7 +147,7 @@ class Client:
             raise _upstream_failure(exc) from exc
         raise UpstreamError(502, f'more than {MAX_REDIRECTS} redirects')
 
-    async def probe(self, url: str, headers: dict[str, str]) -> httpx.Response:
+    async def stream(self, url: str, headers: dict[str, str], sink=None) -> httpx.Response:
         origin = host_key(url)
         try:
             for _ in range(MAX_REDIRECTS + 1):
@@ -160,24 +157,9 @@ class Client:
                     if target is None:
                         if resp.status_code >= 400:
                             raise _status_error(resp.status_code, resp.headers)
-                        return resp
-                url = target
-        except httpx.HTTPError as exc:
-            raise _upstream_failure(exc) from exc
-        raise UpstreamError(502, f'more than {MAX_REDIRECTS} redirects')
-
-    async def download(self, url: str, headers: dict[str, str], sink) -> httpx.Response:
-        origin = host_key(url)
-        try:
-            for _ in range(MAX_REDIRECTS + 1):
-                check_host(url)
-                async with self.raw.stream('GET', url, headers=_hop_headers(headers, url, origin)) as resp:
-                    target = _redirect_target(url, resp)
-                    if target is None:
-                        if resp.status_code >= 400:
-                            raise _status_error(resp.status_code, resp.headers)
-                        async for chunk in resp.aiter_bytes(1 << 20):
-                            await asyncio.to_thread(sink.write, chunk)
+                        if sink is not None:
+                            async for chunk in resp.aiter_bytes(1 << 20):
+                                await asyncio.to_thread(sink.write, chunk)
                         return resp
                 url = target
         except httpx.HTTPError as exc:
@@ -202,12 +184,6 @@ class RangeReader:
 
     def seekable(self) -> bool:
         return True
-
-    def readable(self) -> bool:
-        return True
-
-    def writable(self) -> bool:
-        return False
 
     def tell(self) -> int:
         return self._pos
@@ -239,12 +215,6 @@ class RangeReader:
             self.closed = True
             self._blocks.clear()
             self._client.close()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        self.close()
 
     def _read_at(self, pos: int, size: int) -> bytes:
         if size >= _RANGE_BLOCK:

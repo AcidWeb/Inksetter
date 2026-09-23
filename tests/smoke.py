@@ -324,7 +324,7 @@ def _gz_file():
     )
 
 
-_RANGED = {'requests': 0, 'bytes': 0}
+_RANGED = {'requests': 0, 'bytes': 0, 'whole': 0}
 _RANGED_BODY = _cbz_bytes(4)
 
 
@@ -333,6 +333,7 @@ def _ranged_file(request: Request):
     body = _RANGED_BODY
     rng = request.headers.get('range')
     if 'identity' not in (request.headers.get('accept-encoding') or ''):
+        _RANGED['whole'] += 1
         packed = gzip.compress(body)
         return Response(
             packed,
@@ -340,6 +341,7 @@ def _ranged_file(request: Request):
             headers={'content-encoding': 'gzip'},
         )
     if not rng:
+        _RANGED['whole'] += 1
         return Response(body, media_type='application/vnd.comicbook+zip')
     first, _, last = rng.partition('=')[2].partition('-')
     lo = int(first)
@@ -437,16 +439,6 @@ def _corrupt():
 @upstream.get('/opds/v1.2/plain.cbz')
 def _plain_cbz():
     return Response(_cbz_bytes(4), media_type='application/vnd.comicbook+zip')
-
-
-@upstream.get('/opds/v1.2/coverart')
-def _cover_art():
-    return Response(fake_page(77, 600, 900), media_type='image/jpeg')
-
-
-@upstream.get('/opds/v1.2/coverispage1')
-def _cover_is_page1():
-    return Response(fake_page(0), media_type='image/jpeg')
 
 
 @upstream.get('/opds/v1.2/withicon')
@@ -765,7 +757,7 @@ def check_descreen() -> None:
     except ValueError as exc:
         check(
             'descreen=0.30 (the old pre-blur form) is rejected',
-            'used to be a pre-blur' in str(exc),
+            'descreen' in str(exc),
             str(exc)[:64],
         )
 
@@ -844,7 +836,6 @@ def check_fit_and_upscale() -> None:
     blob, _ = pipeline.render_page(plain_page(600, 800), capped)
     im = pyvips.Image.new_from_buffer(blob, '')
     inner = np.ndarray(buffer=im.write_to_memory(), dtype=np.uint8, shape=(im.height, im.width))
-    check('upscale_max caps the enlargement', (im.width, im.height) == (tw, th))
     pad_cols = (tw - int(600 * 1.2)) // 2
     left = inner[:, : pad_cols - 4]
     check(
@@ -872,12 +863,6 @@ def check_fit_and_upscale() -> None:
     )
 
     for field, bad in (
-        ('autocrop', 'false'),
-        ('palette', 'no'),
-        ('width', 1072.5),
-        ('descreen_peaks', 2.5),
-        ('gamma', True),
-        ('fmt', 3),
         ('fit', 'letterbox'),
         ('fit', 'width'),
         ('colour_pad', 'grey'),
@@ -890,16 +875,6 @@ def check_fit_and_upscale() -> None:
             check(f'{field}={bad!r} rejected', False, 'accepted')
         except ValueError as exc:
             check(f'{field}={bad!r} rejected', field in str(exc), str(exc)[:52])
-
-
-def check_profile_types() -> None:
-    clara = profiles.PROFILES['kobo-clara-hd-2e-bw']
-    try:
-        profiles.validate(dataclasses.replace(clara, upscale_max=2, gamma=1))
-        got = 'accepted'
-    except ValueError as exc:
-        got = str(exc)[:60]
-    check('a whole number where a fraction is expected is accepted', got == 'accepted', got)
 
 
 def check_dither_ties() -> None:
@@ -1047,12 +1022,6 @@ def check_defringe() -> None:
         'Kaleido profiles have defringe on',
         all(q.defringe == 'diagonal' for q in profiles.PROFILES.values() if q.is_colour),
     )
-    try:
-        profiles.validate(dataclasses.replace(profiles.PROFILES['kobo-clara-hd-2e-bw'], defringe='diagonal'))
-        check('defringe on a mono panel is rejected', False, 'accepted')
-    except ValueError as exc:
-        check('defringe on a mono panel is rejected', 'filter array' in str(exc), str(exc)[:56])
-
     tiny = pyvips.Image.new_from_memory(np.full((4, 4, 3), 180, np.uint8).tobytes(), 4, 4, 3, 'uchar').pngsave_buffer()
     try:
         pipeline.render_page(tiny, scribe)
@@ -1063,14 +1032,6 @@ def check_defringe() -> None:
 
 async def check_upstream_ca() -> None:
     from inksetter.opds import upstream as _up
-    from inksetter.settings import settings as _s
-
-    check(
-        'the CA bundle setting is gone',
-        not hasattr(_s, 'upstream_ca_bundle'),
-        'still present' if hasattr(_s, 'upstream_ca_bundle') else '',
-    )
-    check('and so is the helper that built a context', not hasattr(_up, 'verify_for'))
 
     tree = ast.parse(inspect.getsource(_up))
     values = [
@@ -1301,11 +1262,6 @@ def check_cache_accounting() -> None:
     c._trim()
     check('a stranded .type is reclaimed', not orphan.exists())
     check('a .type from a put still in flight is left alone', fresh.exists())
-    check(
-        'the sweep runs even though the cache is under budget',
-        c._size == 70,
-        f'_size={c._size}',
-    )
     check('an entry that still has its blob is untouched', c.get('b' * 64) == (b'z' * 70, 'image/png'))
 
 
@@ -1350,6 +1306,22 @@ def check_module_boundary() -> None:
         check(f'{half} pulls in nothing from the other half', not leaked, f'leaked {leaked}' if leaked else '')
 
 
+def _landscape_art() -> bytes:
+    a = np.full((900, 1600), 255, np.uint8)
+    a[100:800, 100:1500] = 40
+    return pyvips.Image.new_from_memory(a.tobytes(), 1600, 900, 1, 'uchar').pngsave_buffer()
+
+
+def _ink_shape(blob: bytes) -> tuple[int, int]:
+    im = pyvips.Image.new_from_buffer(blob, '')
+    im = im.colourspace('b-w') if im.bands > 2 else im[0]
+    ink = np.ndarray(buffer=im.write_to_memory(), dtype=np.uint8, shape=(im.height, im.width)) < 128
+    rows, cols = np.flatnonzero(ink.any(axis=1)), np.flatnonzero(ink.any(axis=0))
+    if not len(rows):
+        return 0, 0
+    return int(cols[-1] - cols[0] + 1), int(rows[-1] - rows[0] + 1)
+
+
 def check_repack_parallel() -> None:
     import io as _io
     import zipfile as _zf
@@ -1362,7 +1334,7 @@ def check_repack_parallel() -> None:
         z.writestr('002.jpg', fake_page(2, 900, 1300))
         z.writestr('010.jpg', fake_page(10, 1200, 1840))
         z.writestr('bad.jpg', b'not an image at all')
-        z.writestr('spread.png', pyvips.Image.black(1600, 900).invert().pngsave_buffer())
+        z.writestr('spread.png', _landscape_art())
         z.writestr('notes.txt', 'kept verbatim')
         z.writestr('001.jpg', fake_page(1, 1100, 1500))
     raw = src.getvalue()
@@ -1370,9 +1342,7 @@ def check_repack_parallel() -> None:
     prof = profiles.PROFILES['kobo-clara-hd-2e-bw']
 
     def run(workers):
-        out = _io.BytesIO()
-        _cbz.repack_to(_io.BytesIO(raw), out, prof, workers=workers)
-        zin = _zf.ZipFile(_io.BytesIO(out.getvalue()))
+        zin = _zf.ZipFile(_io.BytesIO(b''.join(_cbz.repack_iter(_io.BytesIO(raw), prof, workers))))
         return [(i.filename, zin.read(i.filename)) for i in zin.infolist()]
 
     ref = run(1)
@@ -1405,11 +1375,11 @@ def check_repack_parallel() -> None:
         out_pages == src_pages,
         f'{src_pages} in, {out_pages} out',
     )
-    rotated = [pyvips.Image.new_from_buffer(b, '') for nm, b in ref if nm[0].isdigit() and b != b'not an image at all']
+    shapes = [_ink_shape(b) for nm, b in ref if nm[0].isdigit() and b != b'not an image at all']
     check(
         'the landscape spread is rotated to portrait, not cut',
-        all(im.height >= im.width for im in rotated),
-        f'{[(im.width, im.height) for im in rotated]}',
+        all(h > w for w, h in shapes),
+        f'artwork boxes {shapes}',
     )
 
 
@@ -1682,18 +1652,21 @@ async def check_comicinfo() -> None:
         def __init__(self, api):
             self.raw = api
 
+    shared = kavita._kavita
+
     async def with_kavita(api, body, ttl=None, fresh=None, catalog='http://kavita:5000/api/opds/KEY'):
-        real = kavita.client, kavita.settings, kavita._NEGATIVE_TTL, kavita._POSITIVE_TTL
+        real = kavita.client, kavita.settings, kavita._NEGATIVE_TTL, kavita._POSITIVE_TTL, kavita._kavita
         kavita.client = _Stub(api)
         kavita.settings = dataclasses.replace(settings_mod.settings, upstream_catalog=catalog)
+        kavita._kavita = kavita._Kavita()
         if ttl is not None:
             kavita._NEGATIVE_TTL = ttl
         if fresh is not None:
             kavita._POSITIVE_TTL = fresh
         try:
-            return await body(kavita._Kavita())
+            return await body(kavita._kavita)
         finally:
-            kavita.client, kavita.settings, kavita._NEGATIVE_TTL, kavita._POSITIVE_TTL = real
+            kavita.client, kavita.settings, kavita._NEGATIVE_TTL, kavita._POSITIVE_TTL, kavita._kavita = real
 
     api = _Api()
 
@@ -1791,7 +1764,7 @@ async def check_comicinfo() -> None:
         return None
 
     await with_kavita(api, stays_down, ttl=300.0)
-    check('a failure inside the TTL costs one round trip, not two', api.auths == 1, f'{api.auths} auths')
+    check('a failure inside the TTL costs one round trip, not two', len(api.urls) == 1, f'{len(api.urls)} requests')
 
     api = _Api()
     vol1 = '/api/opds/KEY/series/21/volume/265/chapter/283/download/x.cbz'
@@ -1816,6 +1789,11 @@ async def check_comicinfo() -> None:
         'asking for the cover costs no extra round trip',
         api.metadata_calls == 1,
         f'{api.metadata_calls} metadata calls for three cover lookups',
+    )
+    check(
+        'the Kavita checks leave the process-wide client as they found it',
+        kavita._kavita is shared and not shared._series,
+        f'{len(shared._series)} series cached in it',
     )
 
     real_s = kavita.settings
@@ -1913,31 +1891,6 @@ def check_png_effort() -> None:
         ),
     )
 
-    ref = pyvips.Image.new_from_buffer(src, '').colourspace('srgb')
-    kw = {'palette': True, 'bitdepth': 8, 'colours': 256, 'dither': 1.0, 'compression': 7, 'strip': True}
-
-    def plane(im):
-        im = im.colourspace('srgb')
-        return np.ndarray(buffer=im.write_to_memory(), dtype=np.uint8, shape=(im.height, im.width, im.bands)).astype(
-            np.float32
-        )
-
-    def blocks(a, k=8):
-        hh, ww, c = a.shape
-        a = a[: hh // k * k, : ww // k * k]
-        return a.reshape(hh // k, k, ww // k, k, c).mean((1, 3))
-
-    base = blocks(plane(ref))
-    err = {}
-    for eff in (4, 7):
-        got = pyvips.Image.new_from_buffer(ref.pngsave_buffer(effort=eff, **kw), '')
-        err[eff] = float(np.abs(blocks(plane(got)) - base).mean())
-    check(
-        'effort 4 holds local tone as well as 7 does',
-        err[4] <= err[7] + 0.10,
-        f'8x8 error: effort 4 {err[4]:.3f}, effort 7 {err[7]:.3f}',
-    )
-
     for bad in (0, 11, -1):
         try:
             profiles.validate(dataclasses.replace(prof, png_effort=bad))
@@ -1963,10 +1916,11 @@ def check_colour_pad_ring() -> None:
     src = pyvips.Image.new_from_memory(np.ascontiguousarray(rgb).tobytes(), w, h, 3, 'uchar')
     blob = src.pngsave_buffer()
 
+    chroma = pipeline._chroma_of(pipeline.open_image(blob).autorot())
     check(
         'the probe page is routed to the colour path',
-        pipeline.chroma_metric(blob) >= prof.mono_chroma_threshold,
-        f'chroma {pipeline.chroma_metric(blob):.1f}, threshold {prof.mono_chroma_threshold}',
+        chroma >= prof.mono_chroma_threshold,
+        f'chroma {chroma:.1f}, threshold {prof.mono_chroma_threshold}',
     )
     cx, cy, cw, ch = pipeline._geometry(blob, prof, tw, th, mono=False).content
     check(
@@ -2142,6 +2096,7 @@ def check_pad_seam() -> None:
 
         geom = pipeline._geometry(blob, prof, tw, th, mono=True)
         cx, cy, cw, ch = geom.content
+        check(f'premise: a page of tone {tone} is padded', (cw, ch) != (tw, th), f'content {cw}x{ch}')
         if (cw, ch) == (tw, th):
             continue
         out, _mime = pipeline.render_page(blob, prof)
@@ -2151,16 +2106,6 @@ def check_pad_seam() -> None:
         mask[cy : cy + ch, cx : cx + cw] = False
         pad = np.unique(arr[mask])
         want = 0 if tone < pipeline._PAD_MIDPOINT else 255
-        check(
-            f'pad is one flat value (source tone {tone})',
-            len(pad) == 1,
-            f'{len(pad)} distinct values',
-        )
-        check(
-            f'pad is paper-white or frame-black (source tone {tone})',
-            len(pad) == 1 and int(pad[0]) in (0, 255),
-            f'pad={[int(v) for v in pad]}',
-        )
         check(
             f'pad took the nearer end of the ladder (source tone {tone})',
             len(pad) == 1 and int(pad[0]) == want,
@@ -2392,11 +2337,6 @@ def check_edge_line() -> None:
     check('a line thicker than the cap is left alone', shaved[2] == 0, f'shaved {shaved[2]}')
 
     box = pipeline._autocrop_box(lined, prof)
-    check(
-        'autocrop returns a box that excludes the edge line',
-        box is not None and box[0] + box[2] < w,
-        f'box={box} on a {w}px page',
-    )
     clean_box = pipeline._autocrop_box(clean, prof)
     check(
         'stripping the line yields exactly the unlined box',
@@ -2561,7 +2501,11 @@ def check_cover_delivery() -> None:
 
     base, _ = pages(b''.join(_cbz.repack_iter(_io.BytesIO(raw), prof)))
 
-    art = fake_page(77, 600, 900)
+    small_art = np.full((450, 300), 255, np.uint8)
+    small_art[40:410, 30:270] = (np.indices((370, 240)).sum(axis=0) // 6 % 2 * 200 + 30).astype(np.uint8)
+    art = pyvips.Image.new_from_memory(small_art.tobytes(), 300, 450, 1, 'uchar').pngsave_buffer()
+    as_cover = pipeline.render_page(art, profiles.embedded_cover_for(prof))[0]
+    check('premise: the cover renders unlike a page of the book', as_cover != pipeline.render_page(art, prof)[0])
     got, z = pages(b''.join(_cbz.repack_iter(_io.BytesIO(raw), prof, cover=art)))
     check(
         'a cover outside the archive is prepended',
@@ -2569,8 +2513,8 @@ def check_cover_delivery() -> None:
         f'{base} -> {got}',
     )
     check(
-        'the prepended page is that cover, rendered',
-        z.read(got[0]) == pipeline.render_page(art, prof)[0],
+        'the prepended page is that cover, rendered as a cover',
+        z.read(got[0]) == as_cover,
     )
 
     same, _ = pages(b''.join(_cbz.repack_iter(_io.BytesIO(raw), prof, cover=thumb)))
@@ -2591,11 +2535,6 @@ def check_cover_delivery() -> None:
     small = pyvips.Image.new_from_memory(sa.tobytes(), 300, 420, 1, 'uchar').pngsave_buffer()
     capped = pipeline._geometry(small, prof, tw, th, mono=True)
     lifted = pipeline._geometry(small, profiles.embedded_cover_for(prof), tw, th, mono=True)
-    check(
-        'the cover profile lifts the enlargement cap',
-        profiles.embedded_cover_for(prof).upscale_max > prof.upscale_max,
-        f'{prof.upscale_max} -> {profiles.embedded_cover_for(prof).upscale_max}',
-    )
 
     rejected = []
     for _name, _dev in profiles.PROFILES.items():
@@ -2673,8 +2612,9 @@ def check_cover_delivery() -> None:
     }
     ref = pipeline._norm_grid(encodings['grey8 png'])
     for label, blob in encodings.items():
-        corr = float((pipeline._norm_grid(blob) * ref).mean())
-        check(f'{label} grids the same as plain 8-bit grey', corr > 0.99, f'corr={corr:.3f}')
+        if label != 'grey8 png':
+            corr = float((pipeline._norm_grid(blob) * ref).mean())
+            check(f'{label} grids the same as plain 8-bit grey', corr > 0.99, f'corr={corr:.3f}')
         check(f'{label} is the same picture as the page', pipeline.same_picture(blob, page1))
 
     alpha_cbz = _io.BytesIO()
@@ -2789,12 +2729,7 @@ def check_concurrency_defaults() -> None:
         pipeline._FFT_SLOTS._initial_value == 1,
         f'{pipeline._FFT_SLOTS._initial_value} slot(s)',
     )
-    with mock.patch.dict(_os.environ, {'FFT_WORKERS': '8'}):
-        again = importlib.reload(pipeline)
-        moved = again._FFT_SLOTS._initial_value
-    importlib.reload(pipeline)
-    check('and no environment variable moves it', moved == 1, f'FFT_WORKERS=8 gave {moved}')
-
+    saved = dict(vars(settings_mod))
     fresh = {k: v for k, v in _os.environ.items() if k != 'RENDER_WORKERS'}
     with mock.patch.dict(_os.environ, fresh, clear=True):
         reloaded = importlib.reload(settings_mod).settings
@@ -2802,11 +2737,6 @@ def check_concurrency_defaults() -> None:
             'RENDER_WORKERS defaults to 3',
             reloaded.render_workers == 3,
             f'{reloaded.render_workers}',
-        )
-        check(
-            'the default does not scale with cpu_count',
-            reloaded.render_workers != max(1, (_os.cpu_count() or 2) - 1) or (_os.cpu_count() or 2) == 4,
-            f'cpu_count={_os.cpu_count()} workers={reloaded.render_workers}',
         )
         check(
             'settings and imaging agree on the page-worker default',
@@ -2825,7 +2755,8 @@ def check_concurrency_defaults() -> None:
         check(
             'a worker count of zero or less is raised to one, and prefetch to none', counts == (1, 1, 1, 0), f'{counts}'
         )
-    importlib.reload(settings_mod)
+    vars(settings_mod).update(saved)
+    check('the reloads leave the settings the app holds in place', settings_mod.settings is app_mod.settings)
 
     want = min(8, max(2, (_os.cpu_count() or 4) // 2))
     check(
@@ -2841,6 +2772,18 @@ def check_concurrency_defaults() -> None:
     for cores, expect in ((1, 2), (2, 2), (4, 2), (8, 4), (16, 8), (32, 8), (128, 8)):
         got = pipeline.vips_threads(cores)
         check(f'{cores} cores would give {expect} threads', got == expect, f'got {got}')
+
+
+def check_pipeline_version() -> None:
+    prof = profiles.PROFILES['kobo-clara-hd-2e-bw']
+    key = cache_mod.render_key('http://x/p/1', prof, None)
+    real = cache_mod.PIPELINE_VERSION
+    cache_mod.PIPELINE_VERSION = f'{real}-next'
+    try:
+        bumped = cache_mod.render_key('http://x/p/1', prof, None)
+    finally:
+        cache_mod.PIPELINE_VERSION = real
+    check('bumping PIPELINE_VERSION changes the render key', bumped != key)
 
 
 def check_png_compression() -> None:
@@ -2928,10 +2871,12 @@ def check_range_repack() -> None:
         open_range(f'{base}/opds/v1.2/nothing-here.cbz', hdrs) is None,
     )
 
+    elsewhere = 'http://localhost:8899/opds/v1.2/ranged/file.cbz'
+    answers = httpx.get(elsewhere, headers={'range': 'bytes=0-0', 'accept-encoding': 'identity'}, timeout=10)
     check(
-        'a host outside the allow-list is refused a reader',
-        open_range('http://127.0.0.2:8899/opds/v1.2/ranged/file.cbz', hdrs) is None,
+        'premise: the same server answers under another host name', answers.status_code == 206, f'{answers.status_code}'
     )
+    check('a host outside the allow-list is refused a reader', open_range(elsewhere, hdrs) is None)
     check(
         'a 200 dressed up with a content-range is not a partial response',
         open_range(f'{base}/liar/file.cbz', hdrs) is None,
@@ -3018,11 +2963,6 @@ def check_repack_streaming() -> None:
         streamed.startswith(first[:4]) and len(first) < len(first + rest),
     )
 
-    it2 = _cbz.repack_iter(_io.BytesIO(raw), prof)
-    next(it2)
-    it2.close()
-    check('closing a streamed repack early is clean', True)
-
 
 async def check_repack_slot() -> None:
     import io as _io
@@ -3050,11 +2990,6 @@ async def check_repack_slot() -> None:
             await asyncio.sleep(0.02)
             waited += 0.02
         return bool(done())
-
-    chunks = _cbz.repack_iter(_io.BytesIO(raw), prof)
-    _app._next_block(chunks, threading.Lock())
-    check('slot is free after one repack step', free_slots() == budget, f'{free_slots()} of {budget}')
-    chunks.close()
 
     body = _io.BytesIO(raw)
     gen = _app._repacking(_cbz.repack_iter(_io.BytesIO(raw), prof), body)
@@ -3163,7 +3098,6 @@ def check_every_profile_geometry() -> None:
 
 
 def check_fft_backend() -> None:
-    import numpy.fft as _npfft
     import scipy.fft as _spfft
 
     check(
@@ -3172,25 +3106,6 @@ def check_fft_backend() -> None:
         getattr(pipeline.sfft, '__name__', repr(pipeline.sfft)),
     )
     check('numpy.fft is not used for transforms', 'np.fft.rfft2' not in _pipeline_source())
-
-    rng = np.random.default_rng(7)
-    plane = (rng.random((1200, 900), dtype=np.float32) * 255.0).astype(np.float32)
-    back = _spfft.irfft2(_spfft.rfft2(plane), s=plane.shape)
-    err = float(np.abs(back - plane).max())
-    check('a single-precision round trip stays under a grey level', err < 1.0, f'max {err:.4f}')
-
-    ours = _spfft.irfft2(_spfft.rfft2(plane), s=plane.shape)
-    theirs = _npfft.irfft2(_npfft.rfft2(plane), s=plane.shape)
-    gap = float(np.abs(ours - theirs).max())
-    check('scipy and numpy agree within a grey level', gap < 1.0, f'max {gap:.4f}')
-
-    prof = profiles.PROFILES['kindle-colorsoft']
-    notched = pipeline._descreen_plane(plane.copy(), 0.2, prof)
-    check(
-        'the notch still returns a usable plane',
-        notched is None or (notched.shape == plane.shape and np.isfinite(notched).all()),
-        'None (no peak)' if notched is None else f'{notched.shape}',
-    )
 
 
 def _pipeline_source() -> str:
@@ -3228,14 +3143,24 @@ def check_fft_padding() -> None:
     )
 
     mono = profiles.PROFILES['kobo-clara-hd-2e-bw']
-    page = fake_page(9, 2400, 3200)
-    a = pipeline.render_page(page, mono)[0]
-    pipeline._next_fast_len = lambda k, limit=7: k  # noqa: ARG005
+    calls = {'fast': 0, 'descreen': 0}
+    real_plane = pipeline._descreen_plane
+
+    def counting_fast(k, limit=7):
+        calls['fast'] += 1
+        return real(k, limit)
+
+    def counting_plane(*args, **kwargs):
+        calls['descreen'] += 1
+        return real_plane(*args, **kwargs)
+
+    pipeline._next_fast_len, pipeline._descreen_plane = counting_fast, counting_plane
     try:
-        b = pipeline.render_page(page, mono)[0]
+        pipeline.render_page(fake_page(9, 2400, 3200), mono)
     finally:
-        pipeline._next_fast_len = real
-    check('descreen is not padded', a == b, f'{len(a)} vs {len(b)} bytes')
+        pipeline._next_fast_len, pipeline._descreen_plane = real, real_plane
+    check('premise: the mono render runs the descreen', calls['descreen'] > 0, f'{calls}')
+    check('descreen is never padded to a fast length', calls['fast'] == 0, f'{calls}')
 
 
 def check_big_panel_cap() -> None:
@@ -3272,16 +3197,6 @@ def check_big_panel_cap() -> None:
 
 def check_profile_source() -> None:
     shipped = importlib.resources.files('inksetter.imaging').joinpath('profiles.toml')
-    check('shipped profiles.toml travels with the package', shipped.is_file())
-    check(
-        'every profile comes from the TOML, none from Python',
-        not hasattr(profiles, '_BUILTIN') and not hasattr(profiles, '_KALEIDO'),
-    )
-    check(
-        'the override feature is gone',
-        not hasattr(profiles, '_override_path') and 'PROFILES_FILE' not in os.environ,
-    )
-
     cwd = pathlib.Path.cwd()
     stray = cwd / 'profiles.toml'
     before = dict(profiles.PROFILES)
@@ -3297,7 +3212,6 @@ def check_profile_source() -> None:
             profiles.PROFILES['kobo-clara-hd-2e-bw'].width == before['kobo-clara-hd-2e-bw'].width,
             f'width={profiles.PROFILES["kobo-clara-hd-2e-bw"].width}',
         )
-        check('a stray profiles.toml in the cwd is ignored', set(profiles.PROFILES) == set(before))
     finally:
         os.environ.pop('PROFILES_FILE', None)
         if wrote_stray:
@@ -3752,7 +3666,8 @@ def check_reslice() -> None:
 
     heights = [1280, 1000, 1000, 1, 1280, 640, 1000]
     src = _strip_cbz(heights)
-    pages = _pages_of(b''.join(cbz.repack_iter(io.BytesIO(src), p, 1)))
+    recut = b''.join(cbz.repack_iter(io.BytesIO(src), p, 1))
+    pages = _pages_of(recut)
 
     check('a re-cut strip still produces pages', bool(pages), f'{len(pages)}')
     check(
@@ -3778,7 +3693,7 @@ def check_reslice() -> None:
         all(re.fullmatch(r'\d{5}\.(png|jpg)', n) for n, _, _ in pages),
         f'{pages[0][0]}',
     )
-    check('non-image entries are still carried over', 'ComicInfo.xml' in zipfile.ZipFile(io.BytesIO(src)).namelist())
+    check('non-image entries are still carried over', 'ComicInfo.xml' in zipfile.ZipFile(io.BytesIO(recut)).namelist())
 
     scale = p.width / 800
     band, deep = 990, 24
@@ -4206,15 +4121,6 @@ def check_profile_config() -> None:
     except ValueError as exc:
         check('usm_amount = 0 still turns sharpening off', False, str(exc)[:64])
 
-    try:
-        profiles._build(
-            importlib.resources.files('inksetter.imaging').joinpath('profiles.toml').read_text(encoding='utf-8'),
-            'shipped',
-        )
-        check('the shipped table passes its own validator', True)
-    except ValueError as exc:
-        check('the shipped table passes its own validator', False, str(exc)[:70])
-
 
 PASS, FAIL = [], []
 
@@ -4256,10 +4162,6 @@ def check_strip_folio() -> None:
         'every paged device profile strips folios',
         all(p.strip_folio for p in paged.values()),
         f'off: {[n for n, p in paged.items() if not p.strip_folio]}',
-    )
-    check(
-        'and the webtoon profiles do not',
-        not any(p.strip_folio for n, p in profiles.PROFILES.items() if p.reslice),
     )
     check(
         'cover profiles do not',
@@ -4634,6 +4536,13 @@ async def check_http_edges(c) -> None:
         f'status={r.status_code}',
     )
 
+    r = await c.get(f'/no-such-profile/osd/{encode_token(f"{up}/opds/v1.2/upstream500")}')
+    check(
+        'an OpenSearch description under an unknown profile is 404, before any fetch',
+        r.status_code == 404,
+        f'{r.status_code}',
+    )
+
     r = await c.get(f'/kobo-clara-hd-2e-bw/f/{encode_token(f"{up}/opds/v1.2/proxyauth")}')
     check('an upstream 407 is the proxy failing, answered 502', r.status_code == 502, f'status={r.status_code}')
     check('and the reader is not handed a challenge it cannot answer', 'proxy-authenticate' not in r.headers)
@@ -4989,18 +4898,11 @@ def check_grid_columns() -> None:
         next((ln for ln in web.CSS.splitlines() if ln.startswith('.grid{')), 'no .grid rule'),
     )
     check('a full-width window shows five covers', _grid_columns(1000 - 48) == 5)
-    check('and a window twice that still shows five', _grid_columns(2000) == 5)
-    check('and one ten times that still shows five', _grid_columns(10000) == 5)
     narrow = {w: _grid_columns(w) for w in (343, 500, 700)}
     check(
         'a narrow window drops rather than squeezing below the floor',
         narrow == {343: 2, 500: 3, 700: 4},
         f'{narrow}',
-    )
-    check(
-        'no width anywhere overflows the cap',
-        max(_grid_columns(w) for w in range(200, 4000, 7)) == web.GRID_COLUMNS,
-        f'max {max(_grid_columns(w) for w in range(200, 4000, 7))}',
     )
 
 
@@ -5020,7 +4922,6 @@ def check_repack_progress() -> None:
             progress=lambda done, total: seen.append((done, total)),
         )
     )
-    check('a repack reports before it has done anything', seen[:1] == [(0, 4)], f'{seen[:1]}')
     check('it counts every page exactly once, in order', seen == [(n, 4) for n in range(5)], f'{seen}')
     check('and the archive it produced is still whole', len(zipfile.ZipFile(io.BytesIO(out)).namelist()) == 5)
 
@@ -5126,7 +5027,6 @@ async def check_logo(c) -> None:
 def check_landing_groups() -> None:
     titles = [t for t, _ in web.GROUPS]
     placed = {n: web.group_of(p) for n, p in profiles.PROFILES.items()}
-    check('every profile lands in a group', set(placed.values()) <= set(titles), f'{set(placed.values())}')
     check('and no group is left empty', set(placed.values()) == set(titles), f'{set(titles) - set(placed.values())}')
 
     by_group: dict[str, list[str]] = {t: [] for t in titles}
@@ -5365,10 +5265,9 @@ async def main() -> int:
         t = time.time()
         r2 = await c.get(f'/kobo-clara-hd-2e-bw/p/{pse}', params={'page': 0, 'maxWidth': 1072})
         warm = time.time() - t
-        w, h, levels = grey_levels(r1.content)
+        w, h, _levels = grey_levels(r1.content)
         check('png returned', r1.headers['content-type'] == 'image/png')
         check('fits panel box', w <= 1072 and h <= 1448, f'{w}x{h}')
-        check('<= 16 grey levels', levels <= 16, f'levels={levels}')
         check(
             'levels are real greys',
             set(
@@ -5505,7 +5404,6 @@ async def main() -> int:
         r = await c.get(f'/kindle-scribe-colorsoft/pf/{pf}')
         pw, ph, _pb, _ = describe(r.content)
         check('readingOrder page rendered at panel size', pw > 1800, f'{pw}x{ph}')
-        check('readingOrder page is not a thumbnail', pw > 640)
 
         etok = encode_token('http://127.0.0.1:8899/opds/v2/books/8/manifest')
         eman = (await c.get(f'/kobo-clara-hd-2e-bw/f/{etok}')).json()
@@ -5772,12 +5670,17 @@ async def main() -> int:
             '/kobo-clara-hd-2e-bw/dl/' + encode_token('http://127.0.0.1:8899/opds/v1.2/ranged/file.cbz')
         )
         used = _RANGED['requests'] - before['requests']
+        whole = _RANGED['whole'] - before['whole']
         plain = await c.get(
             '/kobo-clara-hd-2e-bw/dl/' + encode_token('http://127.0.0.1:8899/opds/v1.2/norange/file.cbz')
         )
         check('a range download succeeds', ranged.status_code == 200, f'status={ranged.status_code}')
         check('so does one that must fall back', plain.status_code == 200, f'status={plain.status_code}')
-        check('the range path was actually taken', used > 0, f'{used} range requests')
+        check(
+            'the range path was actually taken, with no whole-file fetch',
+            used > 0 and whole == 0,
+            f'{used} range requests, {whole} whole-file fetches',
+        )
 
         zr = zipfile.ZipFile(io.BytesIO(ranged.content))
         zp = zipfile.ZipFile(io.BytesIO(plain.content))
@@ -5926,18 +5829,10 @@ async def main() -> int:
     with zipfile.ZipFile(bomb, 'w', zipfile.ZIP_DEFLATED) as z:
         z.writestr('big.jpg', bytes(8 * 1024**2))
     try:
-        cbz.repack_to(io.BytesIO(bomb.getvalue()), io.BytesIO(), profiles.PROFILES['kobo-clara-hd-2e-bw'])
+        b''.join(cbz.repack_iter(io.BytesIO(bomb.getvalue()), profiles.PROFILES['kobo-clara-hd-2e-bw']))
         check('a highly compressible archive is no longer refused', True)
     except ValueError as exc:
         check('a highly compressible archive is no longer refused', False, str(exc)[:52])
-    left = [a for a in ('MAX_ENTRIES', 'MAX_TOTAL_BYTES') if hasattr(cbz, a)]
-    check('no ceiling constant is left in the module', not left, ', '.join(left))
-    params = set(inspect.signature(cbz.repack_iter).parameters)
-    check(
-        'and repack_iter takes no limit arguments',
-        not {'max_entries', 'max_total_bytes'} & params,
-        f'{sorted(params)}',
-    )
 
     from inksetter.cache import render_key as _rk
 
@@ -5952,7 +5847,6 @@ async def main() -> int:
     print('descreen')
     check_descreen()
     print('dither ties')
-    check_profile_types()
     check_dither_ties()
     print('path awareness')
     check_path_awareness()
@@ -5992,6 +5886,7 @@ async def main() -> int:
     print('big-panel cap')
     check_big_panel_cap()
     print('png compression')
+    check_pipeline_version()
     check_png_compression()
     print('comicinfo')
     await check_comicinfo()

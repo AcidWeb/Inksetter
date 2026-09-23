@@ -404,13 +404,3 @@ def _metadata(comicinfo, sizes: list[tuple[int, int] | None]) -> bytes | None:
     except Exception:
         log.warning('repack: the metadata factory failed; the volume ships without ComicInfo', exc_info=True)
         return None
-
-
-def repack_to(
-    src,
-    dst,
-    profile: Profile,
-    workers: int = DEFAULT_PAGE_WORKERS,
-) -> None:
-    for block in repack_iter(src, profile, workers):
-        dst.write(block)

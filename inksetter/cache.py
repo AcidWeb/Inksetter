@@ -138,13 +138,12 @@ class DiskCache:
 
 
 class Prefetcher:
-    def __init__(self, depth: int) -> None:
-        self.depth = depth
+    def __init__(self) -> None:
         self._seen: set[str] = set()
         self._tasks: set[asyncio.Task] = set()
 
     def spawn(self, coro, dedup_key: str) -> None:
-        if self.depth <= 0 or dedup_key in self._seen:
+        if dedup_key in self._seen:
             coro.close()
             return
         if len(self._seen) > 8192:

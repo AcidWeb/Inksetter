@@ -5,7 +5,6 @@ Feed rewriting for OPDS 1.x (Atom), OPDS 2.0 (JSON) and Readium manifests.
 import re
 import json
 import base64
-import binascii
 from lxml import etree
 from dataclasses import dataclass
 from urllib.parse import quote, urljoin, urlsplit
@@ -91,7 +90,7 @@ def decode_parts(token: str) -> tuple[str, str | None]:
     pad = '=' * (-len(token) % 4)
     try:
         raw = base64.urlsafe_b64decode(token + pad).decode('utf-8')
-    except (binascii.Error, UnicodeDecodeError, ValueError) as exc:
+    except ValueError as exc:
         raise TokenError(f'malformed token: {token[:24]}') from exc
     secret = _secret()
     if secret:

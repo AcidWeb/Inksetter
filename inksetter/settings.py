@@ -52,10 +52,5 @@ class Settings:
     # Where a spilled spool file lands.
     spool_dir: str = os.environ.get('SPOOL_DIR', '') or str(Path(os.environ.get('CACHE_DIR', '/cache')))
 
-    # How much this proxy says about its own work. INFO gives one line per
-    # rendered page and per repack; DEBUG adds every conversion stage with
-    # its geometry and timing, which is roughly twelve lines a page.
-    log_level: str = os.environ.get('LOG_LEVEL', 'INFO')
-
 
 settings = Settings()

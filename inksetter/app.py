@@ -32,7 +32,7 @@ from .settings import settings
 logs.configure()
 
 cache = DiskCache(settings.cache_dir, settings.cache_max_bytes)
-prefetcher = Prefetcher(settings.prefetch)
+prefetcher = Prefetcher()
 render_sem = asyncio.Semaphore(settings.render_workers)
 repack_slots = asyncio.Semaphore(settings.repack_workers)
 
@@ -52,7 +52,7 @@ class Jobs:
             self._board.popitem(last=False)
 
     def set(self, job: str, **fields) -> None:
-        if not job or not JOB_ID.match(job):
+        if not JOB_ID.match(job):
             return
         now = time.monotonic()
         with self._lock:
@@ -71,9 +71,6 @@ jobs = Jobs()
 
 
 def _reporter(job: str):
-    if not job or not JOB_ID.match(job):
-        return None
-
     def report(done: int, total: int) -> None:
         jobs.set(job, stage='repacking', done=done, total=total)
 
@@ -194,6 +191,7 @@ async def feed(profile: str, token: str, request: Request):
 
 @app.api_route('/{profile}/osd/{token}', methods=['GET', 'HEAD'])
 async def opensearch(profile: str, token: str, request: Request):
+    _profile_or_404(profile)
     url = rewrite.decode_token(token)
     resp = await client.get(url, request_headers(request.headers, forward_accept=True))
     body = rewrite.rewrite_opensearch(resp.content, _ctx(request, profile, str(resp.url)))
@@ -295,11 +293,11 @@ async def _render_cached(url: str, p: Profile, max_width: int | None, headers: d
     return blob, ctype
 
 
-def _query_int(raw: str, default: int = 0) -> int:
+def _query_int(raw: str) -> int:
     try:
         return max(0, int(raw))
-    except TypeError, ValueError:
-        return default
+    except ValueError:
+        return 0
 
 
 @app.api_route('/{profile}/p/{token}', methods=['GET', 'HEAD'])
@@ -396,8 +394,7 @@ async def _repacking(chunks, body, job: str = ''):
                 return
             yield block
     finally:
-        if job:
-            jobs.set(job, stage='done' if whole else 'error')
+        jobs.set(job, stage='done' if whole else 'error')
         threading.Thread(target=_wind_down, args=(chunks, body, turn), name='repack-close', daemon=True).start()
 
 
@@ -474,27 +471,31 @@ async def _repack_over_ranges(url: str, cover_url: str | None, p: Profile, reque
         if not await asyncio.to_thread(_is_comic_zip, url, ctype, reader):
             await asyncio.to_thread(reader.close)
             return None
-        cover = await _pick_cover(url, cover_url, request)
-        meta = await kavita.for_download(url)
-        chunks = await asyncio.to_thread(
-            cbz.repack_iter,
-            reader,
-            p,
-            settings.repack_page_workers,
-            cover=cover,
-            comicinfo=meta,
-            progress=_reporter(job),
-        )
+        return await _repack(reader, url, cover_url, p, request, job, reader.headers)
     except Exception:
         await asyncio.to_thread(reader.close)
         return None
     except BaseException:
         await asyncio.to_thread(reader.close)
         raise
+
+
+async def _repack(src, url: str, cover_url: str | None, p: Profile, request: Request, job: str, upstream):
+    cover = await _pick_cover(url, cover_url, request)
+    meta = await kavita.for_download(url)
+    chunks = await asyncio.to_thread(
+        cbz.repack_iter,
+        src,
+        p,
+        settings.repack_page_workers,
+        cover=cover,
+        comicinfo=meta,
+        progress=_reporter(job),
+    )
     return StreamingResponse(
-        _repacking(chunks, reader, job),
+        _repacking(chunks, src, job),
         media_type='application/vnd.comicbook+zip',
-        headers=_stale(reader.headers),
+        headers=_stale(upstream),
     )
 
 
@@ -511,16 +512,15 @@ async def download_status(profile: str, job: str):
 async def download(profile: str, token: str, request: Request, job: str = ''):
     p = _profile_or_404(profile)
     url, cover_url = rewrite.decode_parts(token)
-    if request.method == 'GET' and job:
+    if request.method == 'GET':
         jobs.set(job, stage='fetching', done=0, total=0)
 
     if request.method == 'HEAD':
-        resp = await client.probe(url, request_headers(request.headers))
+        resp = await client.stream(url, request_headers(request.headers))
         ctype = resp.headers.get('content-type', 'application/octet-stream')
         out_headers = {k: v for k, v in resp.headers.items() if k.lower() in FORWARD_RESPONSE}
         if p.fmt != 'raw' and _probably_zip(url, ctype):
-            for stale in ('etag', 'last-modified', 'content-type'):
-                out_headers.pop(stale, None)
+            out_headers = _stale(out_headers)
             ctype = 'application/vnd.comicbook+zip'
         head = Response(media_type=ctype, headers=out_headers)
         del head.headers['content-length']
@@ -529,8 +529,7 @@ async def download(profile: str, token: str, request: Request, job: str = ''):
     try:
         return await _deliver(p, url, cover_url, request, job)
     except BaseException:
-        if job:
-            jobs.set(job, stage='error')
+        jobs.set(job, stage='error')
         raise
 
 
@@ -542,7 +541,7 @@ async def _deliver(p: Profile, url: str, cover_url: str | None, request: Request
 
     body = _spool()
     try:
-        resp = await client.download(url, request_headers(request.headers), body)
+        resp = await client.stream(url, request_headers(request.headers), body)
     except BaseException:
         body.close()
         raise
@@ -551,34 +550,16 @@ async def _deliver(p: Profile, url: str, cover_url: str | None, request: Request
     out_headers = {k: v for k, v in resp.headers.items() if k.lower() in FORWARD_RESPONSE}
 
     if p.fmt != 'raw' and _is_comic_zip(url, ctype, body):
-        cover = await _pick_cover(url, cover_url, request)
-        meta = await kavita.for_download(url)
         try:
             body.seek(0)
-            chunks = await asyncio.to_thread(
-                cbz.repack_iter,
-                body,
-                p,
-                settings.repack_page_workers,
-                cover=cover,
-                comicinfo=meta,
-                progress=_reporter(job),
-            )
+            return await _repack(body, url, cover_url, p, request, job, out_headers)
         except Exception:
             body.seek(0)
         except BaseException:
             body.close()
             raise
-        else:
-            out_headers = _stale(out_headers)
-            return StreamingResponse(
-                _repacking(chunks, body, job),
-                media_type='application/vnd.comicbook+zip',
-                headers=out_headers,
-            )
 
-    if job:
-        jobs.set(job, stage='done')
+    jobs.set(job, stage='done')
     body.seek(0, os.SEEK_END)
     out_headers['content-length'] = str(body.tell())
     body.seek(0)

@@ -146,8 +146,6 @@ def _apply_notches(
         dy -= np.round(dy)
         rows = np.nonzero(np.abs(dy) <= span)[0]
         cols = np.nonzero(np.abs(freq_x - freq_x[ix]) <= span)[0]
-        if rows.size == 0 or cols.size == 0:
-            continue
         d2 = dy[rows][:, None] ** 2 + (freq_x[cols] - freq_x[ix])[None, :] ** 2
         window = 1.0 - p.descreen_strength * np.exp(-d2 / denom)
         spectrum[np.ix_(rows, cols)] *= window
@@ -427,18 +425,6 @@ def _chroma_of(im: pyvips.Image) -> float:
     return float(t.colourspace('lch')[1].avg())
 
 
-def chroma_metric(buf: bytes) -> float:
-    try:
-        im = pyvips.Image.thumbnail_buffer(buf, 64, size='down')
-    except pyvips.Error as exc:
-        raise UnreadableImage(f'not a readable image ({len(buf)} bytes)') from exc
-    if im.bands < 3:
-        return 0.0
-    if im.hasalpha():
-        im = im.flatten(background=255)
-    return float(im.colourspace('lch')[1].avg())
-
-
 class _Geom(NamedTuple):
     image: pyvips.Image
     content: tuple[int, int, int, int]
@@ -574,8 +560,6 @@ def _band_stack(part: pyvips.Image) -> np.ndarray:
 
 
 def _pad_to_box(im: pyvips.Image, tw: int, th: int, level: float | None = None) -> pyvips.Image:
-    if im.width == tw and im.height == th:
-        return im
     if im.width > tw or im.height > th:
         return im
     if level is not None:
@@ -618,8 +602,6 @@ def _flatten_pad(a: np.ndarray, content: tuple[int, int, int, int], level: float
         return a
     mask = np.ones(a.shape[:2], bool)
     mask[y : y + h, x : x + w] = False
-    if not mask.any():
-        return a
     a[mask] = round(level)
     return a
 

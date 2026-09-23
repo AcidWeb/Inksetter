@@ -162,7 +162,6 @@ base = "kaleido"
 colour_pad = "mono"
 autocrop = false
 rotate_wide = false
-strip_folio = false
 auto_mono = false
 reslice = true
 
@@ -199,7 +198,6 @@ height = 2648
 width = 0
 height = 0
 fmt = "raw"
-autocrop = false
 
 
 # --------------------------------------------------------------------------
@@ -213,7 +211,6 @@ fmt = "jpeg"
 jpeg_quality = 78
 autocrop = false
 usm_amount = 0.35
-dither = "none"
 strip_folio = false
 
 [profiles.cover-colour]

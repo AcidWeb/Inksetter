@@ -154,7 +154,7 @@ class Profile:
     def mono_fmt(self) -> str:
         if self.fmt == 'jpegc':
             return 'jpeg'
-        return self.auto_mono_fmt if self.auto_mono_fmt in ('png4', 'png8') else 'png4'
+        return self.auto_mono_fmt
 
     @property
     def chroma_sigma(self) -> float:
