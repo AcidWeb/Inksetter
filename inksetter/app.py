@@ -409,14 +409,25 @@ _ZIP_TYPES = frozenset(
 )
 
 
-def _is_zip(url: str, ctype: str, body) -> bool:
+_EPUB_TYPE = 'application/epub+zip'
+
+
+def _is_epub(ctype: str, head: bytes) -> bool:
+    if ctype.split(';')[0].strip().lower() == _EPUB_TYPE:
+        return True
+    return head[30:38] == b'mimetype' and head[38:58] == _EPUB_TYPE.encode()
+
+
+def _is_comic_zip(url: str, ctype: str, body) -> bool:
     pos = body.tell()
     try:
         body.seek(0)
-        head = body.read(4)
+        head = body.read(58)
     finally:
         body.seek(pos)
-    if head in _ZIP_MAGIC:
+    if _is_epub(ctype, head):
+        return False
+    if head[:4] in _ZIP_MAGIC:
         return True
     return not head and (url.lower().endswith(('.cbz', '.zip')) or 'zip' in ctype)
 
@@ -453,7 +464,7 @@ async def _repack_over_ranges(url: str, cover_url: str | None, p: Profile, reque
         return None
     try:
         ctype = reader.headers.get('content-type', 'application/octet-stream')
-        if not await asyncio.to_thread(_is_zip, url, ctype, reader):
+        if not await asyncio.to_thread(_is_comic_zip, url, ctype, reader):
             await asyncio.to_thread(reader.close)
             return None
         cover = await _pick_cover(url, cover_url, request)
@@ -532,7 +543,7 @@ async def _deliver(p: Profile, url: str, cover_url: str | None, request: Request
     ctype = resp.headers.get('content-type', 'application/octet-stream')
     out_headers = {k: v for k, v in resp.headers.items() if k.lower() in FORWARD_RESPONSE}
 
-    if p.fmt != 'raw' and _is_zip(url, ctype, body):
+    if p.fmt != 'raw' and _is_comic_zip(url, ctype, body):
         cover = await _pick_cover(url, cover_url, request)
         meta = await kavita.for_download(url)
         try:

@@ -469,6 +469,45 @@ def _half_image():
     return Response(half_decodable(), media_type='image/gif')
 
 
+def _epub_bytes(strict: bool) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z:
+        if strict:
+            z.writestr(zipfile.ZipInfo('mimetype'), 'application/epub+zip', compress_type=zipfile.ZIP_STORED)
+        z.writestr('META-INF/container.xml', '<?xml version="1.0"?><container version="1.0"/>')
+        z.writestr('OEBPS/ch1.xhtml', '<html><body><img src="images/p1.jpg"/></body></html>')
+        z.writestr('OEBPS/images/p1.jpg', fake_page(1, 400, 600))
+        if not strict:
+            z.writestr('mimetype', 'application/epub+zip')
+    return buf.getvalue()
+
+
+EPUBS = {
+    'strict': (_epub_bytes(True), 'application/octet-stream'),
+    'loose': (_epub_bytes(False), 'application/epub+zip'),
+}
+
+
+@upstream.get('/opds/v1.2/epub/{how}/{kind}')
+def _epub(how: str, kind: str, request: Request):
+    body, media = EPUBS[kind]
+    rng = request.headers.get('range')
+    if how != 'ranged' or not rng:
+        return Response(body, media_type=media)
+    first, _, last = rng.partition('=')[2].partition('-')
+    lo = int(first)
+    hi = int(last) if last else len(body) - 1
+    if lo >= len(body) or lo > hi:
+        return Response(status_code=416, headers={'content-range': f'bytes */{len(body)}'})
+    hi = min(hi, len(body) - 1)
+    return Response(
+        body[lo : hi + 1],
+        status_code=206,
+        media_type=media,
+        headers={'content-range': f'bytes {lo}-{hi}/{len(body)}'},
+    )
+
+
 BROKEN_URL = 'http://[broken/'
 BROKEN_HREF_FEED = FEED.replace(
     '<entry><title>Vol 1</title>',
@@ -4120,6 +4159,32 @@ async def check_malformed_input(c) -> None:
         check(f'and {label} leaks nothing upstream', '[broken' not in body and up not in body)
 
 
+async def check_epub(c) -> None:
+    strict, loose = EPUBS['strict'][0], EPUBS['loose'][0]
+    for kind, body in EPUBS.items():
+        moved = zipfile.ZipFile(
+            io.BytesIO(b''.join(cbz.repack_iter(io.BytesIO(body[0]), profiles.PROFILES['kobo-clara-hd-2e-bw'], 1)))
+        ).namelist()
+        check(f'premise: repacking the {kind} EPUB would move its image', 'OEBPS/images/p1.jpg' not in moved)
+    check('premise: only the strict EPUB opens with the mimetype entry', strict[30:38] == b'mimetype' != loose[30:38])
+
+    for how in ('ranged', 'whole'):
+        for kind, found in (('strict', 'by its content alone'), ('loose', 'by its type alone')):
+            body, media = EPUBS[kind]
+            tok = encode_token(f'http://127.0.0.1:8899/opds/v1.2/epub/{how}/{kind}')
+            r = await c.get(f'/kobo-clara-hd-2e-bw/dl/{tok}')
+            check(
+                f'an EPUB found {found} is delivered untouched ({how})',
+                r.status_code == 200 and r.content == body,
+                f'status={r.status_code} {len(r.content)} bytes of {len(body)}',
+            )
+            check(
+                f'and keeps its own type ({how}, {kind})',
+                r.headers.get('content-type', '').startswith(media),
+                r.headers.get('content-type', ''),
+            )
+
+
 def _host_key_of(url: str) -> str | None:
     from inksetter.opds.upstream import host_key
 
@@ -5346,6 +5411,9 @@ async def main() -> int:
 
         print('malformed input')
         await check_malformed_input(c)
+
+        print('epub downloads')
+        await check_epub(c)
 
         print('browse pages')
         await check_browse(c)
