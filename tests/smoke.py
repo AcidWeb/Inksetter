@@ -118,6 +118,15 @@ def fake_page(n: int, w: int = 1600, h: int = 2400) -> bytes:
     return pyvips.Image.new_from_memory(a.tobytes(), w, h, 1, 'uchar').jpegsave_buffer(Q=92)
 
 
+def half_decodable() -> bytes:
+    a = np.full((1500, 800, 3), 255, np.uint8)
+    a[200:1300, 100:700] = (200, 30, 30)
+    blob = bytearray(pyvips.Image.new_from_memory(a.tobytes(), 800, 1500, 3, 'uchar').gifsave_buffer())
+    for i in range(len(blob) // 2, len(blob) - 2):
+        blob[i] = (blob[i] * 7 + 13) & 0xFF
+    return bytes(blob)
+
+
 def _cbz_bytes(pages: int = 3) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, 'w') as z:

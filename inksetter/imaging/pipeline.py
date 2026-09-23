@@ -43,7 +43,7 @@ if not os.environ.get('VIPS_CONCURRENCY'):
     pyvips.concurrency_set(vips_threads(os.cpu_count() or 4))
 
 # Bump this whenever anything in this module changes in a way that alters output pixels. Bump invalidates the cache.
-PIPELINE_VERSION = '2'
+PIPELINE_VERSION = '3'
 
 _BAYER_N = 8
 
@@ -90,9 +90,15 @@ class UnreadableImage(ValueError):
 
 def _open(buf: bytes) -> pyvips.Image:
     try:
-        return pyvips.Image.new_from_buffer(buf, '')
+        return _eight_bit(pyvips.Image.new_from_buffer(buf, ''))
     except pyvips.Error as exc:
         raise UnreadableImage(f'not a readable image ({len(buf)} bytes)') from exc
+
+
+def _eight_bit(im: pyvips.Image) -> pyvips.Image:
+    if im.format == 'uchar' and im.interpretation != 'cmyk':
+        return im
+    return im.colourspace('srgb')
 
 
 def _band_to_numpy(im: pyvips.Image) -> np.ndarray:
@@ -715,12 +721,12 @@ def same_picture(a: bytes, b: bytes, threshold: float = 0.85) -> bool:
 def _norm_grid(buf: bytes, w: int = 72, h: int = 96) -> np.ndarray:
     try:
         im = pyvips.Image.thumbnail_buffer(buf, w, height=h, size='force')
+        if im.hasalpha():
+            im = im.flatten(background=255)
+        im = im.colourspace('b-w')
+        a = np.ndarray(buffer=im.write_to_memory(), dtype=np.uint8, shape=(h, w)).astype(np.float32)
     except pyvips.Error as exc:
         raise UnreadableImage(f'not a readable image ({len(buf)} bytes)') from exc
-    if im.hasalpha():
-        im = im.flatten(background=255)
-    im = im.colourspace('b-w')
-    a = np.ndarray(buffer=im.write_to_memory(), dtype=np.uint8, shape=(h, w)).astype(np.float32)
     return (a - a.mean()) / (float(a.std()) + 1e-6)
 
 
@@ -750,7 +756,13 @@ def render_page(
     if p.fmt == 'raw':
         log.debug('render: fmt=raw, %d kB passed through untouched', len(buf) // 1024)
         return buf, ''
+    try:
+        return _render_page(buf, p, max_width, source)
+    except pyvips.Error as exc:
+        raise UnreadableImage(f'not a readable image ({len(buf)} bytes)') from exc
 
+
+def _render_page(buf: bytes, p: Profile, max_width: int | None, source: pyvips.Image | None) -> tuple[bytes, str]:
     started = time.perf_counter()
 
     tw = p.width

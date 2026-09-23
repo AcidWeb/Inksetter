@@ -71,17 +71,17 @@ STRIP_PAD = 5
 def _strip_rows(blob: bytes, p: Profile) -> np.ndarray | None:
     try:
         im = pipeline.open_image(blob).autorot()
+        if im.hasalpha():
+            im = im.flatten(background=255)
+        im = pipeline.fit_to_width(im, p.width, p)
+        if im.bands == 1:
+            im = im.colourspace('srgb')
+        elif im.bands > 3:
+            im = im.extract_band(0, n=3)
+        a = np.ndarray(buffer=im.write_to_memory(), dtype=np.uint8, shape=(im.height, im.width, im.bands))
     except Exception:
-        log.warning('strip: an entry would not open; it is left out of the page', exc_info=True)
+        log.warning('strip: an entry would not decode; it is left out of the page', exc_info=True)
         return None
-    if im.hasalpha():
-        im = im.flatten(background=255)
-    im = pipeline.fit_to_width(im, p.width, p)
-    if im.bands == 1:
-        im = im.colourspace('srgb')
-    elif im.bands > 3:
-        im = im.extract_band(0, n=3)
-    a = np.ndarray(buffer=im.write_to_memory(), dtype=np.uint8, shape=(im.height, im.width, im.bands))
     return a if a.size else None
 
 
