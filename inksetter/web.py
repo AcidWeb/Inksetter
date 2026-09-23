@@ -18,6 +18,12 @@ PSE_NS = 'http://vaemendis.net/opds-pse/ns'
 SUMMARY_MAX = 140
 LOGO = 'logo.png'
 LOGO_PX = 50
+SOURCE_URL = 'https://github.com/AcidWeb/Inksetter'
+FOOTER = (
+    f'<footer>Inksetter is free software under the '
+    f'<a href="{SOURCE_URL}/blob/master/LICENSE">GNU AGPL v3</a>: '
+    f'<a href="{SOURCE_URL}">source code</a>.'
+)
 TRAIL_PARAM = 't'
 TRAIL_MAX = 8
 TRAIL_TITLE_MAX = 60
@@ -81,6 +87,8 @@ header.hero{align-items:center;justify-content:center;gap:16px;margin:0 0 18px}
 header.hero h1{font-size:30px;letter-spacing:-.02em}
 img.mark{flex:none;display:block}
 p.lede{font-size:15px;color:var(--dim);margin:0 0 20px}
+footer{max-width:1000px;margin:14px auto 0;font-size:12px;color:var(--cap);text-align:center}
+footer a{color:var(--dim)}
 """
 
 GRID_COLUMNS = 5
@@ -366,7 +374,7 @@ def _shell(title: str, chip: str, body: str, base: str = '', hero: bool = False)
         f'<meta name="robots" content="noindex">{icon}'
         f'<title>{escape(tab)}</title><style>{CSS}</style>'
         f'<div class="wrap"><header{" class='hero'" if hero else ""}>{mark}<h1>{escape(title)}</h1>'
-        f'{f"<span class=chip>{escape(chip)}</span>" if chip else ""}</header>{body}</div></html>'
+        f'{f"<span class=chip>{escape(chip)}</span>" if chip else ""}</header>{body}</div>{FOOTER}</html>'
     )
 
 

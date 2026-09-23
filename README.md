@@ -55,3 +55,7 @@ Potential solutions to the above problems:
 * Using smaller CBZ files as input.
 * Setting environment variable `OCR_ENABLED` to `0`. This will disable part of the pipeline responsible for removing the page number from the bottom of the page and will speed up the process considerably.
 * Moving to OPDS server that support HTTP range requests that allow to stream CBZ file from source and process bigger files **way more** efficiently.
+
+## Security
+
+This application was made to be deployed as a sidecar of a local OPDS server. It is not advisable to share access to it outside your home network.

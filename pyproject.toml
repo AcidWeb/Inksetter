@@ -14,7 +14,11 @@ dependencies = [
     "pyvips[binary]>=3.0",
     "uvicorn[standard]>=0.35",
     "rapidocr-onnxruntime>=1.4",
+    "opencv-python-headless>=4.5.1.48",
 ]
+
+[tool.uv]
+override-dependencies = ["opencv-python ; sys_platform == 'never'"]
 
 [dependency-groups]
 dev = [
