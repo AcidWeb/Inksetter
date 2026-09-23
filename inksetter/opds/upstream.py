@@ -43,12 +43,12 @@ class UpstreamError(Exception):
 
 
 def host_key(url: str) -> str:
-    parts = urlsplit(url)
-    host = (parts.hostname or '').lower()
     try:
+        parts = urlsplit(url)
         port = parts.port
     except ValueError:
         return ''
+    host = (parts.hostname or '').lower()
     if port is None or str(port) == _DEFAULT_PORTS.get(parts.scheme.lower()):
         return host
     return f'{host}:{port}'
@@ -67,8 +67,10 @@ def check_host(url: str) -> None:
         raise UpstreamError(403, f'host not allowed: {host or url[:40]}')
 
 
-def _transport_error(exc: Exception) -> UpstreamError:
-    return UpstreamError(502, f'upstream unreachable: {type(exc).__name__}')
+def _upstream_failure(exc: Exception) -> UpstreamError:
+    if isinstance(exc, httpx.TransportError):
+        return UpstreamError(502, f'upstream unreachable: {type(exc).__name__}')
+    return UpstreamError(502, f'upstream answered badly: {type(exc).__name__}')
 
 
 def _status_error(status: int, headers=None) -> UpstreamError:
@@ -142,8 +144,8 @@ class Client:
                         raise _status_error(resp.status_code, resp.headers)
                     return resp
                 url = target
-        except httpx.TransportError as exc:
-            raise _transport_error(exc) from exc
+        except httpx.HTTPError as exc:
+            raise _upstream_failure(exc) from exc
         raise UpstreamError(502, f'more than {MAX_REDIRECTS} redirects')
 
     async def probe(self, url: str, headers: dict[str, str]) -> httpx.Response:
@@ -158,8 +160,8 @@ class Client:
                             raise _status_error(resp.status_code, resp.headers)
                         return resp
                 url = target
-        except httpx.TransportError as exc:
-            raise _transport_error(exc) from exc
+        except httpx.HTTPError as exc:
+            raise _upstream_failure(exc) from exc
         raise UpstreamError(502, f'more than {MAX_REDIRECTS} redirects')
 
     async def download(self, url: str, headers: dict[str, str], sink) -> httpx.Response:
@@ -176,8 +178,8 @@ class Client:
                             await asyncio.to_thread(sink.write, chunk)
                         return resp
                 url = target
-        except httpx.TransportError as exc:
-            raise _transport_error(exc) from exc
+        except httpx.HTTPError as exc:
+            raise _upstream_failure(exc) from exc
         raise UpstreamError(502, f'more than {MAX_REDIRECTS} redirects')
 
 
@@ -274,8 +276,8 @@ class RangeReader:
         url = self._url
         try:
             return self._fetch_inner(url, first, last)
-        except httpx.TransportError as exc:
-            raise _transport_error(exc) from exc
+        except httpx.HTTPError as exc:
+            raise _upstream_failure(exc) from exc
 
     def _fetch_inner(self, url: str, first: int, last: int) -> bytes:
         for _ in range(MAX_REDIRECTS + 1):

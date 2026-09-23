@@ -54,8 +54,8 @@ JSON_TYPES = (
 )
 PAGE_CONTAINERS = ('readingOrder', 'resources')
 SAME_RESOURCE_KEYS = ('alternate',)
-BARE_SEARCH_PLACEHOLDERS = ('{searchTerms}', '{query}', '{search}')
-FORM_STYLE = re.compile(r'\{[?&]([^}]+)\}')
+SEARCH_VARIABLES = frozenset({'searchTerms', 'query', 'search'})
+EXPRESSION = re.compile(r'\{([?&]?)([^{}]*)\}')
 
 
 class TokenError(ValueError):
@@ -67,6 +67,15 @@ def encode_token(url: str, cover: str | None = None) -> str:
     return base64.urlsafe_b64encode(raw.encode('utf-8')).decode('ascii').rstrip('=')
 
 
+def _fetchable(url: str) -> bool:
+    try:
+        parts = urlsplit(url)
+        whole = parts.scheme.lower() in ('http', 'https') and bool(parts.hostname) and parts.port != 0
+    except ValueError:
+        return False
+    return whole and not any(ord(c) < 0x20 or ord(c) == 0x7F for c in url)
+
+
 def decode_parts(token: str) -> tuple[str, str | None]:
     pad = '=' * (-len(token) % 4)
     try:
@@ -74,32 +83,45 @@ def decode_parts(token: str) -> tuple[str, str | None]:
     except (binascii.Error, UnicodeDecodeError, ValueError) as exc:
         raise TokenError(f'malformed token: {token[:24]}') from exc
     url, _, cover = raw.partition('\n')
-    return url, cover or None
+    if not _fetchable(url):
+        raise TokenError(f'malformed token: {token[:24]}')
+    return url, cover if cover and _fetchable(cover) else None
 
 
 def decode_token(token: str) -> str:
     return decode_parts(token)[0]
 
 
+def _names(spec: str) -> list[str]:
+    return [n.strip() for n in spec.split(',') if n.strip()]
+
+
+def _is_search_name(name: str) -> bool:
+    return name.removesuffix('?') in SEARCH_VARIABLES
+
+
 def is_search_template(href: str | None) -> bool:
-    h = href or ''
-    return any(m in h for m in BARE_SEARCH_PLACEHOLDERS) or bool(FORM_STYLE.search(h))
+    return any(_is_search_name(n) for _, spec in EXPRESSION.findall(href or '') for n in _names(spec))
 
 
 def fill_search(template: str, term: str) -> str:
     value = quote(term, safe='')
 
     def expand(match: re.Match[str]) -> str:
-        names = [n.strip() for n in match.group(1).split(',') if n.strip()]
-        if not names:
-            return ''
-        lead = '?' if match.group(0)[1] == '?' else '&'
-        return f'{lead}{names[0]}={value}'
+        op, spec = match.groups()
+        names = _names(spec)
+        if op:
+            pairs = [f'{n}={value}' for n in names if _is_search_name(n)]
+            return f'{op}{"&".join(pairs)}' if pairs else ''
+        if any(_is_search_name(n) for n in names):
+            return value
+        return '' if spec.strip().endswith('?') else match.group(0)
 
-    out = FORM_STYLE.sub(expand, template)
-    for placeholder in BARE_SEARCH_PLACEHOLDERS:
-        out = out.replace(placeholder, value)
-    return out
+    return EXPRESSION.sub(expand, template)
+
+
+def _unfilled(href: str) -> str:
+    return EXPRESSION.sub(lambda m: '' if m.group(1) else m.group(0), href)
 
 
 @dataclass(frozen=True)
@@ -141,14 +163,21 @@ def map_href(
 ) -> str:
     if not href:
         return href
-    scheme = urlsplit(href).scheme.lower()
+    if kind not in ('p', 's'):
+        href = _unfilled(href)
+    try:
+        scheme = urlsplit(href).scheme.lower()
+        target = urljoin(ctx.base_url, href)
+    except ValueError:
+        return ''
     if scheme and scheme not in ('http', 'https'):
         return href
+    try:
+        jacket = urljoin(ctx.base_url, cover) if cover and kind == 'dl' else None
+    except ValueError:
+        jacket = None
 
-    token = encode_token(
-        urljoin(ctx.base_url, href),
-        urljoin(ctx.base_url, cover) if cover and kind == 'dl' else None,
-    )
+    token = encode_token(target, jacket)
     prefix = f'{ctx.public_base}/{quote(ctx.profile)}'
 
     if kind == 'p':
@@ -276,7 +305,7 @@ def _publication_cover(node: dict) -> str | None:
 
 
 def _json_kind(node: dict, container: str | None) -> str:
-    type_ = node.get('type')
+    type_ = node.get('type') if isinstance(node.get('type'), str) else None
     if container == 'images':
         return 'img'
     if container == 'pages':
@@ -317,6 +346,8 @@ def _walk_json(
             node['type'] = page_mime
         if kind in ('p', 's'):
             node['templated'] = True
+        else:
+            node.pop('templated', None)
         if kind == 'pf':
             node.pop('width', None)
             node.pop('height', None)

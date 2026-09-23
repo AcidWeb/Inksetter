@@ -9,6 +9,7 @@ The way is shut. It was made by those who are dead, and the dead keep it, until 
 
 import ast
 import base64
+import contextlib
 import asyncio
 import gzip
 import inspect
@@ -461,6 +462,40 @@ def _not_an_image():
 @upstream.get('/opds/v1.2/emptyimage')
 def _empty_image():
     return Response(b'', media_type='image/jpeg')
+
+
+@upstream.get('/opds/v1.2/halfimage')
+def _half_image():
+    return Response(half_decodable(), media_type='image/gif')
+
+
+BROKEN_URL = 'http://[broken/'
+BROKEN_HREF_FEED = FEED.replace(
+    '<entry><title>Vol 1</title>',
+    '<entry><title>Vol 0</title><link rel="http://opds-spec.org/acquisition" '
+    'type="application/vnd.comicbook+zip" href="http://[broken/"/></entry><entry><title>Vol 1</title>',
+)
+
+
+@upstream.get('/opds/v1.2/badhref')
+def _bad_href():
+    return Response(BROKEN_HREF_FEED, media_type='application/atom+xml;profile=opds-catalog')
+
+
+@upstream.get('/opds/v1.2/badosd')
+def _bad_osd():
+    body = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<OpenSearchDescription xmlns="http://a9.com/-/spec/opensearch/1.1/">'
+        '<Url type="application/atom+xml" template="http://[x/?q={searchTerms}"/></OpenSearchDescription>'
+    )
+    return Response(body, media_type='application/opensearchdescription+xml')
+
+
+@upstream.get('/opds/v1.2/badgzip.{kind}')
+def _bad_gzip(kind: str):
+    media = {'xml': 'application/atom+xml', 'jpg': 'image/jpeg', 'cbz': 'application/vnd.comicbook+zip'}[kind]
+    return Response(b'plainly not gzip', media_type=media, headers={'content-encoding': 'gzip'})
 
 
 @upstream.get('/opds/v1.2/upstream500')
@@ -2680,8 +2715,15 @@ async def check_repack_slot() -> None:
     budget = free_slots()
     check('repack slots start free', budget >= 1, f'{budget} free')
 
+    async def settled(done, timeout: float = 3.0) -> bool:
+        waited = 0.0
+        while not done() and waited < timeout:
+            await asyncio.sleep(0.02)
+            waited += 0.02
+        return bool(done())
+
     chunks = _cbz.repack_iter(_io.BytesIO(raw), prof)
-    _app._next_block(chunks)
+    _app._next_block(chunks, threading.Lock())
     check('slot is free after one repack step', free_slots() == budget, f'{free_slots()} of {budget}')
     chunks.close()
 
@@ -2690,19 +2732,74 @@ async def check_repack_slot() -> None:
     first = await gen.__anext__()
     check('streamed response yields before it finishes', len(first) > 0, f'{len(first)} bytes')
     await gen.aclose()
+    check('spool is closed after the reader hangs up', await settled(lambda: body.closed))
     check(
         'slot is free after the reader hangs up mid-repack',
         free_slots() == budget,
         f'{free_slots()} of {budget}',
     )
-    check('spool is closed after the reader hangs up', body.closed)
 
     body2 = _io.BytesIO(raw)
     gen2 = _app._repacking(_cbz.repack_iter(_io.BytesIO(raw), prof), body2)
     whole = b''.join([blk async for blk in gen2])
     check('fully drained stream is a valid zip', _zf.ZipFile(_io.BytesIO(whole)).testzip() is None)
     check('slot is free after a completed repack', free_slots() == budget, f'{free_slots()} of {budget}')
-    check('spool is closed after a completed repack', body2.closed)
+    check('spool is closed after a completed repack', await settled(lambda: body2.closed))
+
+    wound = threading.Event()
+
+    def slow_to_close():
+        try:
+            while True:
+                yield b'x'
+        finally:
+            time.sleep(0.8)
+            wound.set()
+
+    body3 = _io.BytesIO()
+    gen3 = _app._repacking(slow_to_close(), body3)
+    await gen3.__anext__()
+    gaps = []
+
+    async def ticker():
+        last = time.perf_counter()
+        for _ in range(10):
+            await asyncio.sleep(0.02)
+            now = time.perf_counter()
+            gaps.append(now - last)
+            last = now
+
+    tick = asyncio.create_task(ticker())
+    await asyncio.sleep(0.01)
+    begun = time.perf_counter()
+    await gen3.aclose()
+    took = time.perf_counter() - begun
+    await tick
+    check('hanging up does not wait for the repack to wind down', took < 0.3, f'{took:.2f} s')
+    check('nor stall the event loop while it does', max(gaps) < 0.3, f'longest tick {max(gaps):.2f} s')
+    check(
+        'and the repack still winds down, off the loop',
+        await asyncio.to_thread(wound.wait, 3.0) and await settled(lambda: body3.closed),
+    )
+
+    def slow_block():
+        while True:
+            time.sleep(0.4)
+            yield b'y'
+
+    busy = slow_block()
+    body4 = _io.BytesIO()
+    gen4 = _app._repacking(busy, body4)
+    pending = asyncio.create_task(gen4.__anext__())
+    await asyncio.sleep(0.1)
+    pending.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await pending
+    check(
+        'a hang-up mid-block closes the repack once that block is done',
+        await settled(lambda: busy.gi_frame is None and body4.closed),
+        f'generator closed: {busy.gi_frame is None}, spool closed: {body4.closed}',
+    )
 
 
 def check_every_profile_geometry() -> None:
@@ -3052,6 +3149,142 @@ def check_seam_defects() -> None:
         cbz._seam(blk, L) == edge,
         f'cut at {cbz._seam(blk, L)}, grey run from {edge}',
     )
+
+
+def check_search_templates() -> None:
+    for template, term, want in (
+        ('/search{?query}{&page,limit}', 'bat man', '/search?query=bat%20man'),
+        ('/search{?page,query}', 'batman', '/search?query=batman'),
+        ('/s?q={searchTerms}&start={startPage?}&n={count?}', 'batman', '/s?q=batman&start=&n='),
+        ('/s?q={searchTerms?}', 'x', '/s?q=x'),
+        ('/opds/v1.2/search?query={searchTerms}', 'one piece', '/opds/v1.2/search?query=one%20piece'),
+    ):
+        got = rewrite.fill_search(template, term)
+        check(f'{template} is filled as {want}', got == want, got)
+
+    check('an optional searchTerms still marks a search', rewrite.is_search_template('/s?q={searchTerms?}'))
+    check('a paging template is not a search', not rewrite.is_search_template('/opds/v2/series{?page}'))
+
+    ctx = rewrite.Ctx(
+        profile='kobo-clara-hd-2e-bw', public_base='http://proxy.test', base_url='http://127.0.0.1:8899/opds/v2/catalog'
+    )
+    doc = {
+        'links': [{'rel': 'next', 'href': '/opds/v2/series{?page}', 'type': 'application/opds+json', 'templated': True}]
+    }
+    link = json.loads(rewrite.rewrite(json.dumps(doc).encode(), 'application/opds+json', ctx, None))['links'][0]
+    check(
+        'a templated paging link routes as a feed, not a search',
+        '/kobo-clara-hd-2e-bw/f/' in link['href'],
+        link['href'],
+    )
+    found = re.search(r'/kobo-clara-hd-2e-bw/\w+/([\w-]+)', link['href'])
+    target = rewrite.decode_token(found.group(1)) if found else ''
+    check(
+        'and its template is expanded with nothing, as RFC 6570 does for undefined variables',
+        target == 'http://127.0.0.1:8899/opds/v2/series',
+        target,
+    )
+    check('so it is no longer advertised as templated', 'templated' not in link, f'{link}')
+
+
+def check_bit_depth() -> None:
+    mono = profiles.PROFILES['kobo-clara-hd-2e-bw']
+    colour = dataclasses.replace(profiles.PROFILES['kindle-colorsoft'], auto_mono=False)
+    strip = profiles.PROFILES['kindle-colorsoft-webtoon']
+
+    def twins(bands: int) -> tuple[bytes, bytes]:
+        a = np.full((1400, 900, bands), 255, np.uint8)
+        art = min(bands, 3)
+        a[200:1200, 150:450, :art] = (200, 40, 40)[:art]
+        a[200:1200, 450:750, :art] = (40, 60, 190)[:art]
+        a[600:700, 150:750, :art] = 20
+        if bands in (2, 4):
+            a[..., -1] = 0
+            a[200:1200, 150:750, -1] = 255
+        deep = a.astype(np.uint16) * 257
+        eight = pyvips.Image.new_from_memory(a.tobytes(), 900, 1400, bands, 'uchar')
+        sixteen = pyvips.Image.new_from_memory(deep.tobytes(), 900, 1400, bands, 'ushort')
+        sixteen = sixteen.copy(interpretation='grey16' if bands < 3 else 'rgb16')
+        return eight.pngsave_buffer(), sixteen.pngsave_buffer()
+
+    def pixels(blob: bytes) -> np.ndarray:
+        im = pyvips.Image.new_from_buffer(blob, '')
+        return np.ndarray(buffer=im.write_to_memory(), dtype=np.uint8, shape=(im.height, im.width, im.bands))
+
+    for bands, kind in ((1, 'grey'), (2, 'grey and alpha'), (3, 'RGB'), (4, 'RGBA')):
+        eight, sixteen = twins(bands)
+        loaded = pyvips.Image.new_from_buffer(sixteen, '')
+        check(f'premise: the 16-bit {kind} fixture loads as 16-bit', loaded.format == 'ushort', loaded.format)
+        for prof in (mono, colour):
+            a, b = pixels(pipeline.render_page(eight, prof)[0]), pixels(pipeline.render_page(sixteen, prof)[0])
+            check(
+                f'a 16-bit {kind} page renders exactly like its 8-bit twin ({prof.name})',
+                a.shape == b.shape and np.array_equal(a, b),
+                f'{int(np.abs(a.astype(int) - b.astype(int)).max()) if a.shape == b.shape else (a.shape, b.shape)}',
+            )
+        if bands != 2:
+            a, b = cbz._strip_rows(eight, strip), cbz._strip_rows(sixteen, strip)
+            check(
+                f'the strip reader reads a 16-bit {kind} slice like its 8-bit twin',
+                a is not None and b is not None and np.array_equal(a, b),
+            )
+
+    halves = np.zeros((1400, 900, 3), np.uint8)
+    halves[:, :450] = (200, 30, 30)
+    halves[:, 450:] = (30, 30, 200)
+    cmyk = pyvips.Image.new_from_memory(halves.tobytes(), 900, 1400, 3, 'uchar').colourspace('cmyk').jpegsave_buffer()
+    check('premise: the CMYK fixture loads as CMYK', pyvips.Image.new_from_buffer(cmyk, '').interpretation == 'cmyk')
+    rows = cbz._strip_rows(cmyk, strip)
+    mid = None if rows is None else len(rows) // 2
+    left = [] if rows is None else rows[mid, 100].tolist()
+    right = [] if rows is None else rows[mid, -100].tolist()
+    check(
+        'the strip reader reads a CMYK slice as the colours it shows',
+        bool(left) and left[0] > max(left[1:]) + 80 and right[2] > max(right[:2]) + 50,
+        f'left {left} should be red, right {right} blue',
+    )
+
+
+def check_lazy_decode() -> None:
+    bad = half_decodable()
+    try:
+        pyvips.Image.new_from_buffer(bad, '')
+        opens = True
+    except pyvips.Error:
+        opens = False
+    check('premise: the broken page opens, and fails only once it is decoded', opens)
+
+    for name in ('kobo-clara-hd-2e-bw', 'kindle-colorsoft'):
+        try:
+            pipeline.render_page(bad, profiles.PROFILES[name])
+            got = 'rendered'
+        except pipeline.UnreadableImage:
+            got = 'UnreadableImage'
+        except Exception as exc:
+            got = type(exc).__name__
+        check(f'a page that fails mid-decode raises UnreadableImage ({name})', got == 'UnreadableImage', got)
+
+    try:
+        got = str(pipeline.same_picture(bad, fake_page(0)))
+    except Exception as exc:
+        got = type(exc).__name__
+    check('same_picture calls a page that fails mid-decode different, rather than raising', got == 'False', got)
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w') as z:
+        for i in range(3):
+            z.writestr(f'{i:03d}.jpg', fake_page(i, 800, 1500))
+        z.writestr('003.gif', bad)
+        for i in range(4, 7):
+            z.writestr(f'{i:03d}.jpg', fake_page(i, 800, 1500))
+    strip = profiles.PROFILES['kindle-colorsoft-webtoon']
+    try:
+        out = zipfile.ZipFile(io.BytesIO(b''.join(cbz.repack_iter(io.BytesIO(buf.getvalue()), strip, 1))))
+        pages = [n for n in out.namelist() if n.lower().endswith(('.png', '.jpg'))]
+        got = f'{len(pages)} pages' if out.testzip() is None else 'corrupt archive'
+    except Exception as exc:
+        pages, got = [], f'{type(exc).__name__}: {str(exc)[:40]}'
+    check('a webtoon download survives a slice that fails mid-decode', len(pages) > 0, got)
 
 
 def check_reslice() -> None:
@@ -3748,6 +3981,69 @@ def _decoded(token: str) -> tuple[str, str | None]:
         return rewrite.decode_parts(token)
     except rewrite.TokenError:
         return '', None
+
+
+async def check_malformed_input(c) -> None:
+    up = 'http://127.0.0.1:8899'
+    ctx = rewrite.Ctx(profile='kobo-clara-hd-2e-bw', public_base='http://proxy.test', base_url=f'{up}/opds/v1.2/x')
+    try:
+        out = rewrite.rewrite(BROKEN_HREF_FEED.encode(), 'application/atom+xml', ctx, None).decode()
+        got = 'rewritten'
+    except Exception as exc:
+        out, got = '', type(exc).__name__
+    check('a feed with one malformed href is still rewritten', got == 'rewritten', got)
+    check('the malformed href is dropped, not passed through', '[broken' not in out and 'href=""' in out)
+    check('and the rest of the feed is rewritten as usual', '/kobo-clara-hd-2e-bw/dl/' in out and up not in out)
+
+    doc = {'links': [{'rel': 'self', 'href': '/opds/v2/catalog', 'type': 1}]}
+    try:
+        out = json.loads(rewrite.rewrite(json.dumps(doc).encode(), 'application/opds+json', ctx, None))
+        got = out['links'][0]['href']
+    except Exception as exc:
+        got = type(exc).__name__
+    check(
+        'an OPDS 2 link whose type is not a string is rewritten as if it had none', got.startswith('http://proxy'), got
+    )
+
+    check('host_key answers a malformed URL rather than raising', _host_key_of('http://[x/y') == '')
+    url, jacket = rewrite.decode_parts(encode_token(f'{up}/opds/v1.2/books/7/file', BROKEN_URL))
+    check(
+        'a token whose cover is malformed keeps its URL and drops the cover', url.endswith('/file') and jacket is None
+    )
+
+    for label, bad in (
+        ('a malformed host', BROKEN_URL),
+        ('a NUL byte', f'{up}/opds/v1.2/a\x00b'),
+        ('a scheme other than http', 'ftp://127.0.0.1/x'),
+    ):
+        for route in ('f', 'p', 'img', 'dl'):
+            try:
+                r = await c.get(f'/kobo-clara-hd-2e-bw/{route}/{encode_token(bad)}')
+                status = r.status_code
+            except Exception as exc:
+                status = f'{type(exc).__name__} escaped'
+            check(f'a token for {label} is refused as 400 on /{route}/', status == 400, f'status={status}')
+
+    for label, path, want in (
+        ('a feed with a malformed href', f'/kobo-clara-hd-2e-bw/f/{encode_token(up + "/opds/v1.2/badhref")}', 200),
+        ('a malformed search template', f'/kobo-clara-hd-2e-bw/bs/{encode_token(up + "/opds/v1.2/badosd")}?q=x', 502),
+    ):
+        try:
+            r = await c.get(path)
+            status, body = r.status_code, r.text
+        except Exception as exc:
+            status, body = f'{type(exc).__name__} escaped', ''
+        check(f'{label} is answered {want}, not 500', status == want, f'status={status}')
+        check(f'and {label} leaks nothing upstream', '[broken' not in body and up not in body)
+
+
+def _host_key_of(url: str) -> str | None:
+    from inksetter.opds.upstream import host_key
+
+    try:
+        return host_key(url)
+    except Exception:
+        return None
 
 
 async def check_no_stream(c) -> None:
@@ -4897,6 +5193,27 @@ async def main() -> int:
                 r.status_code == 502,
                 f'status={r.status_code} {r.text[:60]}',
             )
+        for prof in ('kobo-clara-hd-2e-bw', 'kindle-colorsoft'):
+            try:
+                r = await c.get(f'/{prof}/p/' + encode_token('http://127.0.0.1:8899/opds/v1.2/halfimage'))
+                status, said = r.status_code, r.text[:60]
+            except Exception as exc:
+                status, said = 500, f'{type(exc).__name__} escaped the route'
+            check(f'a page that fails mid-decode is 502, not 500 ({prof})', status == 502, f'status={status} {said}')
+        for label, route, path in (
+            ('a feed', 'f', 'badgzip.xml'),
+            ('a page', 'p', 'badgzip.jpg'),
+            ('a download', 'dl', 'badgzip.cbz'),
+        ):
+            try:
+                tok = encode_token(f'http://127.0.0.1:8899/opds/v1.2/{path}')
+                r = await c.get(f'/kobo-clara-hd-2e-bw/{route}/{tok}')
+                status, said = r.status_code, r.text[:70]
+            except Exception as exc:
+                status, said = 500, f'{type(exc).__name__} escaped the route'
+            check(f'{label} the upstream garbles is 502, not 500', status == 502, f'status={status} {said}')
+            if route == 'p':
+                check('and it is not called unreachable', 'unreachable' not in said and 'badly' in said, said)
         r = await c.get('/kobo-clara-hd-2e-bw/p/' + encode_token('http://127.0.0.1:8899/opds/v1.2/upstream500'))
         check('upstream 5xx becomes 502', r.status_code == 502, f'status={r.status_code}')
         r = await c.get('/kobo-clara-hd-2e-bw/p/' + encode_token('http://127.0.0.1:8899/opds/v1.2/missing'))
@@ -4943,6 +5260,9 @@ async def main() -> int:
 
         print('webtoon profiles do not stream')
         await check_no_stream(c)
+
+        print('malformed input')
+        await check_malformed_input(c)
 
         print('browse pages')
         await check_browse(c)
@@ -5016,6 +5336,9 @@ async def main() -> int:
     check_module_boundary()
     print('profile config')
     check_seam_defects()
+    check_search_templates()
+    check_bit_depth()
+    check_lazy_decode()
     check_reslice()
     check_family_duplicates()
     check_profile_config()

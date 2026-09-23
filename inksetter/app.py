@@ -251,7 +251,10 @@ async def browse_search(profile: str, token: str, request: Request, q: str = '')
         template = rewrite.search_template(resp.content)
         if template is None:
             raise UpstreamError(502, 'upstream offers no search template')
-        url = urljoin(url, template)
+        try:
+            url = urljoin(url, template)
+        except ValueError as exc:
+            raise UpstreamError(502, 'upstream search template is malformed') from exc
     return await _serve_html(request, profile, rewrite.fill_search(url, q), q)
 
 
@@ -362,16 +365,25 @@ def _drain(fobj, chunk: int = 1 << 18):
         fobj.close()
 
 
-def _next_block(chunks):
-    with repack_slots:
+def _next_block(chunks, turn: threading.Lock):
+    with turn, repack_slots:
         return next(chunks, None)
 
 
+def _wind_down(chunks, body, turn: threading.Lock) -> None:
+    with turn:
+        with contextlib.suppress(Exception):
+            chunks.close()
+        with contextlib.suppress(Exception):
+            body.close()
+
+
 async def _repacking(chunks, body, job: str = ''):
+    turn = threading.Lock()
     whole = False
     try:
         while True:
-            block = await asyncio.to_thread(_next_block, chunks)
+            block = await asyncio.to_thread(_next_block, chunks, turn)
             if block is None:
                 whole = True
                 return
@@ -379,10 +391,7 @@ async def _repacking(chunks, body, job: str = ''):
     finally:
         if job:
             jobs.set(job, stage='done' if whole else 'error')
-        with contextlib.suppress(Exception):
-            chunks.close()
-        with contextlib.suppress(Exception):
-            body.close()
+        threading.Thread(target=_wind_down, args=(chunks, body, turn), name='repack-close', daemon=True).start()
 
 
 def _spool():
