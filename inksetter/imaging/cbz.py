@@ -30,7 +30,7 @@ _PNG_SIG = b'\x89PNG\r\n\x1a\n'
 
 
 def natural_key(name: str):
-    return [int(t) if t.isdigit() else t.lower() for t in _NUM.split(name)]
+    return [int(t) if t.isdecimal() else t.lower() for t in _NUM.split(name)]
 
 
 def is_image(name: str) -> bool:
@@ -47,14 +47,14 @@ def _suffix_for(blob: bytes, fallback_name: str) -> str:
     return fallback_name[dot:] if dot > 0 else '.jpg'
 
 
-def _entries(zin, names):
+def _entries(zin, infos):
     index = 0
-    for name in names:
-        if not is_image(name):
-            yield ('copy', name, zin.read(name))
+    for info in infos:
+        if not is_image(info.filename):
+            yield ('copy', info.filename, zin.read(info))
             continue
         index += 1
-        yield ('page', index, name, zin.read(name))
+        yield ('page', index, info.filename, zin.read(info))
 
 
 STRIP_GUTTER_FLOOR = 0.50
@@ -126,7 +126,17 @@ def _seam(block: np.ndarray, limit: int) -> int:
     return floor + len(tail) - 1 - int(np.argmin(tail[::-1]))
 
 
-def _strip_tiles(zin, names, p: Profile, note):
+def _leading_blank(a: np.ndarray, step: int) -> int:
+    done = 0
+    while done < len(a):
+        blank = _gutter(a[done : done + step])
+        if not blank.all():
+            return done + int(np.argmin(blank))
+        done += step
+    return len(a)
+
+
+def _strip_tiles(zin, infos, p: Profile, consumed: dict[int, int]):
     limit = round(p.width * p.aspect)
     reach = round(limit * STRIP_OVERSHOOT)
     margin = round(limit * STRIP_TOP_MARGIN)
@@ -138,8 +148,7 @@ def _strip_tiles(zin, names, p: Profile, note):
     def take(a: np.ndarray) -> None:
         nonlocal rows, opening, lead
         if opening:
-            blank = _gutter(a)
-            art = len(a) if blank.all() else int(np.argmin(blank))
+            art = _leading_blank(a, limit)
             if art:
                 run = a[:art] if lead is None else np.concatenate([lead, a[:art]])
                 lead = run[len(run) - min(margin, len(run)) :]
@@ -155,24 +164,26 @@ def _strip_tiles(zin, names, p: Profile, note):
         block = held[0] if len(held) == 1 else np.concatenate(held)
         at = _seam(block, limit) if len(block) > limit else len(block)
         index += 1
+        consumed[index] = seen
+        tile = block[:at].copy()
         held, rows, opening = [], 0, True
         if at < len(block):
-            take(block[at:].copy())
-        return ('tile', index, name, block[:at])
+            take(block[at:])
+        return ('tile', index, name, tile)
 
     last = ''
-    for name in names:
+    for info in infos:
+        name = info.filename
         if not is_image(name):
-            yield ('copy', name, zin.read(name))
+            yield ('copy', name, zin.read(info))
             continue
         seen += 1
         last = name
-        a = _strip_rows(zin.read(name), p)
+        a = _strip_rows(zin.read(info), p)
         if a is not None:
             take(a)
             while rows > reach:
                 yield cut_one(name)
-        note(seen)
     while rows > limit:
         yield cut_one(last)
     if rows:
@@ -181,7 +192,7 @@ def _strip_tiles(zin, names, p: Profile, note):
 
 @functools.lru_cache(maxsize=16)
 def _refit(p: Profile, fit: str) -> Profile:
-    return dataclasses.replace(p, fit=fit)
+    return dataclasses.replace(p, fit=fit, rotate_wide=False, autocrop=False, strip_folio=False)
 
 
 def _tile_image(a: np.ndarray) -> pyvips.Image:
@@ -224,30 +235,30 @@ def _run(jobs, zout, profile: Profile, workers: int, pad: int = 4):
 def _run_serial(jobs, zout, profile: Profile, pad: int = 4):
     for job in jobs:
         if job[0] == 'copy':
-            yield job[0], _emit(zout, job, None, pad)
+            yield job, _emit(zout, job, None, pad)
             continue
         try:
             blob, _ = _render(job, profile)
         except Exception:
             log.warning('page %s failed to render; shipping it unchanged', job[2], exc_info=True)
             blob = None
-        yield job[0], _emit(zout, job, blob, pad)
+        yield job, _emit(zout, job, blob, pad)
 
 
 def _run_pooled(jobs, zout, profile: Profile, workers: int, pad: int = 4):
     window = max(2, workers * 2)
     pending: collections.deque = collections.deque()
 
-    def flush_one() -> tuple[str, tuple[int, int] | None]:
+    def flush_one() -> tuple[tuple, tuple[int, int] | None]:
         job, fut = pending.popleft()
         if fut is None:
-            return job[0], _emit(zout, job, None, pad)
+            return job, _emit(zout, job, None, pad)
         try:
             blob, _ = fut.result()
         except Exception:
             log.warning('page %s failed to render; shipping it unchanged', job[2], exc_info=True)
             blob = None
-        return job[0], _emit(zout, job, blob, pad)
+        return job, _emit(zout, job, blob, pad)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers, thread_name_prefix='repack') as pool:
         try:
@@ -296,10 +307,9 @@ def repack_iter(
     progress=None,
 ):
     zin = zipfile.ZipFile(src)
-    infos = [i for i in zin.infolist() if not i.is_dir()]
+    infos = sorted((i for i in zin.infolist() if not i.is_dir()), key=lambda i: natural_key(i.filename))
     declared = sum(i.file_size for i in infos)
-    names = sorted((i.filename for i in infos), key=natural_key)
-    images = sum(1 for x in names if is_image(x))
+    images = sum(1 for i in infos if is_image(i.filename))
     log.info(
         'repack: %d entries, %d image(s), %.0f MB declared, %d worker(s)',
         len(infos),
@@ -310,14 +320,14 @@ def repack_iter(
 
     lead = None
     if cover:
-        first = next((n for n in names if is_image(n)), None)
+        first = next((i for i in infos if is_image(i.filename)), None)
         if first is not None and not same_picture(cover, zin.read(first)):
             lead = cover
             log.info('repack: prepending the server cover, %d kB', len(cover) // 1024)
         else:
             log.debug('repack: the cover is already page 1, not prepending')
 
-    if any(n.lower().endswith(_COMICINFO) for n in names):
+    if any(i.filename.lower().endswith(_COMICINFO) for i in infos):
         comicinfo = None
 
     strip = profile.reslice
@@ -355,17 +365,22 @@ def repack_iter(
                     pages += 1
                     tell(pages)
 
-                jobs = _strip_tiles(zin, names, profile, lambda n: tell(n + pages)) if strip else _entries(zin, names)
-                for kind, size in _run(jobs, zout, profile, workers, pad):
+                consumed: dict[int, int] = {}
+                jobs = _strip_tiles(zin, infos, profile, consumed) if strip else _entries(zin, infos)
+                for job, size in _run(jobs, zout, profile, workers, pad):
                     written += 1
-                    if kind != 'copy':
+                    if job[0] != 'copy':
                         sizes.append(size)
-                    if kind == 'page':
+                    if job[0] == 'page':
                         pages += 1
                         tell(pages)
+                    elif job[0] == 'tile':
+                        tell(pages + min(consumed.pop(job[1]), max(0, images - 1)))
                     block = sink.drain()
                     if block:
                         yield block
+                if strip:
+                    tell(total_pages)
                 meta = _metadata(comicinfo, sizes)
                 if meta:
                     zout.writestr('ComicInfo.xml', meta)

@@ -8,9 +8,9 @@ from pathlib import Path
 from dataclasses import dataclass
 
 
-def _int(name: str, default: int) -> int:
+def _int(name: str, default: int, minimum: int = 0) -> int:
     try:
-        return int(os.environ.get(name, default))
+        return max(minimum, int(os.environ.get(name, default)))
     except ValueError:
         return default
 
@@ -37,14 +37,14 @@ class Settings:
     prefetch: int = _int('PREFETCH', 3)
 
     # Concurrent libvips renders.
-    render_workers: int = _int('RENDER_WORKERS', 3)
+    render_workers: int = _int('RENDER_WORKERS', 3, minimum=1)
 
     # Concurrent repack STEPS - not concurrent downloads.
-    repack_workers: int = _int('REPACK_WORKERS', 2)
+    repack_workers: int = _int('REPACK_WORKERS', 2, minimum=1)
 
     # Pages rendered concurrently within ONE repack.
     # Three rather than the core count, because libvips is internally threaded.
-    repack_page_workers: int = _int('REPACK_PAGE_WORKERS', 3)
+    repack_page_workers: int = _int('REPACK_PAGE_WORKERS', 3, minimum=1)
 
     # Downloads and repacks stream through a SpooledTemporaryFile: RAM up to this, then disk.
     spool_max_bytes: int = _int('SPOOL_MAX_BYTES', 32 * 1024**2)

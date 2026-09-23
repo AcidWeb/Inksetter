@@ -447,7 +447,7 @@ def error(status: int, detail: str, base: str) -> str:
 GROUPS = (
     ('Black and white', 'Carta and other grey panels. Sixteen levels of grey, dithered.'),
     ('Colour', 'Kaleido panels. Colour pages, and the filter array is corrected for.'),
-    ('Webtoon', 'Long vertical strips, scaled to the panel width for continuous scrolling.'),
+    ('Webtoon', 'Long vertical strips, re-cut into pages that fit the screen.'),
     ('No processing', 'The feed is rewritten, the pages are passed through untouched.'),
 )
 

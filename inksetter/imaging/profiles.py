@@ -181,10 +181,7 @@ def validate(p: Profile, where: str = 'profile') -> Profile:
     if p.dither not in DITHERS:
         problems.append(f'dither={p.dither!r} is not one of {", ".join(sorted(DITHERS))}')
     if p.descreen not in DESCREENS:
-        extra = ''
-        if isinstance(p.descreen, int | float):
-            extra = " - descreen used to be a pre-blur strength and is now a mode; use 'mono', 'always' or 'none'"
-        problems.append(f'descreen={p.descreen!r} is not one of {", ".join(sorted(DESCREENS))}{extra}')
+        problems.append(f'descreen={p.descreen!r} is not one of {", ".join(sorted(DESCREENS))}')
     if not 0.0 <= p.descreen_strength <= 1.0:
         problems.append(f'descreen_strength={p.descreen_strength} must be 0..1')
     if not 0.0 < p.descreen_width < 0.5:

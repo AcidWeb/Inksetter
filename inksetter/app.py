@@ -34,7 +34,7 @@ logs.configure()
 cache = DiskCache(settings.cache_dir, settings.cache_max_bytes)
 prefetcher = Prefetcher(settings.prefetch)
 render_sem = asyncio.Semaphore(settings.render_workers)
-repack_slots = threading.BoundedSemaphore(settings.repack_workers)
+repack_slots = asyncio.Semaphore(settings.repack_workers)
 
 JOB_ID = re.compile(r'^[A-Za-z0-9-]{1,64}$')
 
@@ -168,7 +168,9 @@ async def _serve_feed(request: Request, profile_name: str, url: str) -> Response
     ctype = resp.headers.get('content-type', '')
     page_mime = None if p.fmt == 'raw' else p.mime
     if rewrite.is_feed(ctype, resp.content):
-        body = rewrite.rewrite(resp.content, ctype, _ctx(request, profile_name, url), page_mime, not p.reslice)
+        body = rewrite.rewrite(
+            resp.content, ctype, _ctx(request, profile_name, str(resp.url)), page_mime, not p.reslice
+        )
     else:
         body = resp.content
     return Response(content=body, media_type=ctype or 'application/atom+xml')
@@ -194,7 +196,7 @@ async def feed(profile: str, token: str, request: Request):
 async def opensearch(profile: str, token: str, request: Request):
     url = rewrite.decode_token(token)
     resp = await client.get(url, request_headers(request.headers, forward_accept=True))
-    body = rewrite.rewrite_opensearch(resp.content, _ctx(request, profile, url))
+    body = rewrite.rewrite_opensearch(resp.content, _ctx(request, profile, str(resp.url)))
     return Response(body, media_type='application/opensearchdescription+xml')
 
 
@@ -223,7 +225,7 @@ async def _serve_html(request: Request, profile_name: str, url: str, term: str =
     p = _profile_or_404(profile_name)
     resp = await client.get(url, request_headers(request.headers, accept=BROWSE_ACCEPT))
     base = _public_base(request)
-    feed = web.parse(resp.content, _ctx(request, profile_name, url))
+    feed = web.parse(resp.content, _ctx(request, profile_name, str(resp.url)))
     if feed is None:
         return HTMLResponse(web.unsupported(p, base))
     trail = request.query_params.get(web.TRAIL_PARAM, '')
@@ -252,7 +254,7 @@ async def browse_search(profile: str, token: str, request: Request, q: str = '')
         if template is None:
             raise UpstreamError(502, 'upstream offers no search template')
         try:
-            url = urljoin(url, template)
+            url = urljoin(str(resp.url), template)
         except ValueError as exc:
             raise UpstreamError(502, 'upstream search template is malformed') from exc
     return await _serve_html(request, profile, rewrite.fill_search(url, q), q)
@@ -370,7 +372,7 @@ def _drain(fobj, chunk: int = 1 << 18):
 
 
 def _next_block(chunks, turn: threading.Lock):
-    with turn, repack_slots:
+    with turn:
         return next(chunks, None)
 
 
@@ -387,7 +389,8 @@ async def _repacking(chunks, body, job: str = ''):
     whole = False
     try:
         while True:
-            block = await asyncio.to_thread(_next_block, chunks, turn)
+            async with repack_slots:
+                block = await asyncio.to_thread(_next_block, chunks, turn)
             if block is None:
                 whole = True
                 return

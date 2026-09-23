@@ -24,7 +24,7 @@ FORWARD_RESPONSE = (
     'last-modified',
     'etag',
 )
-CHALLENGE = {401: 'www-authenticate', 407: 'proxy-authenticate'}
+CHALLENGE = {401: 'www-authenticate'}
 DEFAULT_CHALLENGE = 'Basic realm="Inksetter"'
 MAX_REDIRECTS = 5
 TIMEOUT = 30.0
@@ -76,6 +76,8 @@ def _upstream_failure(exc: Exception) -> UpstreamError:
 def _status_error(status: int, headers=None) -> UpstreamError:
     if status >= 500:
         return UpstreamError(502, f'upstream is failing: status {status}')
+    if status == 407:
+        return UpstreamError(502, 'the outbound proxy wants credentials; the reader cannot give them')
     challenge = CHALLENGE.get(status)
     if challenge is None:
         return UpstreamError(status)

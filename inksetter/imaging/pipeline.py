@@ -28,7 +28,7 @@ import scipy.fft as sfft
 from typing import NamedTuple
 
 from . import folio
-from .profiles import Profile
+from .profiles import UPSCALE_MAX_CEILING, Profile
 
 
 log = logging.getLogger(__name__)
@@ -738,7 +738,7 @@ def fit_to_width(im: pyvips.Image, width: int, p: Profile) -> pyvips.Image:
     if scale < 1.0:
         im = im.thumbnail_image(width, height=NO_HEIGHT_CAP, size='down', linear=p.linear_light)
     elif scale > 1.0:
-        im = im.resize(scale, kernel=p.upscale_kernel)
+        im = im.resize(min(scale, UPSCALE_MAX_CEILING), kernel=p.upscale_kernel)
     if im.width > width:
         im = im.crop(0, 0, width, im.height)
     elif im.width < width:

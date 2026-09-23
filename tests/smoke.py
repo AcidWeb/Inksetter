@@ -592,6 +592,52 @@ def _hostile():
     return Response(body, media_type='application/atom+xml;profile=opds-catalog')
 
 
+MOVED_FEED = """<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+ <title>Moved</title>
+ <entry><title>Relative shelf</title>
+  <link rel="subsection" type="application/atom+xml;profile=opds-catalog" href="r/0/2"/>
+ </entry>
+</feed>"""
+
+
+@upstream.get('/opds/v1.2/moved')
+def _moved():
+    return Response(status_code=301, headers={'location': '/opds/v1.2/moved/'})
+
+
+@upstream.get('/opds/v1.2/moved/')
+def _moved_here():
+    return Response(MOVED_FEED, media_type='application/atom+xml;profile=opds-catalog')
+
+
+@upstream.get('/opds/v1.2/moved/search.xml')
+def _moved_osd():
+    body = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<OpenSearchDescription xmlns="http://a9.com/-/spec/opensearch/1.1/">'
+        '<Url type="application/atom+xml" template="found?q={searchTerms}"/></OpenSearchDescription>'
+    )
+    return Response(body, media_type='application/opensearchdescription+xml')
+
+
+@upstream.get('/opds/v1.2/moved/found')
+def _moved_found(q: str = ''):
+    return Response(
+        MOVED_FEED.replace('<title>Moved</title>', f'<title>found:{q}</title>'), media_type='application/atom+xml'
+    )
+
+
+@upstream.get('/opds/v1.2/moved-search')
+def _moved_search():
+    return Response(status_code=302, headers={'location': '/opds/v1.2/moved/search.xml'})
+
+
+@upstream.get('/opds/v1.2/proxyauth')
+def _proxy_auth():
+    return Response('who are you', status_code=407, headers={'proxy-authenticate': 'Basic realm="corp"'})
+
+
 @upstream.get('/opds/v1.2/badhref')
 def _bad_href():
     return Response(BROKEN_HREF_FEED, media_type='application/atom+xml;profile=opds-catalog')
@@ -826,6 +872,12 @@ def check_fit_and_upscale() -> None:
     )
 
     for field, bad in (
+        ('autocrop', 'false'),
+        ('palette', 'no'),
+        ('width', 1072.5),
+        ('descreen_peaks', 2.5),
+        ('gamma', True),
+        ('fmt', 3),
         ('fit', 'letterbox'),
         ('fit', 'width'),
         ('colour_pad', 'grey'),
@@ -838,6 +890,16 @@ def check_fit_and_upscale() -> None:
             check(f'{field}={bad!r} rejected', False, 'accepted')
         except ValueError as exc:
             check(f'{field}={bad!r} rejected', field in str(exc), str(exc)[:52])
+
+
+def check_profile_types() -> None:
+    clara = profiles.PROFILES['kobo-clara-hd-2e-bw']
+    try:
+        profiles.validate(dataclasses.replace(clara, upscale_max=2, gamma=1))
+        got = 'accepted'
+    except ValueError as exc:
+        got = str(exc)[:60]
+    check('a whole number where a fraction is expected is accepted', got == 'accepted', got)
 
 
 def check_dither_ties() -> None:
@@ -1428,11 +1490,20 @@ async def check_comicinfo() -> None:
 
     empty = {
         'series': {'name': 'X', 'format': 2},
-        'meta': {'summary': '-100000', 'releaseYear': 0, 'language': None, 'ageRating': 0, 'writers': [], 'genres': []},
+        'meta': {
+            'summary': '-100000',
+            'releaseYear': 0,
+            'totalCount': 0,
+            'language': None,
+            'ageRating': 0,
+            'writers': [],
+            'genres': [],
+        },
         'numbers': {},
     }
     xml2 = kavita.render(empty, None, [(100, 200)] * 2).decode()
     check('the -100000 sentinel never reaches the file', '-100000' not in xml2, xml2[:120])
+    check('an unset year and count, both 0 in Kavita, are omitted', '<Year>' not in xml2 and '<Count>' not in xml2)
     check('a series with no library type omits <Manga>', '<Manga>' not in xml2)
 
     comic = dict(data, manga=False)
@@ -1579,12 +1650,14 @@ async def check_comicinfo() -> None:
             self.reachable = True
             self.reject = set()
             self.library_type = _R(200, 0)
+            self.urls = []
 
         async def post(self, _url, params=None, **_kw):  # noqa: ARG002
             self.auths += 1
             return _R(200, {'token': f'JWT-{self.auths}'})
 
         async def get(self, url, params=None, headers=None, **_kw):
+            self.urls.append(url)
             if not self.reachable:
                 raise OSError('connection refused')
             if (headers or {}).get('Authorization', '').removeprefix('Bearer ') in self.reject:
@@ -1600,6 +1673,7 @@ async def check_comicinfo() -> None:
                     [
                         {'id': 265, 'minNumber': 1, 'coverImage': 'v265.png'},
                         {'id': 266, 'minNumber': 2, 'coverImage': ''},
+                        {'id': 267, 'minNumber': 100000, 'coverImage': ''},
                     ],
                 )
             return _R(200, {'name': 'Example Manga', 'format': 1, 'libraryId': 3})
@@ -1608,16 +1682,18 @@ async def check_comicinfo() -> None:
         def __init__(self, api):
             self.raw = api
 
-    async def with_kavita(api, body, ttl=None):
-        real_client, real_settings, real_ttl = kavita.client, kavita.settings, kavita._NEGATIVE_TTL
+    async def with_kavita(api, body, ttl=None, fresh=None, catalog='http://kavita:5000/api/opds/KEY'):
+        real = kavita.client, kavita.settings, kavita._NEGATIVE_TTL, kavita._POSITIVE_TTL
         kavita.client = _Stub(api)
-        kavita.settings = dataclasses.replace(settings_mod.settings, upstream_catalog='http://kavita:5000/api/opds/KEY')
+        kavita.settings = dataclasses.replace(settings_mod.settings, upstream_catalog=catalog)
         if ttl is not None:
             kavita._NEGATIVE_TTL = ttl
+        if fresh is not None:
+            kavita._POSITIVE_TTL = fresh
         try:
             return await body(kavita._Kavita())
         finally:
-            kavita.client, kavita.settings, kavita._NEGATIVE_TTL = real_client, real_settings, real_ttl
+            kavita.client, kavita.settings, kavita._NEGATIVE_TTL, kavita._POSITIVE_TTL = real
 
     api = _Api()
 
@@ -1642,6 +1718,27 @@ async def check_comicinfo() -> None:
     )
     check('one authentication served both', api.auths == 1, f'{api.auths} auths')
     check('a series in a manga library is manga', (first or {}).get('manga') is True, f'{(first or {}).get("manga")}')
+    check(
+        'the Specials volume is given no number',
+        267 not in (first or {}).get('numbers', {}),
+        f'{first and first["numbers"]}',
+    )
+
+    api = _Api()
+    again = await with_kavita(api, happy, fresh=0.0)
+    check(
+        'a successful answer is fetched again once it is stale',
+        api.metadata_calls == 2 and again[1] is not again[0],
+        f'{api.metadata_calls} metadata calls',
+    )
+
+    api = _Api()
+    await with_kavita(api, lambda k: k.series_metadata(21), catalog='https://host.lan/kavita/api/opds/KEY')
+    check(
+        'a Kavita behind a reverse-proxy subpath is asked under that subpath',
+        bool(api.urls) and all(u.startswith('https://host.lan/kavita/api/') for u in api.urls),
+        f'{api.urls[:1]}',
+    )
 
     class _NotJson(_R):
         def json(self):
@@ -2721,6 +2818,13 @@ def check_concurrency_defaults() -> None:
             reloaded.repack_workers == 2,
             f'{reloaded.repack_workers}',
         )
+    silly = {'RENDER_WORKERS': '0', 'REPACK_WORKERS': '-3', 'REPACK_PAGE_WORKERS': '0', 'PREFETCH': '-2'}
+    with mock.patch.dict(_os.environ, silly):
+        reloaded = importlib.reload(settings_mod).settings
+        counts = (reloaded.render_workers, reloaded.repack_workers, reloaded.repack_page_workers, reloaded.prefetch)
+        check(
+            'a worker count of zero or less is raised to one, and prefetch to none', counts == (1, 1, 1, 0), f'{counts}'
+        )
     importlib.reload(settings_mod)
 
     want = min(8, max(2, (_os.cpu_count() or 4) // 2))
@@ -2935,12 +3039,7 @@ async def check_repack_slot() -> None:
     raw = src.getvalue()
 
     def free_slots() -> int:
-        taken = 0
-        while _app.repack_slots.acquire(blocking=False):
-            taken += 1
-        for _ in range(taken):
-            _app.repack_slots.release()
-        return taken
+        return _app.repack_slots._value
 
     budget = free_slots()
     check('repack slots start free', budget >= 1, f'{budget} free')
@@ -3517,6 +3616,134 @@ def check_lazy_decode() -> None:
     check('a webtoon download survives a slice that fails mid-decode', len(pages) > 0, got)
 
 
+def check_reslice_edges() -> None:
+    import warnings
+
+    import itertools
+
+    strip = profiles.PROFILES['kindle-colorsoft-webtoon']
+
+    def png(a: np.ndarray) -> bytes:
+        bands = 1 if a.ndim == 2 else a.shape[2]
+        return pyvips.Image.new_from_memory(a.tobytes(), a.shape[1], a.shape[0], bands, 'uchar').pngsave_buffer()
+
+    def archive(entries) -> bytes:
+        buf = io.BytesIO()
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            with zipfile.ZipFile(buf, 'w') as z:
+                for name, blob in entries:
+                    z.writestr(name, blob)
+        return buf.getvalue()
+
+    def infos(blob: bytes):
+        z = zipfile.ZipFile(io.BytesIO(blob))
+        return z, sorted(z.infolist(), key=lambda i: cbz.natural_key(i.filename))
+
+    rng = np.random.default_rng(5)
+    tall = archive([('001.png', png(rng.integers(0, 256, (12800, 800, 3), dtype=np.uint8)))])
+    scanned = [0]
+    real_gutter = cbz._gutter
+
+    def counting(rows):
+        scanned[0] += len(rows)
+        return real_gutter(rows)
+
+    cbz._gutter = counting
+    try:
+        z, order = infos(tall)
+        tiles = [t[3] for t in cbz._strip_tiles(z, order, strip, {}) if t[0] == 'tile']
+    finally:
+        cbz._gutter = real_gutter
+    total = sum(len(t) for t in tiles)
+    check('premise: one slice twelve screens tall is cut into many pages', len(tiles) >= 10, f'{len(tiles)} pages')
+    check('no page keeps the whole slice alive', all(t.base is None for t in tiles))
+    check(
+        'the leading-gutter trim reads a tall slice about once, not once per page',
+        scanned[0] <= 3 * total,
+        f'{scanned[0]} rows scanned for {total}',
+    )
+
+    rows = cbz._strip_rows(png(np.full((1000, 20, 3), 90, np.uint8)), strip)
+    check(
+        'a sliver of an entry is not blown up past the upscale ceiling',
+        rows is not None and rows.shape[1] == strip.width and len(rows) <= 8000,
+        f'{None if rows is None else rows.shape}',
+    )
+
+    def margined(h: int, i: int) -> np.ndarray:
+        a = np.full((h, 800, 3), 255, np.uint8)
+        a[:, 120:680] = rng.integers(0, 256, (h, 560, 3), dtype=np.uint8)
+        a[:, 120:680, 0] = 40 + i
+        return a
+
+    mono = dataclasses.replace(profiles.PROFILES['kindle-pw-6'], reslice=True)
+    src = archive([(f'{i:03d}.png', png(margined(h, i))) for i, h in enumerate((1300, 1100, 250))])
+    z, order = infos(src)
+    cut = [len(t[3]) for t in cbz._strip_tiles(z, order, mono, {}) if t[0] == 'tile']
+    want = [(mono.width, min(h, round(mono.width * mono.aspect))) for h in cut]
+    got = []
+    out = zipfile.ZipFile(io.BytesIO(b''.join(cbz.repack_iter(io.BytesIO(src), mono, 1))))
+    for n in sorted(out.namelist()):
+        if n.endswith(('.png', '.jpg')):
+            im = pyvips.Image.new_from_buffer(out.read(n), '')
+            got.append((im.width, im.height))
+    check('premise: the strip ends on a page wider than it is tall', bool(cut) and cut[-1] < mono.width, f'{cut}')
+    check(
+        'a re-cut page is never rotated or cropped, whatever the profile asks of a paged book',
+        got == want,
+        f'got {got}, cut {want}',
+    )
+
+    dup = archive([('001.png', png(np.full((1400, 900), level, np.uint8))) for level in (60, 200)])
+    dup = archive(
+        [(i.filename, zipfile.ZipFile(io.BytesIO(dup)).read(i)) for i in zipfile.ZipFile(io.BytesIO(dup)).infolist()]
+        + [('002.png', png(np.full((1400, 900), 128, np.uint8)))]
+    )
+    out = zipfile.ZipFile(
+        io.BytesIO(b''.join(cbz.repack_iter(io.BytesIO(dup), profiles.PROFILES['kobo-clara-hd-2e-bw'], 1)))
+    )
+    means = []
+    for n in sorted(out.namelist()):
+        if n.endswith(('.png', '.jpg')):
+            im = pyvips.Image.new_from_buffer(out.read(n), '')
+            means.append(round(im.avg()))
+    check(
+        'two entries sharing a name both come out, each as itself',
+        len(means) == 3 and len(set(means)) == 3,
+        f'{means}',
+    )
+
+    try:
+        got = sorted(['10.jpg', '9.jpg', '1\u00b22.jpg'], key=cbz.natural_key)
+    except Exception as exc:
+        got = type(exc).__name__
+    check(
+        'a name with a superscript digit sorts instead of failing the download',
+        isinstance(got, list) and got.index('9.jpg') < got.index('10.jpg'),
+        ascii(got),
+    )
+
+    calls = []
+    src = _strip_cbz([1280, 1000, 1000, 1280, 640, 1000])
+    out = zipfile.ZipFile(
+        io.BytesIO(b''.join(cbz.repack_iter(io.BytesIO(src), strip, 1, progress=lambda d, t: calls.append((d, t)))))
+    )
+    pages = [n for n in out.namelist() if n.endswith(('.png', '.jpg'))]
+    check(
+        'webtoon progress moves once per page written',
+        len(calls) == len(pages) + 2,
+        f'{len(calls)} reports for {len(pages)} pages',
+    )
+    check(
+        'never goes backwards, and reaches the whole only when the strip is done',
+        all(a[0] <= b[0] for a, b in itertools.pairwise(calls))
+        and calls[-1][0] == calls[-1][1]
+        and all(d < t for d, t in calls[:-1]),
+        f'{calls}',
+    )
+
+
 def check_reslice() -> None:
     p = profiles.PROFILES['kindle-colorsoft-webtoon']
     limit = round(p.width * p.aspect)
@@ -3589,8 +3816,8 @@ def check_reslice() -> None:
 
     def tiles(blob):
         z = zipfile.ZipFile(io.BytesIO(blob))
-        order = sorted(z.namelist(), key=cbz.natural_key)
-        return [len(t[3]) for t in cbz._strip_tiles(z, order, p, lambda _n: None) if t[0] == 'tile']
+        order = sorted(z.infolist(), key=lambda i: cbz.natural_key(i.filename))
+        return [len(t[3]) for t in cbz._strip_tiles(z, order, p, {}) if t[0] == 'tile']
 
     lo60, hi60 = band(0.60)
     t = tiles(_strip_cbz([1280, 1280], gutter=(0, at(0.60))))
@@ -3659,8 +3886,8 @@ def check_reslice() -> None:
 
     def cut(blob):
         z = zipfile.ZipFile(io.BytesIO(blob))
-        order = sorted(z.namelist(), key=cbz.natural_key)
-        return [t[3] for t in cbz._strip_tiles(z, order, p, lambda _n: None) if t[0] == 'tile']
+        order = sorted(z.infolist(), key=lambda i: cbz.natural_key(i.filename))
+        return [t[3] for t in cbz._strip_tiles(z, order, p, {}) if t[0] == 'tile']
 
     def blank_rows(rows):
         s = rows.astype(np.int16)
@@ -4374,6 +4601,68 @@ async def check_security(c) -> None:
         'a browse page links only to the proxy, never to a javascript: or data: URL',
         'javascript:' not in b.text and 'data:text' not in b.text,
     )
+
+
+async def check_http_edges(c) -> None:
+    up = 'http://127.0.0.1:8899'
+    want = f'{up}/opds/v1.2/moved/r/0/2'
+    for route in ('f', 'b'):
+        r = await c.get(f'/kobo-clara-hd-2e-bw/{route}/{encode_token(f"{up}/opds/v1.2/moved")}')
+        targets = [
+            rewrite.decode_token(t)
+            for t in re.findall(r'/kobo-clara-hd-2e-bw/\w+/([\w-]+)', r.text)
+            if 'r/0/2' in rewrite.decode_token(t)
+        ]
+        check(
+            f'a relative href is resolved against the URL that answered, not the one asked (/{route}/)',
+            set(targets) == {want},
+            f'{targets}',
+        )
+
+    moved_osd = encode_token(f'{up}/opds/v1.2/moved-search')
+    r = await c.get(f'/kobo-clara-hd-2e-bw/osd/{moved_osd}')
+    found = re.search(r'/kobo-clara-hd-2e-bw/s/([\w-]+)', r.text)
+    check(
+        'a relative search template is resolved against the URL that answered (/osd/)',
+        found is not None and rewrite.decode_token(found.group(1)) == f'{up}/opds/v1.2/moved/found?q={{searchTerms}}',
+        f'{rewrite.decode_token(found.group(1)) if found else r.text[:80]}',
+    )
+    r = await c.get(f'/kobo-clara-hd-2e-bw/bs/{moved_osd}', params={'q': 'moon'})
+    check(
+        'and browse search follows it to the moved results',
+        r.status_code == 200 and 'found:moon' in r.text,
+        f'status={r.status_code}',
+    )
+
+    r = await c.get(f'/kobo-clara-hd-2e-bw/f/{encode_token(f"{up}/opds/v1.2/proxyauth")}')
+    check('an upstream 407 is the proxy failing, answered 502', r.status_code == 502, f'status={r.status_code}')
+    check('and the reader is not handed a challenge it cannot answer', 'proxy-authenticate' not in r.headers)
+
+    from inksetter import app as _app
+
+    release = threading.Event()
+
+    def busy_repack():
+        release.wait(10.0)
+        yield b'x'
+
+    waiting = [asyncio.create_task(_app._repacking(busy_repack(), io.BytesIO()).__anext__()) for _ in range(40)]
+    try:
+        await asyncio.sleep(0.3)
+        try:
+            probe = await asyncio.wait_for(asyncio.to_thread(lambda: 'ran'), 3.0)
+        except TimeoutError:
+            probe = 'starved'
+        check(
+            'downloads queued for a repack slot hold no worker thread while they wait',
+            probe == 'ran',
+            f'{len(waiting)} downloads, {_app.settings.repack_workers} slots: {probe}',
+        )
+    finally:
+        release.set()
+        for task in waiting:
+            task.cancel()
+        await asyncio.gather(*waiting, return_exceptions=True)
 
 
 def _host_key_of(url: str) -> str | None:
@@ -5609,6 +5898,9 @@ async def main() -> int:
         print('security')
         await check_security(c)
 
+        print('http edges')
+        await check_http_edges(c)
+
         print('browse pages')
         await check_browse(c)
         await check_trail(c)
@@ -5660,6 +5952,7 @@ async def main() -> int:
     print('descreen')
     check_descreen()
     print('dither ties')
+    check_profile_types()
     check_dither_ties()
     print('path awareness')
     check_path_awareness()
@@ -5685,6 +5978,7 @@ async def main() -> int:
     check_bit_depth()
     check_lazy_decode()
     check_reslice()
+    check_reslice_edges()
     check_family_duplicates()
     check_profile_config()
     print('profile source')
