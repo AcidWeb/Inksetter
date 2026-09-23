@@ -3305,6 +3305,15 @@ def _strip_cbz(heights, width=800, gutter=None, noise=0) -> bytes:
     return buf.getvalue()
 
 
+def _archive_of(*slices: np.ndarray) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w') as z:
+        for i, a in enumerate(slices):
+            im = pyvips.Image.new_from_memory(a.tobytes(), a.shape[1], a.shape[0], 3, 'uchar')
+            z.writestr(f'{i:04d}.png', im.pngsave_buffer())
+    return buf.getvalue()
+
+
 def _pages_of(blob: bytes):
     z = zipfile.ZipFile(io.BytesIO(blob))
     out = []
@@ -3325,6 +3334,19 @@ def _panel_strip(*segments, width=1272, seed=7):
             parts.append(np.full((n, width, 3), 255, np.uint8))
         elif kind == 'grey':
             parts.append(np.full((n, width, 3), 154, np.uint8))
+        elif kind == 'black':
+            parts.append(np.full((n, width, 3), 8, np.uint8))
+        elif kind in ('smooth', 'soft'):
+            yy, xx = np.mgrid[0:n, 0:width]
+            wave = 127.5 + 127.5 * np.sin(2 * np.pi * xx / 400 + yy / 50)
+            if kind == 'soft':
+                wave = wave + rng.integers(-20, 21, wave.shape)
+            parts.append(np.repeat(np.clip(wave, 0, 255).astype(np.uint8)[..., None], 3, axis=2))
+        elif kind in ('text', 'sparse'):
+            b = np.full((n, width, 3), 255, np.uint8)
+            for x in range(200, width - 200, 14 if kind == 'text' else 40):
+                b[:, x : x + 4] = 0
+            parts.append(b)
         elif kind == 'bubble':
             b = np.full((n, width, 3), 255, np.uint8)
             b[:, 387:391] = 20
@@ -3344,7 +3366,7 @@ def check_seam_defects() -> None:
     )
     check(
         'but its outline is seen at full resolution, so it is not quiet',
-        int(cbz._spread(row)[0]) > cbz.STRIP_QUIET and not cbz._gutter(row)[0],
+        int(cbz._spread(row)[0]) > cbz.STRIP_QUIET and not any(m[0] for m in cbz._classes(row)[1:]),
         f'spread {int(cbz._spread(row)[0])}',
     )
     first, bub, mid, gap = round(0.60 * L), round(0.03 * L), round(0.42 * L), round(0.10 * L)
@@ -3391,6 +3413,95 @@ def check_seam_defects() -> None:
         'and a flat run with no blank page in it is still entered at its top',
         cbz._seam(blk, L) == edge,
         f'cut at {cbz._seam(blk, L)}, grey run from {edge}',
+    )
+
+    wide = round(0.40 * L)
+    blk = _panel_strip(('art', edge), ('black', 4), ('grey', 2), ('white', wide), ('art', L))
+    at = cbz._seam(blk, L)
+    check(
+        'a gutter past the fold is entered below the border of the panel above, so the panel keeps it',
+        at == edge + 6,
+        f'cut at {at}, border {edge}..{edge + 6}, white from {edge + 6}',
+    )
+    blk = _panel_strip(('art', edge), ('black', 4), ('white', wide), ('art', L))
+    at = cbz._seam(blk, L)
+    check(
+        'even when the border runs straight into white gutter',
+        at == edge + 4,
+        f'cut at {at}, border {edge}..{edge + 4}, white from {edge + 4}',
+    )
+
+    top = round(0.60 * L)
+    blk = _panel_strip(('art', top), ('white', gap), ('grey', 1), ('black', 4), ('grey', 2), ('art', 2 * L))
+    at = cbz._seam(blk, L)
+    check(
+        'a page ends in its gutter, not past the border of the panel below, so that panel keeps it',
+        at == top + gap - 1,
+        f'cut at {at}, white {top}..{top + gap}, border from {top + gap}',
+    )
+    blk = _panel_strip(('art', top), ('white', gap), ('black', 4), ('art', 2 * L))
+    at = cbz._seam(blk, L)
+    check(
+        'even when that border is drawn straight onto the white',
+        at == top + gap - 1,
+        f'cut at {at}, white {top}..{top + gap}, border from {top + gap}',
+    )
+    blk = _panel_strip(('art', top), ('grey', gap), ('art', 2 * L))
+    at = cbz._seam(blk, L)
+    check(
+        'a flat grey run with no gutter in it is still cut at its far side',
+        at == top + gap - 1,
+        f'cut at {at}, grey {top}..{top + gap}',
+    )
+    floor = int(L * cbz.STRIP_MIN_FILL)
+    text_top = round(0.873 * L)
+    text_bottom = text_top + 5 * 20 + 4 * 10
+    lines = [('text', 20), ('white', 10)] * 4 + [('text', 20)]
+    blk = _panel_strip(('smooth', text_top), *lines, ('smooth', 2 * L))
+    s = blk.astype(np.int16)
+    window = (s.max(axis=(1, 2)) - s.min(axis=(1, 2)))[floor:L]
+    old = floor + len(window) - 1 - int(np.argmin(window[::-1]))
+    check(
+        'premise: with no gutter in reach, the least-spread row sits between two lines of text',
+        text_top <= old < text_bottom,
+        f'least spread at {old}, text {text_top}..{text_bottom}',
+    )
+    at = cbz._seam(blk, L)
+    check(
+        'with no gutter in reach, a page is cut neither through lettering nor between its lines',
+        not text_top <= at < text_bottom,
+        f'cut at {at}, text {text_top}..{text_bottom}',
+    )
+    sparse = [('sparse', 20), ('white', 10)] * 4 + [('sparse', 20)]
+    blk = _panel_strip(('soft', text_top), *sparse, ('soft', 2 * L))
+    detail = np.abs(np.diff(blk[:, :, 0].astype(np.int16), axis=1)).mean(axis=1)
+    check(
+        'premise: the sparse lettering carries less fine detail than the texture round it',
+        detail[text_top:text_bottom].mean() < detail[floor:text_top].mean(),
+        f'{detail[text_top:text_bottom].mean():.1f} in the text, {detail[floor:text_top].mean():.1f} in the texture',
+    )
+    at = cbz._seam(blk, L)
+    check(
+        'it is lettering that is stepped round, not fine detail: sparse text beside busy texture',
+        not text_top <= at < text_bottom,
+        f'cut at {at}, text {text_top}..{text_bottom}',
+    )
+    smooth_to = round(0.92 * L)
+    blk = _panel_strip(('smooth', smooth_to), ('soft', 2 * L))
+    at = cbz._seam(blk, L)
+    check(
+        'and with no lettering in reach either, it goes where there is least fine detail',
+        floor <= at < smooth_to,
+        f'cut at {at}, smooth rows {floor}..{smooth_to} of the window',
+    )
+
+    head = round(0.25 * L)
+    blk = _panel_strip(('art', head), ('white', gap), ('grey', 2 * L))
+    at = cbz._seam(blk, L)
+    check(
+        'a gutter at the head of a long flat run, above the window, does not drag the cut up out of it',
+        head + gap < lo and at == L - 1,
+        f'cut at {at}, white {head}..{head + gap}, window from {lo}',
     )
 
 
@@ -3604,24 +3715,24 @@ def check_reslice_edges() -> None:
     rng = np.random.default_rng(5)
     tall = archive([('001.png', png(rng.integers(0, 256, (12800, 800, 3), dtype=np.uint8)))])
     scanned = [0]
-    real_gutter = cbz._gutter
+    real_classes = cbz._classes
 
     def counting(rows):
         scanned[0] += len(rows)
-        return real_gutter(rows)
+        return real_classes(rows)
 
-    cbz._gutter = counting
+    cbz._classes = counting
     try:
         z, order = infos(tall)
         tiles = [t[3] for t in cbz._strip_tiles(z, order, strip, {}) if t[0] == 'tile']
     finally:
-        cbz._gutter = real_gutter
+        cbz._classes = real_classes
     total = sum(len(t) for t in tiles)
     check('premise: one slice twelve screens tall is cut into many pages', len(tiles) >= 10, f'{len(tiles)} pages')
     check('no page keeps the whole slice alive', all(t.base is None for t in tiles))
     check(
         'the leading-gutter trim reads a tall slice about once, not once per page',
-        scanned[0] <= 3 * total,
+        total <= scanned[0] <= 3 * total,
         f'{scanned[0]} rows scanned for {total}',
     )
 
@@ -3856,10 +3967,25 @@ def check_reslice() -> None:
         lo, hi = s.min(axis=(1, 2)), s.max(axis=(1, 2))
         return (hi - lo <= cbz.STRIP_QUIET) & ((lo >= 235) | (hi <= 30))
 
+    minrun = max(1, round(limit * cbz.STRIP_GUTTER_MIN))
+
+    def flat_rows(rows):
+        s = rows.astype(np.int16)
+        return s.max(axis=(1, 2)) - s.min(axis=(1, 2)) <= cbz.STRIP_QUIET
+
+    def droppable(rows):
+        s = rows.astype(np.int16)
+        near = s.max(axis=(1, 2)) - s.min(axis=(1, 2)) <= cbz.STRIP_FAINT
+        soft = near & ~blank_rows(rows)
+        edges = np.flatnonzero(np.diff(np.concatenate([[0], soft.astype(np.int8), [0]])))
+        artwork = np.zeros(len(rows), bool)
+        for start, stop in zip(edges[::2], edges[1::2], strict=True):
+            artwork[start:stop] = stop - start >= minrun
+        return near & ~artwork
+
     def only_gutter_gone(blob):
-        """Walk the strip and the output together: whatever the output skips must be blank gutter."""
         strip, out = strip_of(blob), np.concatenate(cut(blob))
-        blank = blank_rows(strip)
+        blank = droppable(strip)
         i = j = gone = 0
         while j < len(out):
             if i == len(strip):
@@ -3891,6 +4017,73 @@ def check_reslice() -> None:
         f'row after the margin blank: {bool(blank_rows(kept[:1]).any())}',
     )
 
+    fold = round(1.05 * limit)
+    floating = _archive_of(
+        _panel_strip(
+            ('art', fold),
+            ('white', 100),
+            ('grey', 2),
+            ('black', 4),
+            ('grey', 2),
+            ('white', 400),
+            ('art', limit),
+            width=p.width,
+        )
+    )
+    floating_short = _archive_of(
+        _panel_strip(
+            ('art', fold),
+            ('white', 100),
+            ('grey', 2),
+            ('black', 4),
+            ('grey', 2),
+            ('white', 24),
+            ('art', limit),
+            width=p.width,
+        )
+    )
+    faint_line = (240 - np.random.default_rng(9).integers(0, 21, (3, p.width, 3))).astype(np.uint8)
+    faint_lined = _archive_of(
+        np.concatenate(
+            [
+                _panel_strip(('art', fold), ('white', 100), width=p.width),
+                faint_line,
+                _panel_strip(('white', 400), ('art', limit), width=p.width, seed=9),
+            ]
+        )
+    )
+    faint_mark = np.full((10, p.width, 3), 255, np.uint8)
+    faint_mark[:, 400:900:6] = 183
+    faint_marked = _archive_of(
+        np.concatenate(
+            [
+                _panel_strip(('art', fold), ('white', 100), width=p.width),
+                faint_mark,
+                _panel_strip(('white', 400), ('art', limit), width=p.width, seed=10),
+            ]
+        )
+    )
+    banded = _archive_of(
+        _panel_strip(('art', fold), ('white', 100), ('grey', 60), ('white', 400), ('art', limit), width=p.width)
+    )
+    dusk = _archive_of(
+        _panel_strip(('art', fold), ('white', 100), ('grey', 2), ('black', 150), ('art', limit), width=p.width)
+    )
+    speck = _panel_strip(('white', 8), width=p.width)
+    speck[:, 300:1000:40] = 0
+    ellipsis = _archive_of(
+        np.concatenate(
+            [
+                _panel_strip(('art', fold), ('white', 100), width=p.width),
+                speck,
+                _panel_strip(('white', 400), ('art', limit), width=p.width, seed=8),
+            ]
+        )
+    )
+    bordered = _archive_of(
+        _panel_strip(('art', fold), ('black', 4), ('grey', 2), ('white', 1000), ('art', limit), width=p.width)
+    )
+
     everything = [
         _strip_cbz(heights),
         _strip_cbz([1280, 1280], gutter=(0, at(1.05))),
@@ -3898,10 +4091,18 @@ def check_reslice() -> None:
         _strip_cbz([1280, 1280], gutter=(0, at(1.05), 150)),
         _strip_cbz([1500, 1280], gutter=[(0, 1120, 380), (1, 0, 100)]),
         faint,
+        floating,
+        floating_short,
+        faint_lined,
+        faint_marked,
+        banded,
+        dusk,
+        ellipsis,
+        bordered,
     ]
     verdicts = [only_gutter_gone(b) for b in everything]
     check(
-        'no row of artwork is ever lost; only blank gutter is dropped',
+        'no row of artwork is ever lost; only gutter, and the thin lines in it, is dropped',
         all(ok for ok, _, _ in verdicts),
         '; '.join(f'fixture {k}: {why}' for k, (ok, _, why) in enumerate(verdicts) if not ok),
     )
@@ -3977,6 +4178,111 @@ def check_reslice() -> None:
         'a strip that ends on gutter leaves no blank last page',
         not blank_rows(end[-1]).all(),
         f'{len(end)} pages, last {len(end[-1])} rows',
+    )
+
+    def opens_on(tile):
+        return 'artwork' if len(tile) > margin and not flat_rows(tile[margin : margin + 1]).any() else 'a flat row'
+
+    fl = cut(floating)
+    check(
+        'a line floating in a gutter goes with the gutter, so the page after opens on artwork',
+        len(fl) > 1 and blank_at_top(fl[1]) == margin and opens_on(fl[1]) == 'artwork',
+        f'{blank_at_top(fl[1])} blank rows at the top, then {opens_on(fl[1])}',
+    )
+    fs = cut(floating_short)
+    ink = int(np.argmin(flat_rows(fs[1]))) if len(fs) > 1 and not flat_rows(fs[1]).all() else 0
+    white = len(fs) > 1 and bool((fs[1][:ink].min(axis=(1, 2)) >= 235).all())
+    check(
+        'even when the gutter under the line is shorter than the margin',
+        0 < ink <= margin and white,
+        f'{ink} flat rows before the artwork, all white: {white}',
+    )
+    spreads = [int(x.astype(np.int16).max() - x.min()) for x in (faint_line, faint_mark)]
+    check(
+        'premise: the faint line is not flat, and the faint mark as faint as a real one measured',
+        spreads[0] > cbz.STRIP_QUIET and spreads[1] == 72,
+        f'spreads {spreads}',
+    )
+    fz = cut(faint_lined)
+    check(
+        'a faint, noisy line floating in a gutter goes with it too',
+        len(fz) > 1 and blank_at_top(fz[1]) == margin and not any(np.array_equal(r, faint_line[0]) for r in fz[1]),
+        f'{blank_at_top(fz[1])} blank rows at the top of the page after',
+    )
+    fm = cut(faint_marked)
+    check(
+        'but a faint mark stays',
+        len(fm) > 1 and any(np.array_equal(r, faint_mark[0]) for r in fm[1][: margin + len(faint_mark)]),
+        f'{blank_at_top(fm[1])} blank rows at the top of the page after',
+    )
+    grey_row = _panel_strip(('grey', 1), width=p.width)[0]
+    bn = cut(banded)
+    kept = sum(np.array_equal(r, grey_row) for r in bn[1]) if len(bn) > 1 else 0
+    check(
+        'a flat grey band as tall as a gutter, floating in one, is artwork and stays',
+        kept == 60,
+        f'{kept} of its 60 rows on the page after',
+    )
+    dk = cut(dusk)
+    top_dark = bool(len(dk) > 1 and (dk[1][:margin].max(axis=(1, 2)) <= 30).all())
+    check(
+        'white gutter turning black drops through the black, the last gutter before the artwork',
+        len(dk) > 1 and top_dark and opens_on(dk[1]) == 'artwork',
+        f'margin all black: {top_dark}, then {opens_on(dk[1]) if len(dk) > 1 else "nothing"}',
+    )
+    el = cut(ellipsis)
+    check(
+        'but a speck of ink in a gutter - a lone ellipsis - is artwork, and stays',
+        len(el) > 1 and any(np.array_equal(r, speck[0]) for r in el[1][: margin + len(speck)]),
+        f'{blank_at_top(el[1])} blank rows at the top of the page after',
+    )
+    bd = cut(bordered)
+    check(
+        'a panel cut past the fold keeps its bottom border',
+        len(bd) > 1 and bool((bd[0][-6:-2].max(axis=(1, 2)) <= 30).all()),
+        f'last rows of the page: {bd[0][-6:, 0, 0].tolist()}',
+    )
+    check(
+        'and the page after opens on artwork, not on a screen of gutter',
+        len(bd) > 1 and blank_at_top(bd[1]) == margin and opens_on(bd[1]) == 'artwork',
+        f'{blank_at_top(bd[1])} blank rows at the top, then {opens_on(bd[1])}',
+    )
+
+    source = np.random.default_rng(11).integers(0, 256, (1280, 800, 3), dtype=np.uint8)
+    source[640:680] = 0
+    source[640:680, [0, 799]] = 18
+    edged = _archive_of(source)
+    for name, q in sorted(profiles.PROFILES.items()):
+        if not q.reslice:
+            continue
+        s = q.width / 800
+        z = zipfile.ZipFile(io.BytesIO(edged))
+        rows = cbz._strip_rows(z.read('0000.png'), q)[round(650 * s) : round(670 * s)]
+        spread = int((rows.max(axis=(1, 2)).astype(np.int16) - rows.min(axis=(1, 2))).min())
+        check(
+            f'premise, {name}: the light edge of a black gutter survives the upscale',
+            spread > cbz.STRIP_QUIET,
+            f'the flattest gutter row spreads {spread}',
+        )
+        order = sorted(z.infolist(), key=lambda i: cbz.natural_key(i.filename))
+        first = next(len(t[3]) for t in cbz._strip_tiles(z, order, q, {}) if t[0] == 'tile')
+        lo, hi = round(640 * s), round(680 * s)
+        check(
+            f'{name}: a black gutter with a light edge column, as real WebP slices have, is still a gutter',
+            lo - 4 <= first <= hi + 4,
+            f'page {first}, gutter {lo}..{hi}',
+        )
+
+    source = np.random.default_rng(12).integers(0, 256, (1900, 800, 3), dtype=np.uint8)
+    source[1120:1270] = 0
+    source[1120:1270, [0, 799]] = 18
+    night_edged = cut(_archive_of(source))
+    dark = night_edged[1][:, 8:-8].max(axis=(1, 2)) <= 30 if len(night_edged) > 1 else np.zeros(0, bool)
+    top = len(dark) if dark.all() else int(np.argmin(dark))
+    check(
+        'and a page that would open on one keeps only the margin of it',
+        margin <= top <= margin + 3,
+        f'{top} dark rows at the top, margin {margin}',
     )
 
     tall = zipfile.ZipFile(

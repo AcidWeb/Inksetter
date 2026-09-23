@@ -61,10 +61,14 @@ STRIP_GUTTER_FLOOR = 0.50
 STRIP_OVERSHOOT = 2.00
 STRIP_MIN_FILL = 0.85
 STRIP_QUIET = 12
+STRIP_FAINT = 48
 STRIP_GUTTER_MIN = 0.01
 STRIP_TOP_MARGIN = 0.02
 STRIP_GUTTER_WHITE = 235
 STRIP_GUTTER_BLACK = 30
+STRIP_EDGE = 0.005
+STRIP_HARD = 128
+STRIP_HARD_SPAN = 3
 STRIP_PAD = 5
 
 
@@ -85,14 +89,22 @@ def _strip_rows(blob: bytes, p: Profile) -> np.ndarray | None:
     return a if a.size else None
 
 
+def _inner(rows: np.ndarray) -> np.ndarray:
+    edge = round(rows.shape[1] * STRIP_EDGE)
+    return rows[:, edge : rows.shape[1] - edge] if edge else rows
+
+
 def _spread(rows: np.ndarray) -> np.ndarray:
+    rows = _inner(rows)
     return rows.max(axis=(1, 2)).astype(np.int16) - rows.min(axis=(1, 2))
 
 
-def _gutter(rows: np.ndarray) -> np.ndarray:
+def _classes(rows: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    rows = _inner(rows)
     lo, hi = rows.min(axis=(1, 2)), rows.max(axis=(1, 2))
-    flat = hi.astype(np.int16) - lo <= STRIP_QUIET
-    return flat & ((lo >= STRIP_GUTTER_WHITE) | (hi <= STRIP_GUTTER_BLACK))
+    spread = hi.astype(np.int16) - lo
+    quiet = spread <= STRIP_QUIET
+    return spread, quiet & (lo >= STRIP_GUTTER_WHITE), quiet & (hi <= STRIP_GUTTER_BLACK)
 
 
 def _long_runs(mask: np.ndarray, at_least: int) -> np.ndarray:
@@ -104,42 +116,88 @@ def _long_runs(mask: np.ndarray, at_least: int) -> np.ndarray:
     return out
 
 
+def _proper(white: np.ndarray, black: np.ndarray, minrun: int) -> np.ndarray:
+    return _long_runs(white, minrun) | _long_runs(black, minrun)
+
+
+def _busy(rows: np.ndarray, reach: int) -> np.ndarray:
+    y = _inner(rows).astype(np.float32) @ np.array([0.299, 0.587, 0.114], np.float32)
+    hard = (np.abs(y[:, STRIP_HARD_SPAN:] - y[:, :-STRIP_HARD_SPAN]) >= STRIP_HARD).mean(axis=1)
+    detail = np.abs(np.diff(y, axis=1)).mean(axis=1)
+    total = np.concatenate([[0.0], np.cumsum(hard + detail * 1e-4)])
+    i = np.arange(len(hard))
+    lo, hi = np.maximum(i - reach, 0), np.minimum(i + reach + 1, len(hard))
+    return (total[hi] - total[lo]) / (hi - lo)
+
+
+def _run_at(mask: np.ndarray, i: int) -> tuple[int, int]:
+    before, after = mask[i::-1], mask[i:]
+    start = 0 if before.all() else i - int(np.argmin(before)) + 1
+    end = len(mask) if after.all() else i + int(np.argmin(after))
+    return start, end
+
+
 def _seam(block: np.ndarray, limit: int) -> int:
     lo = max(1, int(limit * STRIP_GUTTER_FLOOR))
+    minrun = max(1, round(limit * STRIP_GUTTER_MIN))
     head = block[: round(limit * STRIP_OVERSHOOT)]
     whole = _spread(head)
-    runs = _long_runs(whole <= STRIP_QUIET, max(1, round(limit * STRIP_GUTTER_MIN)))
-    quiet, spread = runs[lo:], whole[lo:]
+    runs = _long_runs(whole <= STRIP_QUIET, minrun)
+    quiet = runs[lo:]
     up = np.flatnonzero(quiet[: limit - lo])
     if len(up):
-        return lo + int(up[-1])
+        at = lo + int(up[-1])
+        start, end = _run_at(runs, at)
+        first = max(start, lo)
+        _, white, black = _classes(head[start:end])
+        proper = np.flatnonzero(_proper(white, black, minrun)[first - start : at - start + 1])
+        return first + int(proper[-1]) if len(proper) else at
     down = np.flatnonzero(quiet[limit - lo :])
     if len(down):
         at = limit + int(down[0])
-        blank = _gutter(head[at:])
-        inside = np.flatnonzero(blank & runs[at:])
-        if len(inside) and runs[at : at + int(inside[0])].all():
-            return at + int(inside[0])
+        _, white, black = _classes(head[at : _run_at(runs, at)[1]])
+        for inside in (np.flatnonzero(_proper(white, black, minrun)), np.flatnonzero(white | black)):
+            if len(inside):
+                return at + int(inside[0])
         return at
     floor = max(lo, int(limit * STRIP_MIN_FILL))
-    tail = spread[floor - lo : limit - lo]
-    return floor + len(tail) - 1 - int(np.argmin(tail[::-1]))
+    start = max(0, floor - minrun)
+    busy = _busy(head[start : limit + minrun], minrun)[floor - start : limit - start]
+    return floor + len(busy) - 1 - int(np.argmin(busy[::-1]))
 
 
-def _leading_blank(a: np.ndarray, step: int) -> int:
+def _opening(a: np.ndarray, step: int, minrun: int) -> tuple[int, int, bool]:
+    parts = []
+    art = None
     done = 0
     while done < len(a):
-        blank = _gutter(a[done : done + step])
-        if not blank.all():
-            return done + int(np.argmin(blank))
-        done += step
-    return len(a)
+        chunk = a[done : done + step]
+        parts.append(_classes(chunk))
+        done += len(chunk)
+        spread, white, black = (np.concatenate(x) for x in zip(*parts, strict=True))
+        ink = spread > STRIP_FAINT
+        soft = _long_runs(~ink & ~white & ~black, minrun)
+        found = [x for x in (np.flatnonzero(ink), np.flatnonzero(soft)) if len(x)]
+        if found:
+            art = min(int(x[0]) for x in found)
+            break
+    if not parts:
+        return 0, 0, False
+    stop = done if art is None else art
+    gutters = []
+    for level in (white[:stop], black[:stop]):
+        runs = np.flatnonzero(_long_runs(level, minrun))
+        if len(runs):
+            gutters.append(_run_at(level, int(runs[-1])))
+    start, end = max(gutters, key=lambda r: r[1], default=(0, 0))
+    return start, end, art is not None
 
 
 def _strip_tiles(zin, infos, p: Profile, consumed: dict[int, int]):
     limit = round(p.width * p.aspect)
     reach = round(limit * STRIP_OVERSHOOT)
     margin = round(limit * STRIP_TOP_MARGIN)
+    minrun = max(1, round(limit * STRIP_GUTTER_MIN))
     held: list[np.ndarray] = []
     rows = index = seen = 0
     opening = True
@@ -148,14 +206,14 @@ def _strip_tiles(zin, infos, p: Profile, consumed: dict[int, int]):
     def take(a: np.ndarray) -> None:
         nonlocal rows, opening, lead
         if opening:
-            art = _leading_blank(a, limit)
-            if art:
-                run = a[:art] if lead is None else np.concatenate([lead, a[:art]])
-                lead = run[len(run) - min(margin, len(run)) :]
-            if art == len(a):
+            if lead is not None:
+                a, lead = np.concatenate([lead, a]), None
+            start, end, art = _opening(a, limit, minrun)
+            a = a[max(start, end - margin) :]
+            if not art:
+                lead = a
                 return
-            a = a[art:] if lead is None or not len(lead) else np.concatenate([lead, a[art:]])
-            lead, opening = None, False
+            opening = False
         held.append(a)
         rows += len(a)
 
