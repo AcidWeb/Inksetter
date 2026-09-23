@@ -457,7 +457,7 @@ async def _repack_over_ranges(url: str, cover_url: str | None, p: Profile, reque
             await asyncio.to_thread(reader.close)
             return None
         cover = await _pick_cover(url, cover_url, request)
-        meta = await kavita.for_download(url, p.width, round(p.width * p.aspect))
+        meta = await kavita.for_download(url)
         chunks = await asyncio.to_thread(
             cbz.repack_iter,
             reader,
@@ -534,7 +534,7 @@ async def _deliver(p: Profile, url: str, cover_url: str | None, request: Request
 
     if p.fmt != 'raw' and _is_zip(url, ctype, body):
         cover = await _pick_cover(url, cover_url, request)
-        meta = await kavita.for_download(url, p.width, round(p.width * p.aspect))
+        meta = await kavita.for_download(url)
         try:
             body.seek(0)
             chunks = await asyncio.to_thread(

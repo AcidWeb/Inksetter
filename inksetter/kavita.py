@@ -17,21 +17,22 @@ _UNSET_DATE = '0001-01-01T00:00:00'
 _IDS = re.compile(r'/series/(\d+)(?:/volume/(\d+))?(?:/chapter/(\d+))?', re.I)
 _OPDS_KEY = re.compile(r'/api/opds/([^/?#]+)', re.I)
 _AGE = {
-    1: 'Adults Only 18+',
+    1: 'Rating Pending',
     2: 'Early Childhood',
     3: 'Everyone',
-    4: 'Everyone 10+',
-    5: 'G',
-    6: 'Kids to Adults',
-    7: 'M',
-    8: 'MA15+',
-    9: 'Mature 17+',
-    10: 'PG',
-    11: 'R18+',
-    12: 'Rating Pending',
-    13: 'Teen',
+    4: 'G',
+    5: 'Everyone 10+',
+    6: 'PG',
+    7: 'Kids to Adults',
+    8: 'Teen',
+    9: 'MA15+',
+    10: 'Mature 17+',
+    11: 'M',
+    12: 'R18+',
+    13: 'Adults Only 18+',
     14: 'X18+',
 }
+_MANGA_LIBRARY = 0
 _ORDER = (
     'Title',
     'Series',
@@ -140,6 +141,13 @@ class _Kavita:
             raise _Reauth
         if meta.status_code != 200 or ser.status_code != 200:
             return None
+        series = ser.json()
+        manga = False
+        if isinstance(series.get('libraryId'), int):
+            lib = await client.raw.get(
+                f'{self.base()}/api/Library/type', params={'libraryId': series['libraryId']}, headers=head
+            )
+            manga = lib.status_code == 200 and _json_or_none(lib) == _MANGA_LIBRARY
         vols = await client.raw.get(f'{self.base()}/api/Series/volumes', params={'seriesId': sid}, headers=head)
         numbers, covers = {}, {}
         if vols.status_code == 200:
@@ -152,7 +160,7 @@ class _Kavita:
                     numbers[vid] = n
                 if _clean(v.get('coverImage')):
                     covers[vid] = v['coverImage']
-        return {'meta': meta.json(), 'series': ser.json(), 'numbers': numbers, 'covers': covers}
+        return {'meta': meta.json(), 'series': series, 'manga': manga, 'numbers': numbers, 'covers': covers}
 
     def _cached(self, sid: int):
         hit = self._series.get(sid)
@@ -191,6 +199,13 @@ class _Kavita:
             return out
 
 
+def _json_or_none(resp):
+    try:
+        return resp.json()
+    except ValueError:
+        return None
+
+
 _kavita = _Kavita()
 
 
@@ -224,7 +239,7 @@ def _fields(data: dict, pages: int) -> dict[str, str]:
     put('Teams', _names(meta.get('teams')))
     put('Locations', _names(meta.get('locations')))
     put('AgeRating', _AGE.get(meta.get('ageRating')))
-    if ser.get('format') == 1:
+    if data.get('manga'):
         put('Manga', 'Yes')
     if ser.get('aniListId'):
         put('Web', f'https://anilist.co/manga/{ser["aniListId"]}')
@@ -234,8 +249,8 @@ def _fields(data: dict, pages: int) -> dict[str, str]:
     return out
 
 
-def render(data: dict, number: str | None, pages: int, width: int, height: int) -> bytes:
-    fields = _fields(data, pages)
+def render(data: dict, number: str | None, sizes: list[tuple[int, int] | None]) -> bytes:
+    fields = _fields(data, len(sizes))
     if number:
         fields['Number'] = number
 
@@ -248,9 +263,10 @@ def render(data: dict, number: str | None, pages: int, width: int, height: int) 
         if tag in fields:
             lines.append(f'  <{tag}>{escape(fields[tag])}</{tag}>')
     lines.append('  <Pages>')
-    for i in range(pages):
+    for i, size in enumerate(sizes):
         kind = ' Type="FrontCover"' if i == 0 else ''
-        lines.append(f'    <Page Image="{i}"{kind} ImageWidth="{width}" ImageHeight="{height}" />')
+        dims = f' ImageWidth="{size[0]}" ImageHeight="{size[1]}"' if size else ''
+        lines.append(f'    <Page Image="{i}"{kind}{dims} />')
     lines.append('  </Pages>')
     lines.append('</ComicInfo>')
     return ('\n'.join(lines) + '\n').encode('utf-8')
@@ -269,7 +285,7 @@ async def cover_url(url: str) -> str | None:
     return f'{base}/api/image/volume-cover?volumeId={vid}&apiKey={api_key()}' if base else None
 
 
-async def for_download(url: str, width: int, height: int):
+async def for_download(url: str):
     if not api_key():
         return None
     sid = series_id(url)
@@ -280,7 +296,7 @@ async def for_download(url: str, width: int, height: int):
         return None
     number = _clean(data.get('numbers', {}).get(volume_id(url)))
 
-    def build(page_count: int) -> bytes:
-        return render(data, number, page_count, width, height)
+    def build(sizes: list[tuple[int, int] | None]) -> bytes:
+        return render(data, number, sizes)
 
     return build

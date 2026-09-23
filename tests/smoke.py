@@ -1248,6 +1248,7 @@ async def check_comicinfo() -> None:
             'format': 1,
             'aniListId': 424242,
         },
+        'manga': True,
         'meta': {
             'totalCount': 18,
             'releaseYear': 2010,
@@ -1266,7 +1267,7 @@ async def check_comicinfo() -> None:
         'numbers': {265: 1},
     }
 
-    xml = kavita.render(data, '1', 188, 1272, 1696)
+    xml = kavita.render(data, '1', [(1272, 1696)] * 188)
     doc = etree.fromstring(xml)
 
     got = {el.tag: (el.text or '') for el in doc if el.tag != 'Pages'}
@@ -1281,7 +1282,7 @@ async def check_comicinfo() -> None:
         ('Characters', 'Hero One, Hero Two'),
         ('PageCount', '188'),
         ('Manga', 'Yes'),
-        ('AgeRating', 'Mature 17+'),
+        ('AgeRating', 'MA15+'),
         ('Web', 'https://anilist.co/manga/424242'),
     ):
         check(f'ComicInfo {tag} = {want!r}', got.get(tag) == want, f'got {got.get(tag)!r}')
@@ -1315,9 +1316,19 @@ async def check_comicinfo() -> None:
         'meta': {'summary': '-100000', 'releaseYear': 0, 'language': None, 'ageRating': 0, 'writers': [], 'genres': []},
         'numbers': {},
     }
-    xml2 = kavita.render(empty, None, 2, 100, 200).decode()
+    xml2 = kavita.render(empty, None, [(100, 200)] * 2).decode()
     check('the -100000 sentinel never reaches the file', '-100000' not in xml2, xml2[:120])
-    check('a non-manga format omits <Manga>', '<Manga>' not in xml2)
+    check('a series with no library type omits <Manga>', '<Manga>' not in xml2)
+
+    comic = dict(data, manga=False)
+    check(
+        'an archive in a comic library is not called manga',
+        '<Manga>' not in kavita.render(comic, '1', [(100, 200)] * 2).decode(),
+    )
+    for code, rating in ((1, 'Rating Pending'), (4, 'G'), (8, 'Teen'), (10, 'Mature 17+'), (13, 'Adults Only 18+')):
+        rated = dict(data, meta=dict(data['meta'], ageRating=code))
+        got = etree.fromstring(kavita.render(rated, '1', [(100, 200)] * 2)).findtext('AgeRating')
+        check(f'Kavita age rating {code} is written as {rating!r}', got == rating, f'got {got!r}')
 
     for catalog, want in (
         ('http://kavita:5000/api/opds/ABC123', 'ABC123'),
@@ -1345,7 +1356,7 @@ async def check_comicinfo() -> None:
         settings_mod.settings, upstream_catalog='http://komga:25600/opds/v1.2/catalog'
     )
     try:
-        off = await kavita.for_download('http://komga/opds/v1.2/books/7/file', 100, 200)
+        off = await kavita.for_download('http://komga/opds/v1.2/books/7/file')
     finally:
         kavita.settings = real
     check('no Kavita upstream means no metadata lookup', off is None, f'{off!r}')
@@ -1374,7 +1385,7 @@ async def check_comicinfo() -> None:
         z.writestr('ComicInfo.xml', '<ComicInfo><Series>Hand written</Series></ComicInfo>')
         z.writestr('001.jpg', fake_page(1))
 
-    out = b''.join(_cbz.repack_iter(_io.BytesIO(raw), prof, comicinfo=lambda n: f'<x n="{n}"/>'.encode()))
+    out = b''.join(_cbz.repack_iter(_io.BytesIO(raw), prof, comicinfo=lambda sizes: f'<x n="{len(sizes)}"/>'.encode()))
     z1 = _zf.ZipFile(_io.BytesIO(out))
     check('a ComicInfo is added when the archive has none', 'ComicInfo.xml' in z1.namelist())
     check(
@@ -1387,6 +1398,56 @@ async def check_comicinfo() -> None:
     z2 = _zf.ZipFile(_io.BytesIO(out2))
     check("an archive's own ComicInfo is kept verbatim", b'Hand written' in z2.read('ComicInfo.xml'))
     check('and only one is present', sum(n.lower().endswith('comicinfo.xml') for n in z2.namelist()) == 1)
+
+    described = etree.fromstring(kavita.render(data, '1', [(1272, 1696), (1272, 900), None]))
+    check(
+        'each Page carries its own size, and none when it is unknown',
+        [pg.get('ImageHeight') for pg in described.findall('Pages/Page')] == ['1696', '900', None],
+    )
+    check('PageCount is the number of pages described', described.findtext('PageCount') == '3')
+
+    def listed(sizes):
+        return json.dumps(sizes).encode()
+
+    def shipped(archive):
+        out = []
+        for n in sorted(archive.namelist()):
+            if n.lower().endswith(('.png', '.jpg')):
+                im = pyvips.Image.new_from_buffer(archive.read(n), '')
+                out.append([im.width, im.height])
+        return out
+
+    heights = [1280, 1000, 1000, 1280, 640, 1000]
+    with_own_info = _zf.ZipFile(_io.BytesIO(_strip_cbz(heights)))
+    strip_src = _io.BytesIO()
+    with _zf.ZipFile(strip_src, 'w') as z:
+        for n in with_own_info.namelist():
+            if not n.lower().endswith('comicinfo.xml'):
+                z.writestr(n, with_own_info.read(n))
+    strip = profiles.PROFILES['kindle-colorsoft-webtoon']
+    z4 = _zf.ZipFile(
+        _io.BytesIO(
+            b''.join(
+                _cbz.repack_iter(
+                    _io.BytesIO(strip_src.getvalue()), strip, 1, cover=fake_page(9, 800, 1200), comicinfo=listed
+                )
+            )
+        )
+    )
+    held, told = shipped(z4), json.loads(z4.read('ComicInfo.xml'))
+    check('premise: re-slicing changes the page count', len(held) != len(heights) + 1, f'{len(held)} pages')
+    check('premise: and the re-sliced pages are not all one height', len({h for _, h in held}) > 1)
+    check(
+        'a re-sliced download describes the pages it holds, cover included',
+        told == held,
+        f'told {len(told)} pages, holds {len(held)}',
+    )
+
+    z5 = _zf.ZipFile(
+        _io.BytesIO(b''.join(_cbz.repack_iter(_io.BytesIO(raw), prof, 1, cover=b'not a picture', comicinfo=listed)))
+    )
+    check('premise: a cover that will not render is left out', len(shipped(z5)) == 3, f'{len(shipped(z5))} pages')
+    check('and the metadata does not count it', len(json.loads(z5.read('ComicInfo.xml'))) == 3)
 
     class _R:
         def __init__(self, status, payload=None):
@@ -1402,12 +1463,13 @@ async def check_comicinfo() -> None:
             self.metadata_calls = 0
             self.reachable = True
             self.reject = set()
+            self.library_type = _R(200, 0)
 
         async def post(self, _url, params=None, **_kw):  # noqa: ARG002
             self.auths += 1
             return _R(200, {'token': f'JWT-{self.auths}'})
 
-        async def get(self, url, params=None, headers=None, **_kw):  # noqa: ARG002
+        async def get(self, url, params=None, headers=None, **_kw):
             if not self.reachable:
                 raise OSError('connection refused')
             if (headers or {}).get('Authorization', '').removeprefix('Bearer ') in self.reject:
@@ -1415,6 +1477,8 @@ async def check_comicinfo() -> None:
             if '/api/Series/metadata' in url:
                 self.metadata_calls += 1
                 return _R(200, {'summary': 'S', 'writers': [], 'genres': []})
+            if '/api/Library/type' in url:
+                return self.library_type if (params or {}).get('libraryId') == 3 else _R(400)
             if '/api/Series/volumes' in url:
                 return _R(
                     200,
@@ -1423,7 +1487,7 @@ async def check_comicinfo() -> None:
                         {'id': 266, 'minNumber': 2, 'coverImage': ''},
                     ],
                 )
-            return _R(200, {'name': 'Example Manga', 'format': 1})
+            return _R(200, {'name': 'Example Manga', 'format': 1, 'libraryId': 3})
 
     class _Stub:
         def __init__(self, api):
@@ -1462,6 +1526,25 @@ async def check_comicinfo() -> None:
         f'{api.metadata_calls} calls, same object: {second is first}',
     )
     check('one authentication served both', api.auths == 1, f'{api.auths} auths')
+    check('a series in a manga library is manga', (first or {}).get('manga') is True, f'{(first or {}).get("manga")}')
+
+    class _NotJson(_R):
+        def json(self):
+            raise ValueError('not JSON')
+
+    for label, answer in (
+        ('a comic library', _R(200, 1)),
+        ('a failed library lookup', _R(500, 0)),
+        ('a library lookup that is not JSON', _NotJson(200)),
+    ):
+        api = _Api()
+        api.library_type = answer
+        got = await with_kavita(api, lambda k: k.series_metadata(21))
+        check(
+            f'a series in {label} is not manga, and keeps its metadata',
+            got is not None and got.get('manga') is False and got['series']['name'] == 'Example Manga',
+            f'{got and got.get("manga")}',
+        )
 
     api = _Api()
     api.reject = {'JWT-1'}

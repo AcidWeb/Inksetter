@@ -196,16 +196,23 @@ def _render(job, profile: Profile):
     return render_page(job[3], profile)
 
 
-def _emit(zout, job, blob: bytes | None, pad: int = 4) -> None:
+def _dimensions(blob: bytes) -> tuple[int, int] | None:
+    try:
+        im = pyvips.Image.new_from_buffer(blob, '')
+    except pyvips.Error:
+        return None
+    return im.width, im.height
+
+
+def _emit(zout, job, blob: bytes | None, pad: int = 4) -> tuple[int, int] | None:
     if job[0] == 'copy':
         zout.writestr(job[1], job[2])
-        return
+        return None
     _, index, name, piece = job
     if blob is None:
-        piece = piece if job[0] == 'page' else _tile_image(piece).pngsave_buffer()
-        zout.writestr(f'{index:0{pad}d}{_suffix_for(piece, name)}', piece)
-        return
+        blob = piece if job[0] == 'page' else _tile_image(piece).pngsave_buffer()
     zout.writestr(f'{index:0{pad}d}{_suffix_for(blob, name)}', blob)
+    return _dimensions(blob)
 
 
 def _run(jobs, zout, profile: Profile, workers: int, pad: int = 4):
@@ -217,34 +224,30 @@ def _run(jobs, zout, profile: Profile, workers: int, pad: int = 4):
 def _run_serial(jobs, zout, profile: Profile, pad: int = 4):
     for job in jobs:
         if job[0] == 'copy':
-            _emit(zout, job, None, pad)
-            yield job[0]
+            yield job[0], _emit(zout, job, None, pad)
             continue
         try:
             blob, _ = _render(job, profile)
         except Exception:
             log.warning('page %s failed to render; shipping it unchanged', job[2], exc_info=True)
             blob = None
-        _emit(zout, job, blob, pad)
-        yield job[0]
+        yield job[0], _emit(zout, job, blob, pad)
 
 
 def _run_pooled(jobs, zout, profile: Profile, workers: int, pad: int = 4):
     window = max(2, workers * 2)
     pending: collections.deque = collections.deque()
 
-    def flush_one() -> str:
+    def flush_one() -> tuple[str, tuple[int, int] | None]:
         job, fut = pending.popleft()
         if fut is None:
-            _emit(zout, job, None, pad)
-            return job[0]
+            return job[0], _emit(zout, job, None, pad)
         try:
             blob, _ = fut.result()
         except Exception:
             log.warning('page %s failed to render; shipping it unchanged', job[2], exc_info=True)
             blob = None
-        _emit(zout, job, blob, pad)
-        return job[0]
+        return job[0], _emit(zout, job, blob, pad)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers, thread_name_prefix='repack') as pool:
         try:
@@ -314,12 +317,8 @@ def repack_iter(
         else:
             log.debug('repack: the cover is already page 1, not prepending')
 
-    meta_blob = None
-    if comicinfo is not None and not any(n.lower().endswith(_COMICINFO) for n in names):
-        try:
-            meta_blob = comicinfo(images + (lead is not None))
-        except Exception:
-            meta_blob = None
+    if any(n.lower().endswith(_COMICINFO) for n in names):
+        comicinfo = None
 
     strip = profile.reslice
     pad = STRIP_PAD if strip else 4
@@ -336,16 +335,12 @@ def repack_iter(
         begun = time.perf_counter()
         written = 0
         pages = 0
+        sizes: list[tuple[int, int] | None] = []
         tell(0)
         try:
             sink = _StreamSink()
             zout = zipfile.ZipFile(sink, 'w', zipfile.ZIP_STORED)
             try:
-                if meta_blob:
-                    zout.writestr('ComicInfo.xml', meta_blob)
-                    block = sink.drain()
-                    if block:
-                        yield block
                 if lead is not None:
                     try:
                         blob, _mime = render_page(lead, embedded_cover_for(profile))
@@ -353,6 +348,7 @@ def repack_iter(
                         blob = None
                     if blob:
                         zout.writestr(f'{0:0{pad}d}{_suffix_for(blob, "cover.png")}', blob)
+                        sizes.append(_dimensions(blob))
                         block = sink.drain()
                         if block:
                             yield block
@@ -360,14 +356,19 @@ def repack_iter(
                     tell(pages)
 
                 jobs = _strip_tiles(zin, names, profile, lambda n: tell(n + pages)) if strip else _entries(zin, names)
-                for kind in _run(jobs, zout, profile, workers, pad):
+                for kind, size in _run(jobs, zout, profile, workers, pad):
                     written += 1
+                    if kind != 'copy':
+                        sizes.append(size)
                     if kind == 'page':
                         pages += 1
                         tell(pages)
                     block = sink.drain()
                     if block:
                         yield block
+                meta = _metadata(comicinfo, sizes)
+                if meta:
+                    zout.writestr('ComicInfo.xml', meta)
             finally:
                 zout.close()
             tail = sink.drain()
@@ -378,6 +379,16 @@ def repack_iter(
             zin.close()
 
     return chunks()
+
+
+def _metadata(comicinfo, sizes: list[tuple[int, int] | None]) -> bytes | None:
+    if comicinfo is None:
+        return None
+    try:
+        return comicinfo(sizes)
+    except Exception:
+        log.warning('repack: the metadata factory failed; the volume ships without ComicInfo', exc_info=True)
+        return None
 
 
 def repack_to(
