@@ -2155,6 +2155,36 @@ def check_edge_line() -> None:
         str(pipeline._strip_edge_lines(lined, thr)),
     )
 
+    check('premise: the lines below are no thicker than the cap', pipeline._LINE_MAX >= 4, f'{pipeline._LINE_MAX}')
+    for thick in (2, 3, 4):
+
+        def thick_line(a, t=thick):
+            a[:, w - t :] = 0
+
+        got = pipeline._strip_edge_lines(page(thick_line), thr)
+        check(f'a {thick}px line welded to the right edge is shaved whole', got == (0, 0, thick, 0), str(got))
+
+    def frame(a):
+        a[:, :3] = 0
+        a[:, w - 3 :] = 0
+        a[:3, :] = 0
+        a[h - 3 :, :] = 0
+
+    got = pipeline._strip_edge_lines(page(frame), thr)
+    check('3px lines on all four edges are all shaved whole', got == (3, 3, 3, 3), str(got))
+    clean_crop = pipeline._autocrop_box(clean, prof)
+    for thick in (2, 3, 4):
+
+        def right_line(a, t=thick):
+            a[:, w - t :] = 0
+
+        got = pipeline._autocrop_box(page(right_line), prof)
+        check(
+            f'autocrop finds exactly the unlined box past a {thick}px edge line',
+            got == clean_crop,
+            f'{got} vs {clean_crop}',
+        )
+
     def draw_all(a):
         a[:, 0] = 0
         a[:, w - 1] = 0
@@ -2189,11 +2219,13 @@ def check_edge_line() -> None:
         a[:, w - 40 :] = 0
 
     shaved = pipeline._strip_edge_lines(page(band), thr)
-    check(
-        'a thick band is capped, never shaved away wholesale',
-        shaved[2] <= pipeline._LINE_MAX,
-        f'shaved {shaved[2]} with a cap of {pipeline._LINE_MAX}',
-    )
+    check('a thick band is not a line, and is left alone', shaved[2] == 0, f'shaved {shaved[2]}')
+
+    def five(a):
+        a[:, w - 5 :] = 0
+
+    shaved = pipeline._strip_edge_lines(page(five), thr)
+    check('a line thicker than the cap is left alone', shaved[2] == 0, f'shaved {shaved[2]}')
 
     box = pipeline._autocrop_box(lined, prof)
     check(

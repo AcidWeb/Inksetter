@@ -43,7 +43,7 @@ if not os.environ.get('VIPS_CONCURRENCY'):
     pyvips.concurrency_set(vips_threads(os.cpu_count() or 4))
 
 # Bump this whenever anything in this module changes in a way that alters output pixels. Bump invalidates the cache.
-PIPELINE_VERSION = '3'
+PIPELINE_VERSION = '4'
 
 _BAYER_N = 8
 
@@ -334,12 +334,10 @@ def _strip_edge_lines(luma: pyvips.Image, threshold: int) -> tuple[int, int, int
 
     def shave(get_line, get_inside) -> int:
         n = 0
-        while n < _LINE_MAX:
-            if get_line(n).mean() <= _LINE_INK:
-                break
-            if get_inside(n).mean() > _LINE_CLEAR:
-                break
+        while n < _LINE_MAX and get_line(n).mean() > _LINE_INK:
             n += 1
+        if n == 0 or get_inside(n - 1).mean() > _LINE_CLEAR:
+            return 0
         return n
 
     left = shave(lambda n: ink[:, n], lambda n: ink[:, n + 1 : n + 1 + _LINE_LOOK])
@@ -364,6 +362,7 @@ def _autocrop_box(luma: pyvips.Image, p: Profile) -> tuple[int, int, int, int] |
     ox, oy = sl, st
     if sl or st or sr or sb:
         luma = luma.crop(sl, st, luma.width - sl - sr, luma.height - st - sb)
+        edges = _dark_edges(luma)
 
     def _trim(src_im):
         white = src_im.find_trim(threshold=threshold, background=255)
