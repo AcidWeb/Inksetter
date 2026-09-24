@@ -16,10 +16,11 @@ import concurrent.futures
 from . import pipeline
 from .pipeline import render_page, same_picture
 from .profiles import Profile, embedded_cover_for
+from .. import cores
 
 log = logging.getLogger(__name__)
 
-DEFAULT_PAGE_WORKERS = 3
+DEFAULT_PAGE_WORKERS = cores.page_workers()
 IMAGE_SUFFIXES = ('.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.avif', '.jxl')
 
 

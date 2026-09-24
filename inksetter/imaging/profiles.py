@@ -40,7 +40,7 @@ class Profile:
     fmt: str = 'png4'
 
     jpeg_quality: int = 82
-    png_compression: int = 7
+    png_compression: int = 6
 
     # What the pixels land on, as opposed to how they are encoded.
     #   mono     plain e-ink, no colour filter array

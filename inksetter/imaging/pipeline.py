@@ -29,6 +29,7 @@ from typing import NamedTuple
 
 from . import folio
 from .profiles import UPSCALE_MAX_CEILING, Profile
+from .. import cores
 
 
 log = logging.getLogger(__name__)
@@ -39,11 +40,15 @@ def vips_threads(cores: int) -> int:
     return min(8, max(2, cores // 2))
 
 
-if not os.environ.get('VIPS_CONCURRENCY'):
-    pyvips.concurrency_set(vips_threads(os.cpu_count() or 4))
+def _size_vips() -> None:
+    if not os.environ.get('VIPS_CONCURRENCY'):
+        pyvips.concurrency_set(vips_threads(cores.available()))
+
+
+_size_vips()
 
 # Bump this whenever anything in this module changes in a way that alters output pixels. Bump invalidates the cache.
-PIPELINE_VERSION = '5'
+PIPELINE_VERSION = '6'
 
 _BAYER_N = 8
 
@@ -68,7 +73,24 @@ def _clamp(im: pyvips.Image, lo: float, hi: float) -> pyvips.Image:
     return (im < lo).ifthenelse(lo, (im > hi).ifthenelse(hi, im))
 
 
+def _bayer_lut() -> np.ndarray:
+    levels = np.arange(256, dtype=np.float32)
+    rows = [np.clip(np.rint((levels + (t - 0.5) * 17.0) / 17.0), 0, 15) for t in _BAYER.ravel()]
+    return np.concatenate(rows).astype(np.uint8)
+
+
+_BAYER_LUT = _bayer_lut()
+
+
+@functools.lru_cache(maxsize=8)
+def _bayer_cells(h: int, w: int) -> np.ndarray:
+    cell = (np.arange(h)[:, None] % _BAYER_N) * _BAYER_N + np.arange(w)[None, :] % _BAYER_N
+    return (cell * 256).astype(np.int16)
+
+
 def _quantise16(a: np.ndarray, dither: str) -> np.ndarray:
+    if dither == 'bayer' and a.dtype == np.uint8:
+        return _BAYER_LUT[_bayer_cells(*a.shape) + a]
     x = a.astype(np.float32)
     if dither == 'bayer':
         h, w = a.shape
@@ -81,7 +103,7 @@ def _quantise16(a: np.ndarray, dither: str) -> np.ndarray:
 # Descreen
 # --------------------------------------------------------------------------
 
-_FFT_SLOTS = threading.BoundedSemaphore(1)
+_FFT_SLOTS = threading.BoundedSemaphore(2)
 
 
 class UnreadableImage(ValueError):
@@ -154,10 +176,11 @@ def _apply_notches(
 
 def _descreen_plane(a: np.ndarray, floor_freq: float, p: Profile) -> np.ndarray | None:
     h, w = a.shape
-    freq_y = np.fft.fftfreq(h).astype(np.float32)
-    freq_x = np.fft.rfftfreq(w).astype(np.float32)
+    ph, pw = _next_fast_len(h), _next_fast_len(w)
+    freq_y = np.fft.fftfreq(ph).astype(np.float32)
+    freq_x = np.fft.rfftfreq(pw).astype(np.float32)
 
-    spectrum = sfft.rfft2(a)
+    spectrum = sfft.rfft2(a if (ph, pw) == (h, w) else np.pad(a, ((0, ph - h), (0, pw - w)), mode='edge'))
     magnitude = np.abs(spectrum)
     peaks = _find_peaks(magnitude, h * w, floor_freq, p)
     del magnitude
@@ -168,9 +191,9 @@ def _descreen_plane(a: np.ndarray, floor_freq: float, p: Profile) -> np.ndarray 
     if not _apply_notches(spectrum, freq_y, freq_x, peaks, p):
         del spectrum
         return None
-    out = sfft.irfft2(spectrum, s=(h, w))
+    out = sfft.irfft(sfft.ifft(spectrum, axis=0, overwrite_x=True), n=pw, axis=1)
     del spectrum
-    return out
+    return out[:h, :w]
 
 
 def descreen(im: pyvips.Image, p: Profile, scale: float = 1.0) -> pyvips.Image:
@@ -194,12 +217,18 @@ def descreen(im: pyvips.Image, p: Profile, scale: float = 1.0) -> pyvips.Image:
             if filtered is None:
                 log.debug('    descreen found no periodic peak worth notching')
                 return im
-            if p.descreen_deadband > 0:
-                filtered = np.where(np.abs(filtered - plane) < p.descreen_deadband, plane, filtered)
+            if p.descreen_deadband > (0.5 if im.bands == 1 else 0.0):
+                change = np.subtract(filtered, plane)
+                np.abs(change, out=change)
+                np.copyto(filtered, plane, where=change < p.descreen_deadband)
+                del change
             if im.bands == 1:
-                out = np.clip(np.rint(filtered), 0, 255).astype(np.uint8)
+                np.rint(filtered, out=filtered)
+                np.clip(filtered, 0, 255, out=filtered)
+                out = filtered.astype(np.uint8)
                 return pyvips.Image.new_from_memory(out.tobytes(), im.width, im.height, 1, 'uchar')
-            delta = (filtered - plane).astype(np.float32)
+            np.subtract(filtered, plane, out=filtered)
+            delta = filtered.astype(np.float32, copy=False)
             correction = pyvips.Image.new_from_memory(delta.tobytes(), im.width, im.height, 1, 'float')
             return (im.cast('float') + correction).rint().cast('uchar')
     except pyvips.Error, MemoryError, ValueError:
@@ -326,7 +355,7 @@ def _strip_edge_lines(luma: pyvips.Image, threshold: int) -> tuple[int, int, int
         )
     except pyvips.Error, ValueError:
         return (0, 0, 0, 0)
-    ink = (255 - a.astype(np.int16)) > threshold
+    ink = a < 255 - threshold
     if min(ink.shape) <= _LINE_LOOK * 2:
         return (0, 0, 0, 0)
 
@@ -352,6 +381,31 @@ def _dark_edges(luma: pyvips.Image) -> tuple[bool, bool, bool, bool]:
         return (False, False, False, False)
 
 
+def _opened_trim(luma: pyvips.Image, window: int, fill: float, threshold: int):
+    edge = window // 2
+    ones = pyvips.Image.new_from_list([[1] * window])
+
+    def find(background: int) -> list[int]:
+        far = (luma < 255 - threshold) if background == 255 else (luma > threshold)
+        count = (
+            (far & 1)
+            .cast('ushort')
+            .embed(
+                edge,
+                edge,
+                luma.width + 2 * edge,
+                luma.height + 2 * edge,
+                extend='background',
+                background=[1 if abs(fill - background) > threshold else 0],
+            )
+            .convsep(ones, precision='integer')
+        )
+        opened = (count > (window * window) // 2).crop(edge, edge, luma.width, luma.height)
+        return opened.find_trim(threshold=threshold, background=0)
+
+    return find
+
+
 def _autocrop_box(luma: pyvips.Image, p: Profile) -> tuple[int, int, int, int] | None:
     threshold = p.autocrop_threshold
     edges = _dark_edges(luma)
@@ -362,11 +416,11 @@ def _autocrop_box(luma: pyvips.Image, p: Profile) -> tuple[int, int, int, int] |
         luma = luma.crop(sl, st, luma.width - sl - sr, luma.height - st - sb)
         edges = _dark_edges(luma)
 
-    def _trim(src_im):
-        white = src_im.find_trim(threshold=threshold, background=255)
+    def _trim(find):
+        white = find(255)
         if not any(edges):
             return white
-        ink = src_im.find_trim(threshold=threshold, background=0)
+        ink = find(0)
         wl, wt, ww, wh = white
         il, it, iw, ih = ink
         x0 = il if edges[0] else wl
@@ -376,19 +430,9 @@ def _autocrop_box(luma: pyvips.Image, p: Profile) -> tuple[int, int, int, int] |
         return [x0, y0, max(0, x1 - x0), max(0, y1 - y0)]
 
     try:
-        plain = _trim(luma.gaussblur(2))
-        window = _open_window(luma)
-        edge = window // 2
-        fill = 0.0 if all_dark else 255.0
-        padded = luma.embed(
-            edge,
-            edge,
-            luma.width + 2 * edge,
-            luma.height + 2 * edge,
-            extend='background',
-            background=[fill] * luma.bands,
-        )
-        opened = _trim(padded.rank(window, window, (window * window) // 2).crop(edge, edge, luma.width, luma.height))
+        blurred = luma.gaussblur(2)
+        plain = _trim(lambda background: blurred.find_trim(threshold=threshold, background=background))
+        opened = _trim(_opened_trim(luma, _open_window(luma), 0.0 if all_dark else 255.0, threshold))
     except pyvips.Error:
         return None
 
@@ -589,6 +633,11 @@ def _tone(chan: pyvips.Image, p: Profile, top: float) -> pyvips.Image:
     return chan
 
 
+@functools.lru_cache(maxsize=64)
+def _tone_lut(p: Profile) -> pyvips.Image:
+    return _tone(pyvips.Image.identity().cast('float'), p, 255.0).copy_memory()
+
+
 def _unsharp(chan: pyvips.Image, p: Profile, upscale: float = 1.0) -> pyvips.Image:
     if p.usm_amount <= 0:
         return chan
@@ -613,7 +662,8 @@ def _render_mono(
     g = geom.image
     if g.bands > 1:
         g = g.colourspace('b-w')
-    g = _unsharp(_tone(g.cast('float'), p, 255.0), p, geom.upscale)
+    toned = g.maplut(_tone_lut(p)) if g.format == 'uchar' else _tone(g.cast('float'), p, 255.0)
+    g = _unsharp(toned, p, geom.upscale)
     g = defringe(g, p, 255.0).rint().cast('uchar')
 
     if fmt == 'jpeg':

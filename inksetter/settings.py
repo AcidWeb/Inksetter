@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 from dataclasses import dataclass
 
+from . import cores
+
 
 def _int(name: str, default: int, minimum: int = 0) -> int:
     try:
@@ -43,8 +45,8 @@ class Settings:
     repack_workers: int = _int('REPACK_WORKERS', 2, minimum=1)
 
     # Pages rendered concurrently within ONE repack.
-    # Three rather than the core count, because libvips is internally threaded.
-    repack_page_workers: int = _int('REPACK_PAGE_WORKERS', 3, minimum=1)
+    # Half the CPUs, 3 to 8: libvips is threaded already, but the colour quantiser is not.
+    repack_page_workers: int = _int('REPACK_PAGE_WORKERS', cores.page_workers(), minimum=1)
 
     # Downloads and repacks stream through a SpooledTemporaryFile: RAM up to this, then disk.
     spool_max_bytes: int = _int('SPOOL_MAX_BYTES', 32 * 1024**2)

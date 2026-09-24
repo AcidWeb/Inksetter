@@ -44,6 +44,8 @@ Currently, if the proxy uses Kavita as the OPDS source, two additional features 
 
 The pipeline used by this application is compute-heavy. If the level of optimisation this project is aiming for had not been as it is, this project would be a plugin for KOReader. But in its current form, it is too resource-intensive to run directly on the e-reader. This isn’t a problem with the code’s performance. It was designed that way - to offload all heavy lifting to something other than the e-reader. What’s worse, it may be too heavy for many NAS and RPi-type devices.
 
+During conversion of HQ input, memory usage might reach up to 1.5GB during conversion of a single file.
+
 Performance issues manifest themselves in two ways:
 
 * Slow page turning when OPDS-PSE is in use.

@@ -8,6 +8,7 @@ import numpy as np
 import pyvips
 import threading
 
+from .. import cores
 
 log = logging.getLogger(__name__)
 
@@ -20,6 +21,7 @@ CTX_X, CTX_Y = 0.02, 0.015  # context the reader is given around the mark
 READ_W = 420  # crops are upscaled to at least this wide before reading
 OVERLAP = 0.5  # how much the read text and the mark must cover each other
 MAX_READS = 2  # marks read per page, lowest first
+OCR_THREADS = 4  # onnxruntime otherwise takes every core and spins them between reads
 
 _DASH = '-\\u2013\\u2014'
 _FOLIO = re.compile(rf'^[{_DASH}.\s\[\(]*(\d{{1,4}})[{_DASH}.\s\]\)]*$')
@@ -42,7 +44,7 @@ def _reader():
                 log.warning('strip_folio is set but rapidocr-onnxruntime is absent; pages ship unchanged')
                 return None
             try:
-                _engine = RapidOCR()
+                _engine = RapidOCR(intra_op_num_threads=min(OCR_THREADS, cores.available()))
             except Exception:
                 _engine_failed = True
                 log.warning('strip_folio could not start its reader; pages ship unchanged', exc_info=True)
@@ -57,7 +59,9 @@ def _marks(ink: np.ndarray, h: int, w: int) -> list[tuple[int, int, int, int]]:
     bh, bw = band.shape
     img = pyvips.Image.new_from_memory((band * 255).astype(np.uint8).tobytes(), bw, bh, 1, 'uchar')
     jx, jy = max(1, int(w * JOIN_X)), max(1, int(h * JOIN_Y))
-    grown = img.conv(pyvips.Image.new_from_list([[1] * (2 * jx + 1)] * (2 * jy + 1)), precision='float') > 0
+    row = pyvips.Image.new_from_list([[255] * (2 * jx + 1)])
+    column = pyvips.Image.new_from_list([[255]] * (2 * jy + 1))
+    grown = img.morph(row, 'dilate').morph(column, 'dilate')
     lab = np.ndarray(buffer=grown.labelregions().write_to_memory(), dtype=np.int32, shape=(bh, bw))
     ys, xs = np.nonzero(band)
     ids = lab[ys, xs]

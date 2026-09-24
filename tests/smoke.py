@@ -52,6 +52,7 @@ from inksetter import cache as cache_mod  # noqa: E402
 from inksetter import settings as settings_mod  # noqa: E402
 from inksetter import app as app_mod  # noqa: E402
 from inksetter.app import app  # noqa: E402
+from inksetter import cores  # noqa: E402
 from inksetter.imaging import cbz, folio, pipeline, profiles  # noqa: E402
 from inksetter import web  # noqa: E402
 from inksetter.opds import rewrite  # noqa: E402
@@ -889,6 +890,39 @@ def check_dither_ties() -> None:
 
     mid = pipeline._quantise16(np.full((400, 400), 127, np.uint8), 'bayer')
     check('a value between rungs still dithers', len(np.unique(mid)) > 1, f'{len(np.unique(mid))} indices')
+
+    noise = np.random.default_rng(12).integers(0, 256, (515, 509), dtype=np.uint8)
+    yy, xx = np.mgrid[0:515, 0:509]
+    n = pipeline._BAYER_N
+    t = pipeline._BAYER[yy % n, xx % n]
+    want = np.clip(np.rint((noise.astype(np.float32) + (t - 0.5) * 17.0) / 17.0), 0, 15).astype(np.uint8)
+    combos = np.unique(((yy % n) * n + xx % n) * 256 + noise).size
+    check('premise: the fixture holds every level in every Bayer cell', combos == n * n * 256, f'{combos}')
+    got = pipeline._quantise16(noise, 'bayer')
+    check(
+        'the dither is the Bayer threshold for every level in every cell, on a page no multiple of the cell',
+        np.array_equal(got, want),
+        f'{int((got != want).sum())} pixels differ',
+    )
+
+    levels = np.tile(np.arange(256, dtype=np.uint8), (1203, 4))[:, :907]
+    ramp = pyvips.Image.new_from_memory(np.ascontiguousarray(levels).tobytes(), 907, 1203, 1, 'uchar')
+    shipped = profiles.PROFILES['kobo-clara-hd-2e-bw']
+    tones = (
+        ('the shipped', shipped),
+        ('a steep', dataclasses.replace(shipped, black=30, white=200, gamma=1.6)),
+        ('a linear', dataclasses.replace(shipped, black=0, white=255, gamma=1.0)),
+    )
+    for label, prof in tones:
+        direct = pipeline._tone(ramp.cast('float'), prof, 255.0)
+        tabled = ramp.maplut(pipeline._tone_lut(prof))
+        a = np.ndarray(buffer=direct.write_to_memory(), dtype=np.float32, shape=(1203, 907))
+        b = np.ndarray(buffer=tabled.write_to_memory(), dtype=np.float32, shape=(1203, 907))
+        check(
+            f'{label} tone table gives every pixel of every level exactly what the tone curve gives it',
+            np.array_equal(a, b),
+            f'{int((a != b).sum())} pixels differ, largest by {float(np.abs(a - b).max()):.2e}',
+        )
 
     clara = dataclasses.replace(profiles.PROFILES['kobo-clara-hd-2e-bw'], autocrop=False)
     for level in (255, 0):
@@ -2336,6 +2370,20 @@ def check_edge_line() -> None:
     shaved = pipeline._strip_edge_lines(page(five), thr)
     check('a line thicker than the cap is left alone', shaved[2] == 0, f'shaved {shaved[2]}')
 
+    def grey_line(level):
+        def draw(a):
+            a[:, w - 1] = level
+
+        return draw
+
+    at = pipeline._strip_edge_lines(page(grey_line(255 - thr)), thr)
+    past = pipeline._strip_edge_lines(page(grey_line(254 - thr)), thr)
+    check(
+        'an edge line is ink only once it is more than the threshold from paper',
+        at == (0, 0, 0, 0) and past == (0, 0, 1, 0),
+        f'at {255 - thr}: {at}, one level darker: {past}',
+    )
+
     box = pipeline._autocrop_box(lined, prof)
     clean_box = pipeline._autocrop_box(clean, prof)
     check(
@@ -2463,6 +2511,51 @@ def check_autocrop_open() -> None:
         'the median window scales with the page and stays odd',
         ws % 2 == 1 and wb % 2 == 1 and 3 <= ws < wb <= 21,
         f'700px->{ws}  3000px->{wb}',
+    )
+
+    thr = prof.autocrop_threshold
+
+    def noise(shape: str, far: int, near: int, seed: int) -> pyvips.Image:
+        rng = np.random.default_rng(seed)
+        yy, xx = np.mgrid[0:120, 0:160]
+        if shape == 'blob':
+            density = np.clip(1.2 - np.hypot(xx - 80, yy - 60) / 50, 0, 1)
+        else:
+            density = np.where(np.minimum.reduce([xx, yy, 159 - xx, 119 - yy]) < 30, 0.3, 0.0)
+        a = np.where(rng.random((120, 160)) < density, far, near).astype(np.uint8)
+        return pyvips.Image.new_from_memory(a.tobytes(), 160, 120, 1, 'uchar')
+
+    def median_trim(im: pyvips.Image, window: int, fill: float, background: int) -> list[int]:
+        e = window // 2
+        padded = im.embed(e, e, im.width + 2 * e, im.height + 2 * e, extend='background', background=[fill])
+        ranked = padded.rank(window, window, (window * window) // 2).crop(e, e, im.width, im.height)
+        return list(ranked.find_trim(threshold=thr, background=background))
+
+    differs, moved = [], 0
+    levels = [(0, 255), (0, 255 - thr), (255, 0), (255, thr)]
+    for shape, windows in (('blob', (3, 7)), ('frame', (7,))):
+        for n, (far, near) in enumerate(levels):
+            im = noise(shape, far, near, 10 + n)
+            for window in windows:
+                for fill in (255.0, 0.0):
+                    find = pipeline._opened_trim(im, window, fill, thr)
+                    for background in (255, 0):
+                        want = median_trim(im, window, fill, background)
+                        if shape == 'blob':
+                            moved += want != list(im.find_trim(threshold=thr, background=background))
+                        if list(find(background)) != want:
+                            differs.append(f'{shape} {far}/{near} window {window} pad {fill:.0f} paper {background}')
+    check('premise: the median moves the box on the blobs', moved > 0, f'{moved} of 32')
+    frame = noise('frame', 0, 255, 10)
+    check(
+        'premise: on the frame, the pad alone decides whether there is a box',
+        median_trim(frame, 7, 255.0, 255) != median_trim(frame, 7, 0.0, 255),
+        f'{median_trim(frame, 7, 255.0, 255)} vs {median_trim(frame, 7, 0.0, 255)}',
+    )
+    check(
+        'the opened trim finds the box a median filter would, on either paper, pad and threshold boundary',
+        not differs,
+        '; '.join(differs[:4]),
     )
 
 
@@ -2725,8 +2818,8 @@ def check_concurrency_defaults() -> None:
     import os as _os
 
     check(
-        'only one render may be inside an FFT',
-        pipeline._FFT_SLOTS._initial_value == 1,
+        'no more than two renders may be inside an FFT at once',
+        pipeline._FFT_SLOTS._initial_value == 2,
         f'{pipeline._FFT_SLOTS._initial_value} slot(s)',
     )
     saved = dict(vars(settings_mod))
@@ -2755,23 +2848,113 @@ def check_concurrency_defaults() -> None:
         check(
             'a worker count of zero or less is raised to one, and prefetch to none', counts == (1, 1, 1, 0), f'{counts}'
         )
+    budgets = {}
+    unset = {k: v for k, v in _os.environ.items() if k != 'REPACK_PAGE_WORKERS'}
+    with mock.patch.dict(_os.environ, unset, clear=True):
+        for n in (1, 2, 4, 6, 8, 12, 16, 32, 128):
+            with mock.patch.object(cores, 'available', lambda n=n: n):
+                budgets[n] = importlib.reload(settings_mod).settings.repack_page_workers
+        _os.environ['REPACK_PAGE_WORKERS'] = '5'
+        with mock.patch.object(cores, 'available', lambda: 32):
+            overridden = importlib.reload(settings_mod).settings.repack_page_workers
+    check(
+        'page workers default to half the CPUs, never fewer than 3 nor more than 8',
+        budgets == {1: 3, 2: 3, 4: 3, 6: 3, 8: 4, 12: 6, 16: 8, 32: 8, 128: 8},
+        f'{budgets}',
+    )
+    check('and REPACK_PAGE_WORKERS still sets them', overridden == 5, f'{overridden}')
     vars(settings_mod).update(saved)
     check('the reloads leave the settings the app holds in place', settings_mod.settings is app_mod.settings)
 
-    want = min(8, max(2, (_os.cpu_count() or 4) // 2))
+    want = pipeline.vips_threads(cores.available())
     check(
-        'libvips threads are set from the core count',
+        'libvips threads are set at import from the CPUs this process may use',
         pyvips.concurrency_get() == want,
-        f'cpu_count={_os.cpu_count()} wanted {want}, libvips reports {pyvips.concurrency_get()}',
+        f'{cores.available()} CPUs, wanted {want}, libvips reports {pyvips.concurrency_get()}',
     )
     check(
         'and it is applied by the pipeline, not by the image',
         'concurrency_set' in inspect.getsource(pipeline),
         'nothing in pipeline.py calls concurrency_set',
     )
-    for cores, expect in ((1, 2), (2, 2), (4, 2), (8, 4), (16, 8), (32, 8), (128, 8)):
-        got = pipeline.vips_threads(cores)
-        check(f'{cores} cores would give {expect} threads', got == expect, f'got {got}')
+    for n, expect in ((1, 2), (2, 2), (4, 2), (8, 4), (16, 8), (32, 8), (128, 8)):
+        got = pipeline.vips_threads(n)
+        check(f'{n} cores would give {expect} threads', got == expect, f'got {got}')
+
+    before = pyvips.concurrency_get()
+    try:
+        with mock.patch.dict(_os.environ, {}):
+            _os.environ.pop('VIPS_CONCURRENCY', None)
+            with mock.patch.object(cores, 'available', lambda: 6):
+                pipeline._size_vips()
+            budgeted = pyvips.concurrency_get()
+            _os.environ['VIPS_CONCURRENCY'] = '5'
+            with mock.patch.object(cores, 'available', lambda: 16):
+                pipeline._size_vips()
+            overridden = pyvips.concurrency_get()
+    finally:
+        pyvips.concurrency_set(before)
+    check(
+        'libvips follows the CPU budget, not the machine, and VIPS_CONCURRENCY still wins',
+        (budgeted, overridden) == (3, 3),
+        f'6 CPUs -> {budgeted} threads; with VIPS_CONCURRENCY set and 16 CPUs -> {overridden}',
+    )
+
+    import rapidocr_onnxruntime as _ocr
+
+    asked: list = []
+
+    class _Recorder:
+        def __init__(self, **kw):
+            asked.append(kw.get('intra_op_num_threads'))
+
+    held = folio._engine, folio._engine_failed
+    try:
+        for budget in (32, 2):
+            folio._engine, folio._engine_failed = None, False
+            with (
+                mock.patch.object(_ocr, 'RapidOCR', _Recorder),
+                mock.patch.object(cores, 'available', lambda b=budget: b),
+            ):
+                folio._reader()
+    finally:
+        folio._engine, folio._engine_failed = held
+    check(
+        'the OCR engine runs on four threads, or fewer where fewer CPUs are allowed',
+        asked == [4, 2],
+        f'32 CPUs, 2 CPUs -> {asked}',
+    )
+
+
+def check_cpu_budget() -> None:
+    n = os.process_cpu_count() or 4
+
+    def budget(files: dict[str, str]) -> int:
+        with tempfile.TemporaryDirectory() as d:
+            root = pathlib.Path(d)
+            for name, text in files.items():
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_text(text)
+            return cores.available(root)
+
+    check('premise: this machine has more CPUs than the quotas below grant', n > 2, f'{n}')
+    cases = [
+        ('no cgroup files', {}, n),
+        ('v2 without a quota', {'cpu.max': 'max 100000\n'}, n),
+        ('a v2 quota of 1.5 CPUs', {'cpu.max': '150000 100000\n'}, 2),
+        ('a v2 quota of half a CPU', {'cpu.max': '50000 100000\n'}, 1),
+        ('a v2 quota beyond the machine', {'cpu.max': f'{(n + 8) * 100000} 100000\n'}, n),
+        ('v1 without a quota', {'cpu/cpu.cfs_quota_us': '-1\n', 'cpu/cpu.cfs_period_us': '100000\n'}, n),
+        ('a v1 quota of 2 CPUs', {'cpu/cpu.cfs_quota_us': '200000\n', 'cpu/cpu.cfs_period_us': '100000\n'}, 2),
+        ('an unreadable quota', {'cpu.max': 'garbage\n'}, n),
+        ('a zero period', {'cpu.max': '100000 0\n'}, n),
+    ]
+    wrong = [f'{label}: {got}, wanted {want}' for label, files, want in cases if (got := budget(files)) != want]
+    check(
+        'the CPU budget is the container quota, v1 or v2, rounded up, and never more than the machine',
+        not wrong,
+        '; '.join(wrong),
+    )
 
 
 def check_pipeline_version() -> None:
@@ -2790,7 +2973,7 @@ def check_png_compression() -> None:
     from inksetter.cache import render_key as _rk
 
     prof = profiles.PROFILES['kobo-clara-hd-2e-bw']
-    check('default png_compression is 7', prof.png_compression == 7, str(prof.png_compression))
+    check('default png_compression is 6', prof.png_compression == 6, str(prof.png_compression))
 
     for bad in (-1, 10):
         try:
@@ -3143,24 +3326,76 @@ def check_fft_padding() -> None:
     )
 
     mono = profiles.PROFILES['kobo-clara-hd-2e-bw']
-    calls = {'fast': 0, 'descreen': 0}
-    real_plane = pipeline._descreen_plane
+    h, w = 1203, 907
+    yy, xx = np.mgrid[0:h, 0:w]
+    tone = np.where((yy // 2 + xx // 2) % 2 == 0, 90.0, 170.0) + np.random.default_rng(4).uniform(-15, 15, (h, w))
+    tone[: h // 6] = 255.0
+    tone[h // 2 : h // 2 + 40, w // 8 : w - w // 8] = 0.0
+    page = pyvips.Image.new_from_memory(np.clip(tone, 0, 255).astype(np.uint8).tobytes(), w, h, 1, 'uchar')
 
-    def counting_fast(k, limit=7):
-        calls['fast'] += 1
-        return real(k, limit)
+    def smooth(n: int) -> bool:
+        for f in (2, 3, 5, 7):
+            while n % f == 0:
+                n //= f
+        return n == 1
 
-    def counting_plane(*args, **kwargs):
-        calls['descreen'] += 1
-        return real_plane(*args, **kwargs)
+    shapes = []
+    real_rfft2 = pipeline.sfft.rfft2
 
-    pipeline._next_fast_len, pipeline._descreen_plane = counting_fast, counting_plane
+    def recording(a, *args, **kwargs):
+        shapes.append(a.shape)
+        return real_rfft2(a, *args, **kwargs)
+
+    pipeline.sfft.rfft2 = recording
     try:
-        pipeline.render_page(fake_page(9, 2400, 3200), mono)
+        got = pipeline._to_numpy(pipeline.descreen(page, mono, 0.3)).astype(int)
     finally:
-        pipeline._next_fast_len, pipeline._descreen_plane = real, real_plane
-    check('premise: the mono render runs the descreen', calls['descreen'] > 0, f'{calls}')
-    check('descreen is never padded to a fast length', calls['fast'] == 0, f'{calls}')
+        pipeline.sfft.rfft2 = real_rfft2
+    check('premise: the page is no fast length itself', not (smooth(h) and smooth(w)), f'{w}x{h}')
+    check(
+        'descreen transforms the page padded to a 7-smooth size, never smaller',
+        shapes and all(smooth(a) and smooth(b) and a >= h and b >= w for a, b in shapes),
+        f'{shapes} for a {w}x{h} page',
+    )
+    pipeline._next_fast_len = lambda k, limit=7: k  # noqa: ARG005
+    try:
+        ref = pipeline._to_numpy(pipeline.descreen(page, mono, 0.3)).astype(int)
+    finally:
+        pipeline._next_fast_len = real
+    check(
+        'premise: descreen notches this screentone', got.std() < tone.std() - 5, f'{tone.std():.1f} -> {got.std():.1f}'
+    )
+    inner = np.abs(got - ref)[32:-32, 32:-32]
+    check(
+        'padded descreen matches unpadded within a level beyond 32 px of the edges',
+        inner.max() <= 1,
+        f'max {inner.max()}, mean {inner.mean():.4f}; whole page max {np.abs(got - ref).max()}',
+    )
+
+    handed = []
+    real_ifft = pipeline.sfft.ifft
+
+    def keeping(x, *args, **kwargs):
+        handed.append(x.copy())
+        return real_ifft(x, *args, **kwargs)
+
+    plane = pipeline._band_to_numpy(page)
+    pipeline.sfft.ifft = keeping
+    try:
+        mine = pipeline._descreen_plane(plane, max(mono.descreen_min_freq, 0.3 / 2.0), mono)
+    finally:
+        pipeline.sfft.ifft = real_ifft
+    check(
+        'premise: the notch hands its spectrum to the inverse', mine is not None and len(handed) == 1, f'{len(handed)}'
+    )
+    if mine is not None and handed:
+        whole = pipeline.sfft.irfft2(handed[0], s=(real(h), real(w)))[:h, :w]
+        gap = float(np.abs(mine - whole).max()) if mine.shape == whole.shape else float('inf')
+        check(
+            'the inverse in two passes is irfft2 to within a thousandth of a level',
+            gap < 1e-3,
+            f'shape {mine.shape} against {whole.shape}, largest difference {gap:.6f}',
+        )
 
 
 def check_big_panel_cap() -> None:
@@ -3586,6 +3821,80 @@ def check_rounding() -> None:
         )
         drift = float(np.abs(after.mean(axis=(0, 1)) - before.mean(axis=(0, 1))).max())
         check(f'descreen keeps the {label} page at its own mean level', drift < 0.25, f'drift {drift:.3f}')
+
+    inked = tone.copy()
+    inked[:200] = 255.0
+    inked[500:560, 100:800] = 0.0
+    inked[800:1000, 300:340] = 255.0
+    stacks = [inked, inked * 0.8 + 20, inked * 0.6 + 50]
+    grey = pyvips.Image.new_from_memory(np.clip(inked, 0, 255).astype(np.uint8).tobytes(), 900, 1200, 1, 'uchar')
+    colour = pyvips.Image.new_from_memory(
+        np.dstack([np.clip(b, 0, 255).astype(np.uint8) for b in stacks]).tobytes(), 900, 1200, 3, 'uchar'
+    )
+    wide = dataclasses.replace(clara, descreen_deadband=2.0)
+    floor = max(wide.descreen_min_freq, 0.3 / 2.0)
+    for label, im in (('grey', grey), ('colour', colour)):
+        luma = im if im.bands == 1 else im.colourspace('b-w')
+        plane = np.ndarray(buffer=luma.write_to_memory(), dtype=np.uint8, shape=(1200, 900)).astype(np.float32)
+        notched = pipeline._descreen_plane(plane.copy(), floor, wide)
+        whole = notched is not None and notched.shape == plane.shape
+        check(
+            f'premise: the notch filters the {label} page and returns it at its own size',
+            whole,
+            f'{None if notched is None else notched.shape} for {plane.shape}',
+        )
+        if not whole:
+            continue
+        kept = np.where(np.abs(notched - plane) < wide.descreen_deadband, plane, notched)
+        source = np.ndarray(buffer=im.write_to_memory(), dtype=np.uint8, shape=(1200, 900, im.bands)).astype(np.float32)
+
+        def rounded(values: np.ndarray, source=source, plane=plane) -> np.ndarray:
+            shifted = values[:, :, None] if source.shape[2] == 1 else source + (values - plane)[:, :, None]
+            return np.clip(np.rint(shifted), 0, 255).astype(np.uint8)
+
+        want = rounded(kept)
+        out = pipeline.descreen(im, wide, 0.3)
+        got = np.ndarray(buffer=out.write_to_memory(), dtype=np.uint8, shape=(1200, 900, im.bands))
+        unclipped = notched[:, :, None] if im.bands == 1 else source + (notched - plane)[:, :, None]
+        check(
+            f'premise: on the {label} page the deadband keeps pixels and the notch rings past black and white',
+            (rounded(notched) != want).any() and unclipped.max() > 255.5 and unclipped.min() < -0.5,
+            f'deadband decides {int((rounded(notched) != want).sum())} values, '
+            f'unclipped range {unclipped.min():.1f}..{unclipped.max():.1f}',
+        )
+        check(
+            f'descreen of the {label} page is the notch, less changes under the deadband, rounded and clipped',
+            np.array_equal(got, want),
+            f'{int((got != want).sum())} values differ, largest by {int(np.abs(got.astype(int) - want).max())}',
+        )
+
+    half = dataclasses.replace(clara, descreen_deadband=0.5)
+    plane = np.ndarray(buffer=grey.write_to_memory(), dtype=np.uint8, shape=(1200, 900)).astype(np.float32)
+    notched = pipeline._descreen_plane(plane.copy(), floor, half)
+    if notched is not None and notched.shape == plane.shape:
+        want = np.clip(np.rint(np.where(np.abs(notched - plane) < 0.5, plane, notched)), 0, 255).astype(np.uint8)
+        got = pipeline._to_numpy(pipeline.descreen(grey, half, 0.3))
+        same, detail = np.array_equal(got, want), f'{int((got != want).sum())} values differ'
+    else:
+        same, detail = False, f'the notch returned {None if notched is None else notched.shape}'
+    check('a grey page at a half-level deadband comes out exactly as the deadband would leave it', same, detail)
+    steps = {}
+    real_copyto = np.copyto
+    for band in (0.5, 2.0):
+        seen = []
+
+        def counting(*args, seen=seen, **kwargs):
+            seen.append(1)
+            return real_copyto(*args, **kwargs)
+
+        with mock.patch.object(pipeline.np, 'copyto', counting):
+            pipeline.descreen(grey, dataclasses.replace(clara, descreen_deadband=band), 0.3)
+        steps[band] = len(seen)
+    check(
+        'a grey page skips the deadband step where rounding already does its work, and only there',
+        steps == {0.5: 0, 2.0: 1},
+        f'deadband steps run: {steps}',
+    )
 
 
 def check_bit_depth() -> None:
@@ -4677,6 +4986,29 @@ def check_strip_folio() -> None:
     a3 = np.ndarray(buffer=raw3.cast('uchar').write_to_memory(), dtype=np.uint8, shape=(raw3.height, raw3.width))
     marks = folio._marks((255 - a3.astype(np.int16)) > off.autocrop_threshold, raw3.height, raw3.width)
     check('a three-digit folio is offered to the reader as one mark', len(marks) == 1, f'{len(marks)} marks')
+
+    fw, fh = 900, 1300
+    jx, jy = max(1, int(fw * folio.JOIN_X)), max(1, int(fh * folio.JOIN_Y))
+
+    def dots(across: int, down: int) -> int:
+        ink = np.zeros((fh, fw), bool)
+        y, x = fh - 70, fw // 2
+        ink[y : y + 8, x : x + 4] = True
+        if across:
+            ink[y : y + 8, x + 4 + across : x + 8 + across] = True
+        else:
+            ink[y + 8 + down : y + 16 + down, x : x + 4] = True
+        return len(folio._marks(ink, fh, fw))
+
+    joins = {
+        'across': (dots(2 * jx, 0), dots(2 * jx + 1, 0)),
+        'down': (dots(0, 2 * jy), dots(0, 2 * jy + 1)),
+    }
+    check(
+        'two dots whose JOIN_X and JOIN_Y growth meets are one mark, a pixel further they are two, both ways',
+        all(v == (1, 2) for v in joins.values()),
+        f'marks at the limit and one past it: {joins}',
+    )
     speck = _folio_page(number='')
     im = pyvips.Image.new_from_buffer(speck, '')
     a = np.ndarray(buffer=im.cast('uchar').write_to_memory(), dtype=np.uint8, shape=(im.height, im.width))
@@ -6263,6 +6595,7 @@ async def main() -> int:
     check_cover_token()
     print('concurrency defaults')
     check_concurrency_defaults()
+    check_cpu_budget()
     print('parallel repack')
     check_repack_parallel()
     print('range repack')
