@@ -48,7 +48,7 @@ def _size_vips() -> None:
 _size_vips()
 
 # Bump this whenever anything in this module changes in a way that alters output pixels. Bump invalidates the cache.
-PIPELINE_VERSION = '6'
+PIPELINE_VERSION = '7'
 
 _BAYER_N = 8
 

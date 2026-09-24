@@ -1031,7 +1031,8 @@ def check_defringe() -> None:
     off_blob, _ = pipeline.render_page(diag, off)
 
     d_on, d_off = wedge_energy(on_blob, 135.0), wedge_energy(off_blob, 135.0)
-    a_on, a_off = wedge_energy(on_blob, 0.0), wedge_energy(off_blob, 0.0)
+    axial = diagonal_colour_page(axis='axial')
+    a_on, a_off = (wedge_energy(pipeline.render_page(axial, q)[0], 0.0) for q in (scribe, off))
     check(
         'defringe cuts diagonal high frequencies',
         d_on < d_off * 0.75,
@@ -3000,6 +3001,38 @@ def check_png_compression() -> None:
         )
         check(f'png_compression leaves {label} pixels untouched', ident)
 
+    check(
+        'every shipped profile enlarges bicubic',
+        all(q.upscale_kernel == 'cubic' for q in profiles.PROFILES.values()),
+        f'{sorted({q.upscale_kernel for q in profiles.PROFILES.values()})}',
+    )
+
+    def pixels(im):
+        return np.ndarray(buffer=im.write_to_memory(), dtype=np.uint8, shape=(im.height, im.width, im.bands))
+
+    small = pyvips.Image.new_from_buffer(fake_page(4, 700, 1000), '')
+    plain = dataclasses.replace(prof, autocrop=False, strip_folio=False)
+    g = pipeline._geometry(b'', plain, prof.width, prof.height, mono=True, page=small)
+    got = g.image.crop(*g.content)
+    want = small.resize(g.upscale, kernel='cubic')
+    check('premise: the page is enlarged', g.upscale > 1.2, f'{g.upscale:.3f}')
+    check(
+        'and an enlarged page is exactly what bicubic makes of it',
+        (got.width, got.height) == (want.width, want.height) and np.array_equal(pixels(got), pixels(want)),
+        f'{got.width}x{got.height} vs {want.width}x{want.height}',
+    )
+
+    strip = profiles.PROFILES['kindle-scribe-colorsoft-webtoon']
+    slice_ = pyvips.Image.new_from_buffer(fake_page(2, 800, 1000), '')
+    widened = pipeline.fit_to_width(slice_, strip.width, strip)
+    wanted = slice_.resize(strip.width / slice_.width, kernel='cubic')
+    check(
+        'the strip reader widens a webtoon slice bicubic too',
+        (widened.width, widened.height) == (wanted.width, wanted.height)
+        and np.array_equal(pixels(widened), pixels(wanted)),
+        f'{widened.width}x{widened.height} vs {wanted.width}x{wanted.height}',
+    )
+
 
 def check_range_repack() -> None:
     import io as _io
@@ -4059,7 +4092,7 @@ def check_reslice_edges() -> None:
         return a
 
     mono = dataclasses.replace(profiles.PROFILES['kindle-pw-6'], reslice=True)
-    src = archive([(f'{i:03d}.png', png(margined(h, i))) for i, h in enumerate((1300, 1100, 250))])
+    src = archive([(f'{i:03d}.png', png(margined(h, i))) for i, h in enumerate((1300, 1100, 100))])
     z, order = infos(src)
     cut = [len(t[3]) for t in cbz._strip_tiles(z, order, mono, {}) if t[0] == 'tile']
     want = [(mono.width, min(h, round(mono.width * mono.aspect))) for h in cut]
@@ -4247,6 +4280,25 @@ def check_reslice() -> None:
         lo60 - 4 <= t[0] <= hi60 + 4,
         f'page {t[0]}, gutter {lo60}..{hi60}',
     )
+
+    native = round(1280 * scale)
+    g60, deep60 = round(0.60 * limit), round(24 * scale)
+    noisy = _strip_cbz([native, native], width=p.width, gutter=(0, g60, deep60), noise=15)
+    drawn = pyvips.Image.new_from_buffer(zipfile.ZipFile(io.BytesIO(noisy)).read('0000.png'), '')
+    rows = np.ndarray(buffer=drawn.write_to_memory(), dtype=np.uint8, shape=(drawn.height, drawn.width, 3))
+    spreads = rows[g60 : g60 + deep60].astype(np.int16)
+    spreads = spreads.max(axis=(1, 2)) - spreads.min(axis=(1, 2))
+    check(
+        'premise: drawn at the panel width, the noisy gutter spreads exactly 15',
+        drawn.width == p.width and bool((spreads == 15).all()),
+        f'{drawn.width} wide, spreads {sorted(set(spreads.tolist()))}',
+    )
+    t = tiles(noisy)
+    check(
+        'and a gutter as noisy as that still counts as one',
+        g60 - 4 <= t[0] <= g60 + deep60 + 4,
+        f'page {t[0]}, gutter {g60}..{g60 + deep60}',
+    )
     lead_rows = round((limit + 4) / scale)
     t = tiles(_strip_cbz([lead_rows, 1280], gutter=(1, at(1.05) - lead_rows)))
     check(
@@ -4310,8 +4362,13 @@ def check_reslice() -> None:
 
     margin = round(limit * cbz.STRIP_TOP_MARGIN)
 
-    faint = _strip_cbz([1280, 1280], gutter=[(0, at(1.05), 60), (0, at(1.05) + 60, 80, (252, 252, 252), 16)])
-    band = strip_of(faint)[round((at(1.05) + 64) * scale) : round((at(1.05) + 136) * scale)]
+    f105, deep, tall = round(1.05 * limit), round(60 * scale), round(80 * scale)
+    faint = _strip_cbz(
+        [native, native],
+        width=p.width,
+        gutter=[(0, f105, deep), (0, f105 + deep, tall, (252, 252, 252), 16)],
+    )
+    band = strip_of(faint)[f105 + deep + 4 : f105 + deep + tall - 4]
     light = band.min(axis=(1, 2)) >= 235
     check(
         'the faint band is light everywhere and blank nowhere, as intended',
@@ -4324,6 +4381,13 @@ def check_reslice() -> None:
         'faint artwork under a gutter is not swallowed with it',
         len(kept) and not blank_rows(kept[:1]).any() and bool((kept[:40].min(axis=(1, 2)) >= 235).all()),
         f'row after the margin blank: {bool(blank_rows(kept[:1]).any())}',
+    )
+    past = _strip_cbz([native, native], width=p.width, gutter=(0, f105, deep), noise=15)
+    opened = cut(past)[1]
+    check(
+        'a page opening on a gutter noisy up to 15 trims it like a clean one',
+        len(opened) > margin and np.array_equal(opened[margin], strip_of(past)[f105 + deep]),
+        f'{len(opened)} rows',
     )
 
     fold = round(1.05 * limit)

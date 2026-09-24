@@ -17,7 +17,7 @@ DEFRINGES = frozenset({'diagonal', 'none'})
 FITS = frozenset({'box', 'none'})
 COLOUR_PADS = frozenset({'border', 'mono'})
 UPSCALES = frozenset({'panel', 'none'})
-UPSCALE_KERNELS = frozenset({'linear', 'nearest', 'cubic', 'mitchell', 'lanczos3'})
+UPSCALE_KERNELS = frozenset({'nearest', 'linear', 'cubic'})
 UPSCALE_MAX_CEILING = 8.0
 
 _SHIPPED = 'profiles.toml'
@@ -73,7 +73,12 @@ class Profile:
     upscale: str = 'panel'
     # Refuse to enlarge beyond this.
     upscale_max: float = 2.0
-    upscale_kernel: str = 'linear'
+    # How to enlarge. resize has three interpolators for it:
+    #   nearest  pixel copies
+    #   linear   bilinear
+    #   cubic    bicubic
+    # lbb, nohalo and vsqbs are libvips interpolators too, but only affine takes them; resize refuses them.
+    upscale_kernel: str = 'cubic'
 
     # --- resampling ---
     # Screentone removal ahead of the downscale.
