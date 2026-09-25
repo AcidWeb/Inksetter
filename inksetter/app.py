@@ -131,6 +131,11 @@ async def _token_error(request: Request, exc: rewrite.TokenError):
     return _error(request, 400, str(exc))
 
 
+@app.exception_handler(rewrite.FeedError)
+async def _feed_error(request: Request, exc: rewrite.FeedError):
+    return _error(request, 502, str(exc))
+
+
 @app.api_route('/healthz', methods=['GET', 'HEAD'])
 async def healthz():
     return {'ok': True, 'profiles': sorted(profiles.PROFILES)}
@@ -165,9 +170,7 @@ async def _serve_feed(request: Request, profile_name: str, url: str) -> Response
     ctype = resp.headers.get('content-type', '')
     page_mime = None if p.fmt == 'raw' else p.mime
     if rewrite.is_feed(ctype, resp.content):
-        body = rewrite.rewrite(
-            resp.content, ctype, _ctx(request, profile_name, str(resp.url)), page_mime, not p.reslice
-        )
+        body = rewrite.rewrite(resp.content, _ctx(request, profile_name, str(resp.url)), page_mime, not p.reslice)
     else:
         body = resp.content
     return Response(content=body, media_type=ctype or 'application/atom+xml')
@@ -194,7 +197,7 @@ async def opensearch(profile: str, token: str, request: Request):
     _profile_or_404(profile)
     url = rewrite.decode_token(token)
     resp = await client.get(url, request_headers(request.headers, forward_accept=True))
-    body = rewrite.rewrite_opensearch(resp.content, _ctx(request, profile, str(resp.url)))
+    body = rewrite.rewrite(resp.content, _ctx(request, profile, str(resp.url)), None)
     return Response(body, media_type='application/opensearchdescription+xml')
 
 
@@ -281,6 +284,8 @@ async def _render_cached(url: str, p: Profile, max_width: int | None, headers: d
         if p.fmt == 'raw':
             blob = resp.content
             ctype = resp.headers.get('content-type', 'application/octet-stream')
+            if rewrite.looks_like_feed(blob):
+                raise UpstreamError(502, 'upstream answered a feed, not a page')
         else:
             async with render_sem:
                 try:
@@ -422,13 +427,24 @@ def _is_epub(ctype: str, head: bytes) -> bool:
     return head[30:38] == b'mimetype' and head[38:58] == _EPUB_TYPE.encode()
 
 
-def _is_comic_zip(url: str, ctype: str, body) -> bool:
+def _head_of(body, size: int = 64) -> bytes:
     pos = body.tell()
     try:
         body.seek(0)
-        head = body.read(58)
+        return body.read(size)
     finally:
         body.seek(pos)
+
+
+def _is_feed_body(body) -> bool:
+    head = _head_of(body, 4096)
+    if rewrite.looks_like_feed(head):
+        return True
+    return rewrite.is_json(head) and rewrite.looks_like_feed(_head_of(body, 32 << 20))
+
+
+def _is_comic_zip(url: str, ctype: str, body) -> bool:
+    head = _head_of(body)
     if _is_epub(ctype, head):
         return False
     if head[:4] in _ZIP_MAGIC:
@@ -559,6 +575,9 @@ async def _deliver(p: Profile, url: str, cover_url: str | None, request: Request
             body.close()
             raise
 
+    if _is_feed_body(body):
+        body.close()
+        raise UpstreamError(502, 'upstream answered a feed, not a book')
     jobs.set(job, stage='done')
     body.seek(0, os.SEEK_END)
     out_headers['content-length'] = str(body.tell())

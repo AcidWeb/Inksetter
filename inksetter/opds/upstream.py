@@ -143,7 +143,7 @@ class Client:
                         raise _status_error(resp.status_code, resp.headers)
                     return resp
                 url = target
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, httpx.InvalidURL) as exc:
             raise _upstream_failure(exc) from exc
         raise UpstreamError(502, f'more than {MAX_REDIRECTS} redirects')
 

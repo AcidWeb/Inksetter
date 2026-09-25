@@ -543,6 +543,16 @@ def _kavita_like_feed(key: str):
     return Response(body, media_type='application/atom+xml;profile=opds-catalog')
 
 
+LONG_JSON = json.dumps(
+    {'metadata': {'title': 'Long', 'description': 'x' * 8000}, 'links': [{'href': f'/api/opds/{SEAL_KEY}/feed'}]}
+)
+
+
+@upstream.get('/opds/v1.2/long-json')
+def _long_json():
+    return Response(LONG_JSON, media_type='application/opds+json')
+
+
 GUARDED_PAGE = {'hits': 0}
 
 
@@ -556,7 +566,7 @@ def _guarded_page(authorization: str = Header(default='')):
 
 @upstream.get('/opds/v1.2/untyped/{shape}/{kind}')
 def _untyped(shape: str, kind: str):
-    body = {'atom': FEED, 'bom': '﻿' + FEED, 'json': json.dumps(FEED_V2)}[shape]
+    body = {'atom': FEED, 'bom': '﻿' + FEED, 'json': json.dumps(FEED_V2), 'json-array': json.dumps([FEED_V2])}[shape]
     media = {'plain': 'text/plain', 'octet': 'application/octet-stream', 'none': None}[kind]
     return Response(body, media_type=media)
 
@@ -655,6 +665,40 @@ def _bad_gzip(kind: str):
 @upstream.get('/opds/v1.2/upstream500')
 def _upstream_500():
     return Response(status_code=503)
+
+
+@upstream.get('/opds/v1.2/bad-location')
+def _bad_location():
+    return Response(status_code=302, headers={'location': 'http://[::1/'})
+
+
+@upstream.get('/opds/v1.2/deep-json')
+def _deep_json():
+    return Response('{"links":' * 3000 + '[]' + '}' * 3000, media_type='application/opds+json')
+
+
+@upstream.get('/opds/v1.2/form-search')
+def _form_search():
+    return Response(
+        '<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"><title>Form search</title>'
+        '<link rel="search" type="application/atom+xml" href="/opds/v1.2/series{?search}"/></feed>',
+        media_type='application/atom+xml',
+    )
+
+
+class _Escaped:
+    status_code = 500
+
+    def __init__(self, exc: Exception) -> None:
+        self.text = f'{type(exc).__name__} escaped the route'
+        self.headers: dict[str, str] = {}
+
+
+async def _get(c, url: str, **kw):
+    try:
+        return await c.get(url, **kw)
+    except Exception as exc:
+        return _Escaped(exc)
 
 
 def start_upstream() -> uvicorn.Server:
@@ -3033,6 +3077,18 @@ def check_png_compression() -> None:
         f'{widened.width}x{widened.height} vs {wanted.width}x{wanted.height}',
     )
 
+    refused = []
+    for kernel in sorted(profiles.UPSCALE_KERNELS):
+        try:
+            geom = pipeline._geometry(
+                b'', dataclasses.replace(plain, upscale_kernel=kernel), prof.width, prof.height, mono=True, page=small
+            )
+            geom.image.copy_memory()
+            pipeline.fit_to_width(slice_, strip.width, dataclasses.replace(strip, upscale_kernel=kernel)).copy_memory()
+        except pyvips.Error:
+            refused.append(kernel)
+    check('every kernel the profiles accept is one resize takes', not refused, f'refused: {refused}')
+
 
 def check_range_repack() -> None:
     import io as _io
@@ -3793,7 +3849,7 @@ def check_search_templates() -> None:
     doc = {
         'links': [{'rel': 'next', 'href': '/opds/v2/series{?page}', 'type': 'application/opds+json', 'templated': True}]
     }
-    link = json.loads(rewrite.rewrite(json.dumps(doc).encode(), 'application/opds+json', ctx, None))['links'][0]
+    link = json.loads(rewrite.rewrite(json.dumps(doc).encode(), ctx, None))['links'][0]
     check(
         'a templated paging link routes as a feed, not a search',
         '/kobo-clara-hd-2e-bw/f/' in link['href'],
@@ -5095,7 +5151,7 @@ async def check_malformed_input(c) -> None:
     up = 'http://127.0.0.1:8899'
     ctx = rewrite.Ctx(profile='kobo-clara-hd-2e-bw', public_base='http://proxy.test', base_url=f'{up}/opds/v1.2/x')
     try:
-        out = rewrite.rewrite(BROKEN_HREF_FEED.encode(), 'application/atom+xml', ctx, None).decode()
+        out = rewrite.rewrite(BROKEN_HREF_FEED.encode(), ctx, None).decode()
         got = 'rewritten'
     except Exception as exc:
         out, got = '', type(exc).__name__
@@ -5105,7 +5161,7 @@ async def check_malformed_input(c) -> None:
 
     doc = {'links': [{'rel': 'self', 'href': '/opds/v2/catalog', 'type': 1}]}
     try:
-        out = json.loads(rewrite.rewrite(json.dumps(doc).encode(), 'application/opds+json', ctx, None))
+        out = json.loads(rewrite.rewrite(json.dumps(doc).encode(), ctx, None))
         got = out['links'][0]['href']
     except Exception as exc:
         got = type(exc).__name__
@@ -5212,8 +5268,42 @@ async def check_security(c) -> None:
             and not any(SEAL_KEY in x for x in inside)
             and not any(SEAL_KEY in _raw_token(t) for t in crumbs),
         )
+
+        for label, route in (
+            ('a download', '/kobo-clara-hd-2e-bw/dl'),
+            ('a raw page', '/passthrough/p'),
+            ('a raw image', '/passthrough/img'),
+        ):
+            r = await _get(c, f'{route}/{start}')
+            check(f'{label} of the keyed feed is refused, not passed through', r.status_code == 502, f'{r.status_code}')
+            check(f'and {label} refused carries no key', SEAL_KEY not in r.text, r.text[:80])
+        check('premise: the long JSON feed has no link in its first 4 KB', LONG_JSON.index('"href"') > 4096)
+        r = await _get(c, f'/kobo-clara-hd-2e-bw/dl/{encode_token(f"{up}/opds/v1.2/long-json")}')
+        check(
+            'a download of a JSON feed whose first link lies past its first 4 KB is refused too',
+            r.status_code == 502 and SEAL_KEY not in r.text,
+            f'{r.status_code} {r.text[:60]}',
+        )
+        r = await _get(c, f'/kobo-clara-hd-2e-bw/osd/{start}')
+        check(
+            'the search-description route rewrites a feed it is pointed at, key and all',
+            r.status_code == 200 and SEAL_KEY not in r.text and '/kobo-clara-hd-2e-bw/' in r.text,
+            f'status={r.status_code} {r.text[:80]}',
+        )
     finally:
         kavita.settings = real
+
+    for label, body, want in (
+        ('an Atom feed', b'<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"/>', True),
+        ('an Atom entry under a prefix', b'<a:entry xmlns:a="http://www.w3.org/2005/Atom"/>', True),
+        ('a search description behind a BOM and a comment', b'\xef\xbb\xbf<!-- x --><OpenSearchDescription/>', True),
+        ('JSON with links in it', b'{"links": [{"href": "/x"}]}', True),
+        ('a JSON array with links in it', b'[{"href": "/x"}]', True),
+        ('an XHTML chapter', b'<?xml version="1.0"?><!DOCTYPE html><html><body>one</body></html>', False),
+        ('JSON without a link', b'{"positions": [1, 2]}', False),
+        ('a JPEG', b'\xff\xd8\xff\xe0', False),
+    ):
+        check(f'{label} is {"" if want else "not "}taken for a feed', rewrite.looks_like_feed(body) is want)
 
     tok = encode_token(f'{up}/opds/v1.2/guarded-page')
     alice = {'authorization': 'Basic Zm9vOmJhcg=='}
@@ -5231,7 +5321,7 @@ async def check_security(c) -> None:
         f'status={r.status_code}, {GUARDED_PAGE["hits"] - before} upstream request(s)',
     )
 
-    for shape in ('atom', 'bom', 'json'):
+    for shape in ('atom', 'bom', 'json', 'json-array'):
         for kind in ('plain', 'octet', 'none'):
             r = await c.get(f'/kobo-clara-hd-2e-bw/f/{encode_token(f"{up}/opds/v1.2/untyped/{shape}/{kind}")}')
             check(
@@ -5416,8 +5506,8 @@ async def check_no_stream(c) -> None:
         ],
     }
     body = json.dumps(doc).encode()
-    on = json.loads(rewrite.rewrite(body, 'application/opds+json', ctx, 'image/png'))
-    off = json.loads(rewrite.rewrite(body, 'application/opds+json', ctx, 'image/png', stream=False))
+    on = json.loads(rewrite.rewrite(body, ctx, 'image/png'))
+    off = json.loads(rewrite.rewrite(body, ctx, 'image/png', stream=False))
     check(
         'premise: both OPDS 2 stream links map to /p/ when streaming',
         sum('/p/' in link['href'] for link in on['publications'][0]['links']) == 2,
@@ -5470,6 +5560,16 @@ async def check_browse(c) -> None:
     r = await c.get(f'/kobo-clara-hd-2e-bw/bs/{stok}', params={'q': 'dune'})
     check('search resolves the description and runs the query', 'hits:dune' in r.text)
     check('the search box keeps the term', 'value="dune"' in r.text)
+
+    form = (await c.get(f'/kobo-clara-hd-2e-bw/b/{encode_token(f"{up}/opds/v1.2/form-search")}')).text
+    found = re.search(r'<form class="q" action="[^"]*/bs/([\w-]+)"', form)
+    check(
+        'a form-style search link reaches the browse page as the template it is',
+        found is not None and _decoded(found.group(1))[0] == f'{up}/opds/v1.2/series{{?search}}',
+        _decoded(found.group(1))[0] if found else 'no search form',
+    )
+    r = await _get(c, f'/kobo-clara-hd-2e-bw/bs/{found.group(1) if found else "x"}', params={'q': 'dune'})
+    check('and searching it fills the template', r.status_code == 200 and 'hits:dune' in r.text, f'{r.status_code}')
 
     ntok = encode_token(f'{up}/opds/v1.2/nav')
     nav = (await c.get(f'/kobo-clara-hd-2e-bw/b/{ntok}')).text
@@ -6494,6 +6594,21 @@ async def main() -> int:
             check(f'{label} the upstream garbles is 502, not 500', status == 502, f'status={status} {said}')
             if route == 'p':
                 check('and it is not called unreachable', 'unreachable' not in said and 'badly' in said, said)
+        for label, route, path in (
+            ('a feed that redirects to a malformed URL', 'f', 'bad-location'),
+            ('a download that redirects to a malformed URL', 'dl', 'bad-location'),
+            ('a JSON feed nested too deep to rewrite', 'f', 'deep-json'),
+        ):
+            tok = encode_token(f'http://127.0.0.1:8899/opds/v1.2/{path}')
+            r = await _get(c, f'/kobo-clara-hd-2e-bw/{route}/{tok}')
+            check(f'{label} is 502, not 500', r.status_code == 502, f'status={r.status_code} {r.text[:70]}')
+        tok = encode_token('http://127.0.0.1:8899/opds/v1.2/series?search={searchTerms}')
+        r = await _get(c, f'/kobo-clara-hd-2e-bw/s/{tok}?q=' + '+' * 30000)
+        check(
+            'a search term that fills in past any URL httpx will take is 502, not 500',
+            r.status_code == 502,
+            f'status={r.status_code} {r.text[:70]}',
+        )
         r = await c.get('/kobo-clara-hd-2e-bw/p/' + encode_token('http://127.0.0.1:8899/opds/v1.2/upstream500'))
         check('upstream 5xx becomes 502', r.status_code == 502, f'status={r.status_code}')
         r = await c.get('/kobo-clara-hd-2e-bw/p/' + encode_token('http://127.0.0.1:8899/opds/v1.2/missing'))

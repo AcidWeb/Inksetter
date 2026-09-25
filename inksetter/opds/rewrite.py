@@ -63,6 +63,10 @@ class TokenError(ValueError):
     pass
 
 
+class FeedError(ValueError):
+    pass
+
+
 def _secret() -> str:
     from .. import kavita
 
@@ -176,7 +180,7 @@ def map_href(
 ) -> str:
     if not href:
         return href
-    if kind not in ('p', 's'):
+    if kind not in ('p', 's', 'bs'):
         href = _unfilled(href)
     try:
         scheme = urlsplit(href).scheme.lower()
@@ -286,13 +290,6 @@ def search_template(body: bytes) -> str | None:
     return None
 
 
-def rewrite_opensearch(body: bytes, ctx: Ctx) -> bytes:
-    root = root_or_none(body)
-    if root is None:
-        return body
-    return _rewrite_osd(root, ctx)
-
-
 def _rewrite_osd(root, ctx: Ctx) -> bytes:
     for url in root.iter(f'{{{OSD_NS}}}Url'):
         tpl = url.get('template')
@@ -393,8 +390,11 @@ def rewrite_json(body: bytes, ctx: Ctx, page_mime: str | None, stream: bool = Tr
         doc = json.loads(body)
     except ValueError:
         return body
-    _walk_json(doc, ctx, page_mime, stream=stream)
-    return json.dumps(doc, ensure_ascii=False).encode('utf-8')
+    try:
+        _walk_json(doc, ctx, page_mime, stream=stream)
+        return json.dumps(doc, ensure_ascii=False).encode('utf-8')
+    except RecursionError as exc:
+        raise FeedError('upstream feed is nested too deeply to rewrite') from exc
 
 
 # --------------------------------------------------------------------------
@@ -402,28 +402,39 @@ def rewrite_json(body: bytes, ctx: Ctx, page_mime: str | None, stream: bool = Tr
 # --------------------------------------------------------------------------
 
 
-def rewrite(body: bytes, content_type: str, ctx: Ctx, page_mime: str | None, stream: bool = True) -> bytes:
-    ct = (content_type or '').lower()
-    if 'opensearchdescription' in ct:
-        return rewrite_opensearch(body, ctx)
-    if any(j in ct for j in JSON_TYPES):
-        return rewrite_json(body, ctx, page_mime, stream)
-    if 'xml' in ct:
-        return rewrite_atom(body, ctx, page_mime, stream)
+def rewrite(body: bytes, ctx: Ctx, page_mime: str | None, stream: bool = True) -> bytes:
     head = _head(body)
-    if head == b'{':
+    if head in (b'{', b'['):
         return rewrite_json(body, ctx, page_mime, stream)
     if head == b'<':
         return rewrite_atom(body, ctx, page_mime, stream)
     return body
 
 
+_LEADING = b' \t\r\n\xef\xbb\xbf'
+
+
 def _head(body: bytes) -> bytes:
-    return body.lstrip(b' \t\r\n\xef\xbb\xbf')[:1]
+    return body.lstrip(_LEADING)[:1]
 
 
 def is_feed(content_type: str, body: bytes = b'') -> bool:
     ct = (content_type or '').lower()
     if 'xml' in ct or 'opensearchdescription' in ct or any(j in ct for j in JSON_TYPES):
         return True
-    return ct.split(';')[0].strip() in GENERIC_TYPES and _head(body) in (b'<', b'{')
+    return ct.split(';')[0].strip() in GENERIC_TYPES and (is_json(body) or _head(body) == b'<')
+
+
+_XML_ROOT = re.compile(rb'(?:\s+|<\?.*?\?>|<!--.*?-->|<!DOCTYPE[^>]*>)*<(?:[\w.-]+:)?([\w.-]+)', re.S)
+_FEED_ROOTS = frozenset({b'feed', b'entry', b'OpenSearchDescription'})
+
+
+def is_json(body: bytes) -> bool:
+    return _head(body) in (b'{', b'[')
+
+
+def looks_like_feed(body: bytes) -> bool:
+    if is_json(body):
+        return b'"href"' in body
+    root = _XML_ROOT.match(body.lstrip(_LEADING))
+    return root is not None and root.group(1) in _FEED_ROOTS
