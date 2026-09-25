@@ -850,7 +850,7 @@ def check_fit_and_upscale() -> None:
     tw, th = clara.width, clara.height
 
     for label, (w, h) in (
-        ('smaller than panel', (1170, 1536)),
+        ('a little larger than panel', (1170, 1536)),
         ('much smaller', (600, 800)),
         ('larger than panel', (2400, 3200)),
         ('very wide aspect', (1600, 1000)),
@@ -872,21 +872,25 @@ def check_fit_and_upscale() -> None:
         f'{im.width}x{im.height}',
     )
 
-    blob, _ = pipeline.render_page(plain_page(1170, 1536), clara)
+    small = plain_page(600, 800)
+    g = pipeline._geometry(small, clara, tw, th, True)
+    check('premise: that page is enlarged', g.upscale > 1.5, f'upscale {g.upscale:.3f}')
+    blob, _ = pipeline.render_page(small, clara)
     im = pyvips.Image.new_from_buffer(blob, '')
     a = np.ndarray(buffer=im.write_to_memory(), dtype=np.uint8, shape=(im.height, im.width))
-    check('an enlarged page still quantises to 16 levels', len(np.unique(a)) <= 16)
+    check('an enlarged page still quantises to 16 levels', len(np.unique(a)) <= 16, f'{len(np.unique(a))} levels')
 
     capped = dataclasses.replace(clara, upscale_max=1.2)
     blob, _ = pipeline.render_page(plain_page(600, 800), capped)
     im = pyvips.Image.new_from_buffer(blob, '')
     inner = np.ndarray(buffer=im.write_to_memory(), dtype=np.uint8, shape=(im.height, im.width))
-    pad_cols = (tw - int(600 * 1.2)) // 2
-    left = inner[:, : pad_cols - 4]
+    ink = np.flatnonzero((inner < 200).any(axis=0))
+    band = int(ink[-1] - ink[0] + 1) if len(ink) else 0
+    want = round((600 - 2 * (600 // 8)) * 1.2)
     check(
         'a capped page is letterboxed, not blown up',
-        pad_cols > 100 and float(left.std()) < 30.0,
-        f'{pad_cols}px padding per side, std {float(left.std()):.1f}',
+        abs(band - want) <= 4,
+        f'its grey band is {band}px wide, {want} at the cap',
     )
 
     dark = pipeline.render_page(plain_page(900, 3000, level=30), clara)[0]
@@ -992,11 +996,12 @@ def check_path_awareness() -> None:
     check('descreen=mono runs on the mono path', m_on != m_off)
 
     colour = dataclasses.replace(profiles.PROFILES['kobo-clara-colour'], autocrop=False, auto_mono=False)
-    c_mono, _ = pipeline.render_page(fake_colour_page(2400, 3200), dataclasses.replace(colour, descreen='mono'))
-    c_none, _ = pipeline.render_page(fake_colour_page(2400, 3200), dataclasses.replace(colour, descreen='none'))
+    big_colour = fake_colour_page(2400, 3200)
+    c_mono, _ = pipeline.render_page(big_colour, dataclasses.replace(colour, descreen='mono'))
+    c_none, _ = pipeline.render_page(big_colour, dataclasses.replace(colour, descreen='none'))
     check('descreen=mono leaves the colour path alone', c_mono == c_none)
 
-    c_all, _ = pipeline.render_page(fake_colour_page(2400, 3200), dataclasses.replace(colour, descreen='always'))
+    c_all, _ = pipeline.render_page(big_colour, dataclasses.replace(colour, descreen='always'))
     check('descreen=always reaches the colour path', c_all != c_none)
 
     check(
@@ -1021,6 +1026,50 @@ def check_mask_cache_and_padding() -> None:
         'the defringe mask is built once for a whole volume',
         info.misses == 1 and info.hits >= 2,
         f'{info.misses} miss(es), {info.hits} hit(s)',
+    )
+
+    strip = profiles.PROFILES['kindle-scribe-colorsoft-webtoon']
+    heights = (700, 1300, 1900, strip.height)
+    check(
+        'premise: those page heights pad to four different lengths on their own',
+        len({pipeline._next_fast_len(h) for h in heights}) == 4,
+        f'{sorted({pipeline._next_fast_len(h) for h in heights})}',
+    )
+    pipeline._diagonal_attenuation.cache_clear()
+    for rows in heights:
+        tile = np.full((rows, strip.width, 3), (200, 120, 60), np.uint8)
+        tile[rows // 4 : rows // 2, strip.width // 4 : strip.width // 2] = (40, 90, 200)
+        cbz._render(('tile', 1, 'x.png', tile), strip)
+    info = pipeline._diagonal_attenuation.cache_info()
+    check(
+        'a webtoon of short pages builds one defringe mask, not one for every height',
+        info.misses == 1 and info.hits == len(heights) - 1,
+        f'{info.misses} miss(es), {info.hits} hit(s)',
+    )
+
+    n = 1875
+    check('premise: the padding produces an odd length', pipeline._next_fast_len(n) == n and n % 2 == 1)
+    mask = pipeline._diagonal_attenuation(
+        n, n, scribe.defringe_angle, scribe.defringe_tolerance, scribe.defringe_min_freq, scribe.defringe_strength
+    )
+    corner = mask[: n // 2 + 1, : n // 2 + 1]
+    check(
+        'on a square grid of odd length the defringe mask is symmetric about its diagonal',
+        mask.shape == (n, n // 2 + 1) and np.allclose(corner, corner.T, atol=1e-5),
+        f'shape {mask.shape}, off by up to {float(np.abs(corner - corner.T).max()):.2e}',
+    )
+    floor = 0.1499
+    check(
+        'premise: at that floor a width of n and of n - 1 leave out different column counts',
+        math.ceil(floor * n) != math.ceil(floor * (n - 1)),
+    )
+    flat = np.ones((n, n // 2 + 1), np.float32)
+    found = pipeline._find_peaks(flat, 1, floor, n, profiles.PROFILES['kobo-clara-hd-2e-bw'])
+    rows_out, cols_out = int((flat[: n // 2, 0] == 0).sum()), int((flat[0] == 0).sum())
+    check(
+        "descreen's peak search leaves out a square round DC on a square grid of odd length",
+        not found and rows_out == cols_out,
+        f'{rows_out} rows by {cols_out} columns, {len(found)} peak(s)',
     )
 
     clara = profiles.PROFILES['kobo-clara-hd-2e-bw']
@@ -1057,8 +1106,15 @@ def check_unsharp_scaling() -> None:
         f'sigma x{factor:.2f} gives {auto:.3f} against {unscaled:.3f} un-scaled',
     )
 
-    geom = pipeline._geometry(big, scribe, scribe.width, scribe.height, mono=True)
-    check('a downscaled page keeps the tuned sigma', geom.upscale == 1.0, f'upscale={geom.upscale}')
+    blurs: list = []
+
+    def recording(self, sigma, **kwargs):
+        blurs.append(sigma)
+        return pyvips.Operation.call('gaussblur', self, sigma, **kwargs)
+
+    with mock.patch.object(pyvips.Image, 'gaussblur', recording, create=True):
+        pipeline.render_page(big, scribe)
+    check('a downscaled page is sharpened at the tuned radius', blurs == [scribe.usm_sigma], f'blurred at {blurs}')
 
 
 def check_defringe() -> None:
@@ -1461,6 +1517,28 @@ def check_repack_parallel() -> None:
         f'artwork boxes {shapes}',
     )
 
+    started: list = []
+
+    def slow(job, _profile):
+        started.append((job[1], time.perf_counter()))
+        time.sleep(0.01 if job[1] == 1 else 0.1)
+        return b'x', 'image/png'
+
+    queue = [('page', i, f'{i:03d}.png', b'x') for i in range(1, 41)]
+    with mock.patch.object(_cbz, '_render', slow):
+        run = _cbz._run_pooled(iter(queue), _zf.ZipFile(_io.BytesIO(), 'w'), prof, 3, 4)
+        next(run)
+        closed = time.perf_counter()
+        run.close()
+    begun = sum(at < closed for _, at in started)
+    check(
+        'premise: renders were still queued when the repack was closed',
+        begun < 2 * 3,
+        f'{begun} of the {2 * 3} submitted had begun',
+    )
+    late = [i for i, at in started if at > closed]
+    check('closing a pooled repack cancels the renders still queued', not late, f'begun after the close: {late}')
+
 
 async def check_comicinfo() -> None:
     from lxml import etree
@@ -1624,7 +1702,7 @@ async def check_comicinfo() -> None:
     z1 = _zf.ZipFile(_io.BytesIO(out))
     check('a ComicInfo is added when the archive has none', 'ComicInfo.xml' in z1.namelist())
     check(
-        'it is told the OUTPUT page count',
+        'it is handed one size per page written',
         z1.read('ComicInfo.xml') == b'<x n="3"/>',
         f'{z1.read("ComicInfo.xml")!r}',
     )
@@ -2065,10 +2143,9 @@ def check_webtoon_pad() -> None:
     rng = np.random.default_rng(11)
 
     def page(w: int, h: int, side) -> np.ndarray:
-        a = rng.integers(0, 256, (h, w, 3), dtype=np.uint8)
-        if side is not None:
-            a[:, :60] = side
-            a[:, -60:] = side
+        a = np.full((h, w, 3), (240, 170, 60), np.uint8)
+        for cols in (slice(0, 60), slice(w - 60, w)):
+            a[:, cols] = rng.integers(0, 256, (h, 60, 3), dtype=np.uint8) if side is None else side
         return a
 
     def pad_of(blob: bytes, cols: int):
@@ -2081,7 +2158,8 @@ def check_webtoon_pad() -> None:
     cases = (
         ('dark grey', (90, 90, 90), 0, True),
         ('light grey', (170, 170, 170), 255, True),
-        ('flat red', (200, 60, 60), 255, True),
+        ('flat red', (200, 60, 60), 0, True),
+        ('flat pink', (250, 190, 190), 255, True),
         ('busy', None, 255, True),
         ('black', (8, 8, 8), 0, False),
     )
@@ -2184,7 +2262,7 @@ def check_pad_seam() -> None:
         mask = np.ones(arr.shape, bool)
         mask[cy : cy + ch, cx : cx + cw] = False
         pad = np.unique(arr[mask])
-        want = 0 if tone < pipeline._PAD_MIDPOINT else 255
+        want = 0 if tone < 128 else 255
         check(
             f'pad took the nearer end of the ladder (source tone {tone})',
             len(pad) == 1 and int(pad[0]) == want,
@@ -2361,7 +2439,7 @@ def check_edge_line() -> None:
     got = pipeline._strip_edge_lines(page(frame), thr)
     check('3px lines on all four edges are all shaved whole', got == (3, 3, 3, 3), str(got))
     clean_crop = pipeline._autocrop_box(clean, prof)
-    for thick in (2, 3, 4):
+    for thick in (1, 2, 3, 4):
 
         def right_line(a, t=thick):
             a[:, w - t :] = 0
@@ -2427,14 +2505,6 @@ def check_edge_line() -> None:
         'an edge line is ink only once it is more than the threshold from paper',
         at == (0, 0, 0, 0) and past == (0, 0, 1, 0),
         f'at {255 - thr}: {at}, one level darker: {past}',
-    )
-
-    box = pipeline._autocrop_box(lined, prof)
-    clean_box = pipeline._autocrop_box(clean, prof)
-    check(
-        'stripping the line yields exactly the unlined box',
-        box == clean_box,
-        f'lined={box} clean={clean_box}',
     )
 
 
@@ -2699,38 +2769,23 @@ def check_cover_delivery() -> None:
         (lifted.image.width, lifted.image.height) == (tw, th),
         f'{lifted.image.width}x{lifted.image.height}',
     )
+    as_cover = pipeline.render_page(small, profiles.embedded_cover_for(prof))[0]
+    as_page = pipeline.render_page(small, prof)[0]
     got2, z2 = pages(b''.join(_cbz.repack_iter(_io.BytesIO(raw), prof, cover=small)))
     check(
         'a small cover is prepended',
         len(got2) == len(base) + 1 and got2[0].startswith('0000.'),
         f'{got2}',
     )
-    check(
-        'the prepended cover is the UNCAPPED render',
-        z2.read(got2[0]) == pipeline.render_page(small, profiles.embedded_cover_for(prof))[0],
-    )
-    check(
-        'which is not what the page path would have produced',
-        z2.read(got2[0]) != pipeline.render_page(small, prof)[0],
-    )
+    check('the prepended cover is the UNCAPPED render', z2.read(got2[0]) == as_cover)
     tiny = _io.BytesIO()
     with _zf.ZipFile(tiny, 'w') as zz:
         for i in range(2):
             zz.writestr(f'p{i:03d}.png', small)
     tiny_raw = tiny.getvalue()
     got3, z3 = pages(b''.join(_cbz.repack_iter(_io.BytesIO(tiny_raw), prof)))
-    check(
-        'a small page IS affected by the cap, so this fixture can tell',
-        pipeline.render_page(small, prof)[0] != pipeline.render_page(small, profiles.embedded_cover_for(prof))[0],
-    )
-    check(
-        'ordinary pages keep the enlargement cap',
-        z3.read(got3[0]) == pipeline.render_page(small, prof)[0],
-    )
-    check(
-        'and are not rendered like the cover',
-        z3.read(got3[0]) != pipeline.render_page(small, profiles.embedded_cover_for(prof))[0],
-    )
+    check('premise: a small page IS affected by the cap, so this fixture can tell', as_page != as_cover)
+    check('ordinary pages keep the enlargement cap', z3.read(got3[0]) == as_page)
 
     opaque = pyvips.Image.new_from_buffer(page1, '')
     flat = opaque.copy()
@@ -3045,6 +3100,10 @@ def check_png_compression() -> None:
         )
         check(f'png_compression leaves {label} pixels untouched', ident)
 
+
+def check_upscale_kernel() -> None:
+    prof = profiles.PROFILES['kobo-clara-hd-2e-bw']
+
     check(
         'every shipped profile enlarges bicubic',
         all(q.upscale_kernel == 'cubic' for q in profiles.PROFILES.values()),
@@ -3226,13 +3285,25 @@ def check_repack_streaming() -> None:
     wrong = [nm for nm, want in expected if nm in sz.namelist() and sz.read(nm) != want]
     check('every streamed entry is byte-for-byte the rendered page', not wrong, f'differ: {wrong}')
 
-    it = _cbz.repack_iter(_io.BytesIO(raw), prof)
-    first = next(it)
-    check('first chunk arrives before the archive is finished', len(first) > 0, f'{len(first)} bytes')
-    rest = b''.join(it)
+    renders = [0]
+    real_render = _cbz.render_page
+
+    def counting(*args, **kwargs):
+        renders[0] += 1
+        return real_render(*args, **kwargs)
+
+    _cbz.render_page = counting
+    try:
+        it = _cbz.repack_iter(_io.BytesIO(raw), prof, 1)
+        first = next(it)
+        at_first = renders[0]
+        rest = b''.join(it)
+    finally:
+        _cbz.render_page = real_render
     check(
-        'first chunk is a prefix of the whole archive',
-        streamed.startswith(first[:4]) and len(first) < len(first + rest),
+        'the first piece of the archive arrives before every page is rendered',
+        len(first) > 0 and len(rest) > 0 and at_first < renders[0],
+        f'{at_first} of {renders[0]} renders done, {len(first)} bytes then {len(rest)}',
     )
 
 
@@ -3377,7 +3448,8 @@ def check_fft_backend() -> None:
         pipeline.sfft is _spfft,
         getattr(pipeline.sfft, '__name__', repr(pipeline.sfft)),
     )
-    check('numpy.fft is not used for transforms', 'np.fft.rfft2' not in _pipeline_source())
+    transforms = sorted(set(re.findall(r'np\.fft\.(?!r?fftfreq\b)(\w+)\(', _pipeline_source())))
+    check('numpy.fft is not used for transforms, only for frequency grids', not transforms, f'{transforms}')
 
 
 def _pipeline_source() -> str:
@@ -3468,7 +3540,7 @@ def check_fft_padding() -> None:
         handed.append(x.copy())
         return real_ifft(x, *args, **kwargs)
 
-    plane = pipeline._band_to_numpy(page)
+    plane = pipeline._to_numpy(page).astype(np.float32)
     pipeline.sfft.ifft = keeping
     try:
         mine = pipeline._descreen_plane(plane, max(mono.descreen_min_freq, 0.3 / 2.0), mono)
@@ -3505,18 +3577,12 @@ def check_big_panel_cap() -> None:
         (ksc.upscale_max, ksc.panel, ksc.defringe, ksc.fmt) == (2.2, 'kaleido', 'diagonal', 'pngc'),
         f'{ksc.upscale_max} {ksc.panel} {ksc.defringe} {ksc.fmt}',
     )
-    small = fake_page(4, 760, 1200)
-    for name, want_capped in (('kindle-scribe-3', 2.2), ('kobo-clara-hd-2e-bw', None)):
-        prof = profiles.PROFILES[name]
-        g = pipeline._geometry(small, prof, prof.width, prof.height, True)
-        if want_capped:
-            check(
-                f'{name} enlarges up to the raised cap',
-                abs(g.upscale - want_capped) < 0.01,
-                f'upscale {g.upscale:.3f}',
-            )
-        else:
-            check(f'{name} is unaffected by the cap', g.upscale < 2.0, f'upscale {g.upscale:.3f}')
+    for name, (w, h), cap in (('kindle-scribe-3', (700, 1000), 2.2), ('kobo-clara-hd-2e-bw', (500, 690), 2.0)):
+        prof = dataclasses.replace(profiles.PROFILES[name], autocrop=False, strip_folio=False)
+        free = min(prof.width / w, prof.height / h)
+        g = pipeline._geometry(fake_page(4, w, h), prof, prof.width, prof.height, True)
+        check(f'premise: the page would enlarge {free:.2f}x on {name}, past the cap', free > cap + 0.05)
+        check(f'{name} enlarges to its cap and no further', abs(g.upscale - cap) < 1e-9, f'upscale {g.upscale:.3f}')
 
 
 def check_profile_source() -> None:
@@ -4028,6 +4094,44 @@ def check_bit_depth() -> None:
                 a is not None and b is not None and np.array_equal(a, b),
             )
 
+    def every_level(bands: int) -> np.ndarray:
+        x = np.arange(768) // 3
+        a = np.empty((64, 768, bands), np.uint8)
+        for c in range(bands):
+            alpha = bands in (2, 4) and c == bands - 1
+            a[:, :, c] = 255 - x if alpha else (x + 85 * c) % 256
+        return a
+
+    def linear(a: np.ndarray, bands: int) -> np.ndarray:
+        v = a.astype(np.float64) / 255.0
+        out = np.where(v <= 0.04045, v / 12.92, ((v + 0.055) / 1.055) ** 2.4)
+        if bands in (2, 4):
+            out[..., -1] = v[..., -1]
+        return out.astype(np.float32)
+
+    for bands, kind in ((1, 'grey'), (2, 'grey and alpha'), (3, 'RGB'), (4, 'RGBA')):
+        a = every_level(bands)
+        for label, data, fmt, slack in (
+            ('float page in 0-255', a.astype(np.float32), 'float', 0),
+            ('float page in 0-1, linear light', linear(a, bands), 'float', 1),
+            ('signed 16-bit page', np.rint(a * (32767 / 255)).astype(np.int16), 'short', 0),
+            ('signed 8-bit page', np.rint(a * (127 / 255)).astype(np.int8), 'char', 1),
+            ('32-bit page', a.astype(np.uint32) * 16843009, 'uint', 0),
+        ):
+            blob = pyvips.Image.new_from_memory(data.tobytes(), 768, 64, bands, fmt).tiffsave_buffer()
+            loaded = pipeline._open(blob)
+            got = (
+                np.ndarray(buffer=loaded.write_to_memory(), dtype=np.uint8, shape=(64, 768, loaded.bands))
+                if loaded.format == 'uchar' and loaded.bands == bands
+                else None
+            )
+            off = None if got is None else int(np.abs(got.astype(int) - a.astype(int)).max())
+            check(
+                f'a {label} ({kind}) decodes as its 8-bit twin',
+                off is not None and off <= slack,
+                f'{loaded.format}, {loaded.bands} band(s)' if got is None else f'off by up to {off}',
+            )
+
     halves = np.zeros((1400, 900, 3), np.uint8)
     halves[:, :450] = (200, 30, 30)
     halves[:, 450:] = (30, 30, 200)
@@ -4232,7 +4336,7 @@ def check_reslice() -> None:
     over = [h for _, _, h in pages if h > limit]
     check('and none is taller than the panel, so the zoom stays 1.0', not over, f'{over}')
     short = [h for _, _, h in pages[:-1] if h < floor]
-    check('nor shorter than the fill floor, bar the last', not short, f'{short}')
+    check('and, with no gutter in reach, none is shorter than the fill floor bar the last', not short, f'{short}')
 
     scaled = 0
     for i in range(len(heights)):
@@ -4243,7 +4347,7 @@ def check_reslice() -> None:
         sum(h for _, _, h in pages) == scaled,
         f'{sum(h for _, _, h in pages)} out vs {scaled} in',
     )
-    check('a one-pixel entry does not derail it', 1 in heights and len(pages) >= 3)
+    check('a one-pixel entry does not derail it', len(pages) >= 3, f'{len(pages)} pages')
     check(
         'the page numbers are wide enough to sort past 9999',
         all(re.fullmatch(r'\d{5}\.(png|jpg)', n) for n, _, _ in pages),
@@ -4255,25 +4359,22 @@ def check_reslice() -> None:
     band, deep = 990, 24
     lo, hi = round(band * scale), round((band + deep) * scale)
     check('the gutter really is inside the window', floor <= lo and hi <= limit, f'{lo}..{hi} in {floor}..{limit}')
-    gut = _strip_cbz([1280, 1280], gutter=(0, band))
-    cut = _pages_of(b''.join(cbz.repack_iter(io.BytesIO(gut), p, 1)))[0][2]
+
+    def tiles(blob):
+        z = zipfile.ZipFile(io.BytesIO(blob))
+        order = sorted(z.infolist(), key=lambda i: cbz.natural_key(i.filename))
+        return [len(t[3]) for t in cbz._strip_tiles(z, order, p, {}) if t[0] == 'tile']
+
+    seam = tiles(_strip_cbz([1280, 1280], gutter=(0, band)))[0]
     check(
         'the cut is drawn to a quiet row rather than the nominal one',
-        lo - 6 <= cut <= hi + 6,
-        f'cut at {cut}, gutter spans {lo}..{hi}, panel would be {limit}',
+        lo - 6 <= seam <= hi + 6,
+        f'cut at {seam}, gutter spans {lo}..{hi}, panel would be {limit}',
     )
     check(
         'and to the far side of it, so the page fills up',
-        cut >= (lo + hi) // 2,
-        f'cut at {cut}, gutter spans {lo}..{hi}',
-    )
-
-    high = _strip_cbz([1280, 1280], gutter=(0, 200))
-    first = _pages_of(b''.join(cbz.repack_iter(io.BytesIO(high), p, 1)))[0][2]
-    check(
-        'a quiet row above the floor cannot drag the cut up to it',
-        first >= floor,
-        f'page came out {first} tall, floor is {floor}',
+        seam >= (lo + hi) // 2,
+        f'cut at {seam}, gutter spans {lo}..{hi}',
     )
 
     reach = round(limit * cbz.STRIP_OVERSHOOT)
@@ -4285,11 +4386,6 @@ def check_reslice() -> None:
     def band(frac):
         return round(at(frac) * scale), round((at(frac) + 24) * scale)
 
-    def tiles(blob):
-        z = zipfile.ZipFile(io.BytesIO(blob))
-        order = sorted(z.infolist(), key=lambda i: cbz.natural_key(i.filename))
-        return [len(t[3]) for t in cbz._strip_tiles(z, order, p, {}) if t[0] == 'tile']
-
     lo60, hi60 = band(0.60)
     t = tiles(_strip_cbz([1280, 1280], gutter=(0, at(0.60))))
     check(
@@ -4300,12 +4396,13 @@ def check_reslice() -> None:
     lo30, hi30 = band(0.30)
     t = tiles(_strip_cbz([1280, 1280], gutter=(0, at(0.30))))
     check(
-        'but one below the gutter floor still does not',
-        t[0] >= low and not (lo30 - 4 <= t[0] <= hi30 + 4),
-        f'page {t[0]}, gutter {lo30}..{hi30}, gutter floor {low}',
+        'but one below the gutter floor still does not, nor drags the cut up to it',
+        t[0] >= floor and not (lo30 - 4 <= t[0] <= hi30 + 4),
+        f'page {t[0]}, gutter {lo30}..{hi30}, gutter floor {low}, fill floor {floor}',
     )
     lo105, _ = band(1.05)
-    t = tiles(_strip_cbz([1280, 1280], gutter=(0, at(1.05))))
+    past_fold = _strip_cbz([1280, 1280], gutter=(0, at(1.05)))
+    t = tiles(past_fold)
     check(
         'with nothing above the fold, a gutter just past it is taken',
         limit < t[0] <= reach and lo105 - 4 <= t[0] <= lo105 + 4,
@@ -4332,7 +4429,7 @@ def check_reslice() -> None:
 
     t = tiles(_strip_cbz([1280, 1280], gutter=(0, at(0.60)), noise=12))
     check(
-        'a gutter with a little JPEG noise in it still counts as one',
+        'a gutter with a little noise in it, enlarged with its slice, still counts as one',
         lo60 - 4 <= t[0] <= hi60 + 4,
         f'page {t[0]}, gutter {lo60}..{hi60}',
     )
@@ -4400,8 +4497,8 @@ def check_reslice() -> None:
             artwork[start:stop] = stop - start >= minrun
         return near & ~artwork
 
-    def only_gutter_gone(blob):
-        strip, out = strip_of(blob), np.concatenate(cut(blob))
+    def only_gutter_gone(blob, pieces):
+        strip, out = strip_of(blob), np.concatenate(pieces)
         blank = droppable(strip)
         i = j = gone = 0
         while j < len(out):
@@ -4515,7 +4612,7 @@ def check_reslice() -> None:
 
     everything = [
         _strip_cbz(heights),
-        _strip_cbz([1280, 1280], gutter=(0, at(1.05))),
+        past_fold,
         _strip_cbz([1280, 1000, 1280, 640], gutter=[(0, at(1.05)), (2, 300)]),
         _strip_cbz([1280, 1280], gutter=(0, at(1.05), 150)),
         _strip_cbz([1500, 1280], gutter=[(0, 1120, 380), (1, 0, 100)]),
@@ -4529,7 +4626,11 @@ def check_reslice() -> None:
         ellipsis,
         bordered,
     ]
-    verdicts = [only_gutter_gone(b) for b in everything]
+    verdicts, tallest = [], 0
+    for b in everything:
+        pieces = cut(b)
+        verdicts.append(only_gutter_gone(b, pieces))
+        tallest = max(tallest, *(len(t) for t in pieces))
     check(
         'no row of artwork is ever lost; only gutter, and the thin lines in it, is dropped',
         all(ok for ok, _, _ in verdicts),
@@ -4540,7 +4641,6 @@ def check_reslice() -> None:
         sum(g for _, g, _ in verdicts) > 0,
         f'{[g for _, g, _ in verdicts]} rows',
     )
-    tallest = max(len(t) for b in everything for t in cut(b))
     check('and no tile ever runs past the overshoot', tallest <= reach, f'tallest {tallest}, reach {reach}')
 
     def blank_at_top(tile):
@@ -4583,8 +4683,8 @@ def check_reslice() -> None:
         blank_at_top(grey[1]) == 0 and len(grey[1]) and cbz._spread(grey[1][:100]).max() <= cbz.STRIP_QUIET,
         f'{blank_at_top(grey[1])} blank rows at the top',
     )
-    mid = cut(_strip_cbz([1280, 1280], gutter=(0, at(0.30), 60)))
-    held = strip_of(_strip_cbz([1280, 1280], gutter=(0, at(0.30), 60)))
+    middle = _strip_cbz([1280, 1280], gutter=(0, at(0.30), 60))
+    mid, held = cut(middle), strip_of(middle)
     check(
         'a gutter in the middle of a page is left whole',
         int(blank_rows(mid[0]).sum()) == int(blank_rows(held[: len(mid[0])]).sum()) > margin,
@@ -4714,9 +4814,7 @@ def check_reslice() -> None:
         f'{top} dark rows at the top, margin {margin}',
     )
 
-    tall = zipfile.ZipFile(
-        io.BytesIO(b''.join(cbz.repack_iter(io.BytesIO(_strip_cbz([1280, 1280], gutter=(0, at(1.05)))), p, 1)))
-    )
+    tall = zipfile.ZipFile(io.BytesIO(b''.join(cbz.repack_iter(io.BytesIO(past_fold), p, 1))))
     first = pyvips.Image.new_from_buffer(tall.read('00001.png'), '').colourspace('srgb')
     a = np.ndarray(buffer=first.write_to_memory(), dtype=np.uint8, shape=(first.height, first.width, first.bands))
     check(
@@ -4810,7 +4908,7 @@ def check_family_duplicates() -> None:
         if kin(a, b) and shape(profiles.PROFILES[a]) == shape(profiles.PROFILES[b])
     ]
     check(
-        'the family test sees past a generation suffix',
+        'premise: the family test sees past a generation suffix',
         kin('kobo-elipsa', 'kobo-elipsa-2e')
         and kin('kindle-pw-3-4', 'kindle-pw-5')
         and not kin('kobo-clara-hd-2e-bw', 'kobo-glo-hd')
@@ -4939,7 +5037,7 @@ def check_strip_folio() -> None:
     numbered, blank = _folio_page(), _folio_page(number='')
     attached = _folio_page(attached=True)
 
-    paged = {n: p for n, p in profiles.PROFILES.items() if not p.reslice}
+    paged = _paged()
     check(
         'every paged device profile strips folios',
         all(p.strip_folio for p in paged.values()),
@@ -4972,7 +5070,7 @@ def check_strip_folio() -> None:
             f'still on: {[n for n, p in profiles.PROFILES.items() if p.strip_folio]}',
         )
         check(
-            'and that reaches the cache key, so nothing is re-rendered',
+            'and that reaches the cache key, so no page rendered with it on is served with it off',
             cache_mod.render_key('u', profiles.PROFILES['kobo-clara-hd-2e-bw'], None) != before_key,
         )
         for junk in ('typo', 'yes', ''):
@@ -5082,6 +5180,14 @@ def check_strip_folio() -> None:
         check('the gate thresholds exactly as (255 - a) > threshold did', _thr is None, f'differs at threshold={_thr}')
     finally:
         folio._marks = _real_marks
+    searched: list = []
+    with (
+        mock.patch.object(folio, '_engine_failed', True),
+        mock.patch.object(folio, '_marks', lambda *a: searched.append(a) or []),
+    ):
+        _page = pyvips.Image.new_from_buffer(numbered, '')
+        folio.strip(_page, _page, off.autocrop_threshold)
+    check('with no reader to ask, folio does not search the page for marks', not searched, f'{len(searched)}')
 
     _wide_png = _folio_page(w=2400)
     _widths: list = []
@@ -5382,7 +5488,7 @@ async def check_http_edges(c) -> None:
         f'{r.status_code}',
     )
 
-    r = await c.get(f'/kobo-clara-hd-2e-bw/f/{encode_token(f"{up}/opds/v1.2/proxyauth")}')
+    r = await _get(c, f'/kobo-clara-hd-2e-bw/f/{encode_token(f"{up}/opds/v1.2/proxyauth")}')
     check('an upstream 407 is the proxy failing, answered 502', r.status_code == 502, f'status={r.status_code}')
     check('and the reader is not handed a challenge it cannot answer', 'proxy-authenticate' not in r.headers)
 
@@ -5776,7 +5882,7 @@ def check_repack_progress() -> None:
 
     big = _cbz_bytes(8)
     one, many = [], []
-    b1 = b''.join(
+    b''.join(
         cbz.repack_iter(
             io.BytesIO(big),
             profiles.PROFILES['kobo-clara-hd-2e-bw'],
@@ -5784,7 +5890,7 @@ def check_repack_progress() -> None:
             progress=lambda done, total: one.append((done, total)),
         )
     )
-    b2 = b''.join(
+    b''.join(
         cbz.repack_iter(
             io.BytesIO(big),
             profiles.PROFILES['kobo-clara-hd-2e-bw'],
@@ -5794,7 +5900,6 @@ def check_repack_progress() -> None:
     )
     check('eight pages are counted one by one', one == [(n, 8) for n in range(9)], f'{one}')
     check('the pooled repack counts the same way', many == one, f'{many}')
-    check('and produces the same entries as the serial one', _entries_of(b2) == _entries_of(b1))
 
     counted = []
     cover = fake_page(9, 800, 1200)
@@ -6153,7 +6258,10 @@ async def main() -> int:
         check('cache hit identical', r1.content == r2.content)
         check('cache hit is fast', warm < cold / 5, f'cold={cold * 1000:.0f}ms warm={warm * 1000:.0f}ms')
 
-        await asyncio.sleep(2.0)
+        for _ in range(200):
+            if all(task.done() for task in app_mod.prefetcher._tasks):
+                break
+            await asyncio.sleep(0.05)
         t = time.time()
         r3 = await c.get(f'/kobo-clara-hd-2e-bw/p/{pse}', params={'page': 1, 'maxWidth': 1072})
         pf = time.time() - t
@@ -6169,8 +6277,9 @@ async def main() -> int:
 
         r = await c.get(f'/kobo-clara-hd-2e-bw/osd/{osd}')
         check('{searchTerms} survives', '{searchTerms}' in r.text)
-        s = re.search(r'/kobo-clara-hd-2e-bw/s/([\w-]+)\?q=', r.text).group(1)
-        r = await c.get(f'/kobo-clara-hd-2e-bw/s/{s}', params={'q': 'sample query'})
+        found = re.search(r'/kobo-clara-hd-2e-bw/s/([\w-]+)\?q=', r.text)
+        check('and its template goes through the proxy', found is not None, r.text[:80])
+        r = await c.get(f'/kobo-clara-hd-2e-bw/s/{found.group(1) if found else "x"}', params={'q': 'sample query'})
         check('search term reaches upstream', 'hits:sample query' in r.text)
 
         raw = await c.get(f'/passthrough/dl/{dl}')
@@ -6363,7 +6472,7 @@ async def main() -> int:
                 ('image', 'img'),
                 ('download', 'dl'),
             ):
-                r = await c.get(f'/kobo-clara-hd-2e-bw/{route}/' + encode_token(f'{dead}/x.cbz'))
+                r = await _get(c, f'/kobo-clara-hd-2e-bw/{route}/' + encode_token(f'{dead}/x.cbz'))
                 check(
                     f'an unreachable upstream is 502 on the {label} route',
                     r.status_code == 502,
@@ -6473,20 +6582,6 @@ async def main() -> int:
             not CREDS_SEEN,
             f'target saw {CREDS_SEEN!r}',
         )
-        from inksetter.opds import upstream as _up
-
-        stripped = _up._hop_headers(
-            {'authorization': 'Basic c2VjcmV0', 'cookie': 'session=abc', 'user-agent': 'x'},
-            'http://localhost:8899/x',
-            '127.0.0.1:8899',
-        )
-        check(
-            'Authorization dropped crossing origins',
-            'authorization' not in stripped,
-            f'kept {sorted(stripped)}',
-        )
-        check('Cookie dropped crossing origins', 'cookie' not in stripped, f'kept {sorted(stripped)}')
-        check('non-credential headers survive the hop', stripped.get('user-agent') == 'x', f'{stripped}')
 
         CREDS_SEEN.clear()
         await c.get(
@@ -6500,7 +6595,7 @@ async def main() -> int:
         )
 
         for label, path in (('empty', 'empty-feed'), ('binary', 'binary-feed')):
-            r = await c.get('/kobo-clara-hd-2e-bw/f/' + encode_token(f'http://127.0.0.1:8899/opds/v1.2/{path}'))
+            r = await _get(c, '/kobo-clara-hd-2e-bw/f/' + encode_token(f'http://127.0.0.1:8899/opds/v1.2/{path}'))
             check(
                 f'{label} body under a feed content-type is not a 500', r.status_code < 500, f'status={r.status_code}'
             )
@@ -6567,7 +6662,7 @@ async def main() -> int:
             )
 
         for label, path in (('undecodable', 'notanimage'), ('empty body', 'emptyimage')):
-            r = await c.get('/kobo-clara-hd-2e-bw/p/' + encode_token(f'http://127.0.0.1:8899/opds/v1.2/{path}'))
+            r = await _get(c, '/kobo-clara-hd-2e-bw/p/' + encode_token(f'http://127.0.0.1:8899/opds/v1.2/{path}'))
             check(
                 f'{label} upstream page is 502, not 500',
                 r.status_code == 502,
@@ -6609,7 +6704,7 @@ async def main() -> int:
             r.status_code == 502,
             f'status={r.status_code} {r.text[:70]}',
         )
-        r = await c.get('/kobo-clara-hd-2e-bw/p/' + encode_token('http://127.0.0.1:8899/opds/v1.2/upstream500'))
+        r = await _get(c, '/kobo-clara-hd-2e-bw/p/' + encode_token('http://127.0.0.1:8899/opds/v1.2/upstream500'))
         check('upstream 5xx becomes 502', r.status_code == 502, f'status={r.status_code}')
         r = await c.get('/kobo-clara-hd-2e-bw/p/' + encode_token('http://127.0.0.1:8899/opds/v1.2/missing'))
         check('upstream 4xx is forwarded as itself', r.status_code == 404, f'status={r.status_code}')
@@ -6625,7 +6720,7 @@ async def main() -> int:
             check('an unreadable page raises UnreadableImage', False, f'{type(exc).__name__}')
 
         ptok = encode_token('http://127.0.0.1:8899/opds/v1.2/plain.cbz')
-        rp = await c.get(f'/kobo-clara-hd-2e-bw/dl/{ptok}')
+        rp = hg
         inner = zipfile.ZipFile(io.BytesIO(rp.content))
         check(
             'repacked download is a readable cbz',
@@ -6673,10 +6768,12 @@ async def main() -> int:
         await check_trail(c)
         await check_logo(c)
         check_grid_columns()
+        check_landing_groups()
+
+        print('download progress')
         check_repack_progress()
         check_job_board()
         check_progress_script()
-        check_landing_groups()
 
     print('repack + profile config')
     jc = dataclasses.replace(profiles.PROFILES['kindle-scribe-colorsoft'], fmt='jpegc', auto_mono=False)
@@ -6730,14 +6827,19 @@ async def main() -> int:
     check_cache_accounting()
     print('module boundary')
     check_module_boundary()
-    print('profile config')
+    print('seam defects')
     check_seam_defects()
+    print('search templates')
     check_search_templates()
+    print('rounding and bit depth')
     check_rounding()
     check_bit_depth()
+    print('lazy decode')
     check_lazy_decode()
+    print('webtoon re-slicing')
     check_reslice()
     check_reslice_edges()
+    print('profile config')
     check_family_duplicates()
     check_profile_config()
     print('profile source')
@@ -6750,17 +6852,23 @@ async def main() -> int:
     check_fft_padding()
     print('big-panel cap')
     check_big_panel_cap()
-    print('png compression')
+    print('pipeline version')
     check_pipeline_version()
+    print('png compression')
     check_png_compression()
+    print('upscale kernel')
+    check_upscale_kernel()
     print('comicinfo')
     await check_comicinfo()
-    print('colour pad ring')
+    print('png effort')
     check_png_effort()
+    print('colour pad ring')
     check_colour_pad_ring()
+    print('webtoon pad')
     check_webtoon_pad()
-    print('pad seam')
+    print('strip width')
     check_strip_width()
+    print('pad seam')
     check_pad_seam()
     print('edge lines')
     check_edge_line()

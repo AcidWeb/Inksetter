@@ -44,8 +44,7 @@ def _suffix_for(blob: bytes, fallback_name: str) -> str:
         return '.jpg'
     if blob.startswith(_PNG_SIG):
         return '.png'
-    dot = fallback_name.rfind('.')
-    return fallback_name[dot:] if dot > 0 else '.jpg'
+    return fallback_name[fallback_name.rfind('.') :]
 
 
 def _entries(zin, infos):
@@ -182,8 +181,6 @@ def _opening(a: np.ndarray, step: int, minrun: int) -> tuple[int, int, bool]:
         if found:
             art = min(int(x[0]) for x in found)
             break
-    if not parts:
-        return 0, 0, False
     stop = done if art is None else art
     gutters = []
     for level in (white[:stop], black[:stop]):
@@ -195,7 +192,7 @@ def _opening(a: np.ndarray, step: int, minrun: int) -> tuple[int, int, bool]:
 
 
 def _strip_tiles(zin, infos, p: Profile, consumed: dict[int, int]):
-    limit = round(p.width * p.aspect)
+    limit = p.height
     reach = round(limit * STRIP_OVERSHOOT)
     margin = round(limit * STRIP_TOP_MARGIN)
     minrun = max(1, round(limit * STRIP_GUTTER_MIN))
@@ -261,7 +258,7 @@ def _tile_image(a: np.ndarray) -> pyvips.Image:
 def _render(job, profile: Profile):
     if job[0] == 'tile':
         tile = job[3]
-        tall = len(tile) > round(profile.width * profile.aspect)
+        tall = len(tile) > profile.height
         return render_page(b'', _refit(profile, 'box' if tall else 'none'), source=_tile_image(tile))
     return render_page(job[3], profile)
 
@@ -274,7 +271,7 @@ def _dimensions(blob: bytes) -> tuple[int, int] | None:
     return im.width, im.height
 
 
-def _emit(zout, job, blob: bytes | None, pad: int = 4) -> tuple[int, int] | None:
+def _emit(zout, job, blob: bytes | None, pad: int) -> tuple[int, int] | None:
     if job[0] == 'copy':
         zout.writestr(job[1], job[2])
         return None
@@ -285,39 +282,38 @@ def _emit(zout, job, blob: bytes | None, pad: int = 4) -> tuple[int, int] | None
     return _dimensions(blob)
 
 
-def _run(jobs, zout, profile: Profile, workers: int, pad: int = 4):
+def _emit_rendered(zout, job, pad: int, render, *args) -> tuple[int, int] | None:
+    try:
+        blob, _ = render(*args)
+    except Exception:
+        log.warning('page %s failed to render; shipping it unchanged', job[2], exc_info=True)
+        blob = None
+    return _emit(zout, job, blob, pad)
+
+
+def _run(jobs, zout, profile: Profile, workers: int, pad: int):
     if workers > 1:
         return _run_pooled(jobs, zout, profile, workers, pad)
     return _run_serial(jobs, zout, profile, pad)
 
 
-def _run_serial(jobs, zout, profile: Profile, pad: int = 4):
+def _run_serial(jobs, zout, profile: Profile, pad: int):
     for job in jobs:
         if job[0] == 'copy':
             yield job, _emit(zout, job, None, pad)
-            continue
-        try:
-            blob, _ = _render(job, profile)
-        except Exception:
-            log.warning('page %s failed to render; shipping it unchanged', job[2], exc_info=True)
-            blob = None
-        yield job, _emit(zout, job, blob, pad)
+        else:
+            yield job, _emit_rendered(zout, job, pad, _render, job, profile)
 
 
-def _run_pooled(jobs, zout, profile: Profile, workers: int, pad: int = 4):
-    window = max(2, workers * 2)
+def _run_pooled(jobs, zout, profile: Profile, workers: int, pad: int):
+    window = workers * 2
     pending: collections.deque = collections.deque()
 
     def flush_one() -> tuple[tuple, tuple[int, int] | None]:
         job, fut = pending.popleft()
         if fut is None:
             return job, _emit(zout, job, None, pad)
-        try:
-            blob, _ = fut.result()
-        except Exception:
-            log.warning('page %s failed to render; shipping it unchanged', job[2], exc_info=True)
-            blob = None
-        return job, _emit(zout, job, blob, pad)
+        return job, _emit_rendered(zout, job, pad, fut.result)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers, thread_name_prefix='repack') as pool:
         try:
@@ -329,9 +325,7 @@ def _run_pooled(jobs, zout, profile: Profile, workers: int, pad: int = 4):
             while pending:
                 yield flush_one()
         except BaseException:
-            for _, fut in pending:
-                if fut is not None:
-                    fut.cancel()
+            pool.shutdown(cancel_futures=True)
             raise
 
 
@@ -392,7 +386,7 @@ def repack_iter(
     strip = profile.reslice
     pad = STRIP_PAD if strip else 4
     if strip:
-        log.info('repack: re-cutting the strip into %d px pages', round(profile.width * profile.aspect))
+        log.info('repack: re-cutting the strip into %d px pages', profile.height)
 
     total_pages = images + (lead is not None)
 

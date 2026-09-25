@@ -443,13 +443,9 @@ def _is_feed_body(body) -> bool:
     return rewrite.is_json(head) and rewrite.looks_like_feed(_head_of(body, 32 << 20))
 
 
-def _is_comic_zip(url: str, ctype: str, body) -> bool:
+def _is_comic_zip(ctype: str, body) -> bool:
     head = _head_of(body)
-    if _is_epub(ctype, head):
-        return False
-    if head[:4] in _ZIP_MAGIC:
-        return True
-    return not head and (url.lower().endswith(('.cbz', '.zip')) or 'zip' in ctype)
+    return not _is_epub(ctype, head) and head[:4] in _ZIP_MAGIC
 
 
 def _probably_zip(url: str, ctype: str) -> bool:
@@ -484,7 +480,7 @@ async def _repack_over_ranges(url: str, cover_url: str | None, p: Profile, reque
         return None
     try:
         ctype = reader.headers.get('content-type', 'application/octet-stream')
-        if not await asyncio.to_thread(_is_comic_zip, url, ctype, reader):
+        if not await asyncio.to_thread(_is_comic_zip, ctype, reader):
             await asyncio.to_thread(reader.close)
             return None
         return await _repack(reader, url, cover_url, p, request, job, reader.headers)
@@ -565,7 +561,7 @@ async def _deliver(p: Profile, url: str, cover_url: str | None, request: Request
     ctype = resp.headers.get('content-type', 'application/octet-stream')
     out_headers = {k: v for k, v in resp.headers.items() if k.lower() in FORWARD_RESPONSE}
 
-    if p.fmt != 'raw' and _is_comic_zip(url, ctype, body):
+    if p.fmt != 'raw' and _is_comic_zip(ctype, body):
         try:
             body.seek(0)
             return await _repack(body, url, cover_url, p, request, job, out_headers)

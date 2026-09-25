@@ -5,6 +5,7 @@ Upstream fetching.
 import re
 import httpx
 import asyncio
+import contextlib
 import collections
 from urllib.parse import urlsplit
 
@@ -91,10 +92,17 @@ def _redirect_target(url: str, resp: httpx.Response) -> str | None:
     return str(httpx.URL(url).join(location))
 
 
-def _hop_headers(headers: dict[str, str], url: str, origin: str) -> dict[str, str]:
-    if host_key(url) == origin:
-        return headers
-    return {k: v for k, v in headers.items() if k.lower() not in CREDENTIAL_REQUEST}
+@contextlib.contextmanager
+def _answer(client: httpx.Client, url: str, headers: dict[str, str]):
+    for _ in range(MAX_REDIRECTS + 1):
+        check_host(url)
+        with client.stream('GET', url, headers=headers) as resp:
+            target = _redirect_target(url, resp)
+            if target is None:
+                yield url, resp
+                return
+        url = target
+    raise UpstreamError(502, f'more than {MAX_REDIRECTS} redirects')
 
 
 def request_headers(incoming, *, forward_accept: bool = False, accept: str = '*/*') -> dict[str, str]:
@@ -131,52 +139,45 @@ class Client:
             raise RuntimeError('client not started')
         return self._client
 
-    async def get(self, url: str, headers: dict[str, str]) -> httpx.Response:
-        origin = host_key(url)
+    @contextlib.asynccontextmanager
+    async def _answer(self, url: str, headers: dict[str, str]):
         try:
             for _ in range(MAX_REDIRECTS + 1):
                 check_host(url)
-                resp = await self.raw.get(url, headers=_hop_headers(headers, url, origin))
-                target = _redirect_target(url, resp)
-                if target is None:
-                    if resp.status_code >= 400:
-                        raise _status_error(resp.status_code, resp.headers)
-                    return resp
+                async with self.raw.stream('GET', url, headers=headers) as resp:
+                    target = _redirect_target(url, resp)
+                    if target is None:
+                        if resp.status_code >= 400:
+                            raise _status_error(resp.status_code, resp.headers)
+                        yield resp
+                        return
                 url = target
         except (httpx.HTTPError, httpx.InvalidURL) as exc:
             raise _upstream_failure(exc) from exc
         raise UpstreamError(502, f'more than {MAX_REDIRECTS} redirects')
 
+    async def get(self, url: str, headers: dict[str, str]) -> httpx.Response:
+        async with self._answer(url, headers) as resp:
+            await resp.aread()
+        return resp
+
     async def stream(self, url: str, headers: dict[str, str], sink=None) -> httpx.Response:
-        origin = host_key(url)
-        try:
-            for _ in range(MAX_REDIRECTS + 1):
-                check_host(url)
-                async with self.raw.stream('GET', url, headers=_hop_headers(headers, url, origin)) as resp:
-                    target = _redirect_target(url, resp)
-                    if target is None:
-                        if resp.status_code >= 400:
-                            raise _status_error(resp.status_code, resp.headers)
-                        if sink is not None:
-                            async for chunk in resp.aiter_bytes(1 << 20):
-                                await asyncio.to_thread(sink.write, chunk)
-                        return resp
-                url = target
-        except httpx.HTTPError as exc:
-            raise _upstream_failure(exc) from exc
-        raise UpstreamError(502, f'more than {MAX_REDIRECTS} redirects')
+        async with self._answer(url, headers) as resp:
+            if sink is not None:
+                async for chunk in resp.aiter_bytes(1 << 20):
+                    await asyncio.to_thread(sink.write, chunk)
+        return resp
 
 
 client = Client()
 
 
 class RangeReader:
-    def __init__(self, url, headers, client, size, origin, resp_headers):
+    def __init__(self, url, headers, client, size, resp_headers):
         self._url = url
         self._headers = headers
         self._client = client
         self._size = size
-        self._origin = origin
         self.headers = resp_headers
         self._pos = 0
         self._blocks: collections.OrderedDict = collections.OrderedDict()
@@ -245,27 +246,14 @@ class RangeReader:
         return block
 
     def _fetch(self, first: int, last: int) -> bytes:
-        url = self._url
+        headers = {**self._headers, 'range': f'bytes={first}-{last}', 'accept-encoding': 'identity'}
         try:
-            return self._fetch_inner(url, first, last)
+            with _answer(self._client, self._url, headers) as (_, resp):
+                if resp.status_code != 206:
+                    raise UpstreamError(502, f'range request answered {resp.status_code}')
+                return resp.read()
         except httpx.HTTPError as exc:
             raise _upstream_failure(exc) from exc
-
-    def _fetch_inner(self, url: str, first: int, last: int) -> bytes:
-        for _ in range(MAX_REDIRECTS + 1):
-            check_host(url)
-            headers = dict(_hop_headers(self._headers, url, self._origin))
-            headers['range'] = f'bytes={first}-{last}'
-            headers['accept-encoding'] = 'identity'
-            with self._client.stream('GET', url, headers=headers) as resp:
-                target = _redirect_target(url, resp)
-                if target is None:
-                    if resp.status_code != 206:
-                        raise UpstreamError(502, f'range request answered {resp.status_code}')
-                    resp.read()
-                    return resp.content
-            url = target
-        raise UpstreamError(502, f'more than {MAX_REDIRECTS} redirects')
 
 
 def open_range(url: str, headers: dict[str, str]) -> RangeReader | None:
@@ -278,35 +266,14 @@ def open_range(url: str, headers: dict[str, str]) -> RangeReader | None:
     except Exception:
         return None
     try:
-        origin = host_key(url)
-        target = url
-        status, resp_headers = None, None
-        for _ in range(MAX_REDIRECTS + 1):
-            check_host(target)
-            probe = dict(_hop_headers(headers, target, origin))
-            probe['range'] = 'bytes=0-0'
-            probe['accept-encoding'] = 'identity'
-            with client.stream('GET', target, headers=probe) as resp:
-                nxt = _redirect_target(target, resp)
-                if nxt is None:
-                    status, resp_headers = resp.status_code, resp.headers
-                    break
-            target = nxt
-        else:
-            client.close()
-            return None
-        if status != 206:
-            client.close()
-            return None
-        match = _CONTENT_RANGE.search(resp_headers.get('content-range', ''))
-        if not match:
-            client.close()
-            return None
-        size = int(match.group(1))
-        if size <= 0:
-            client.close()
-            return None
-        return RangeReader(target, headers, client, size, origin, resp_headers)
+        probe = {**headers, 'range': 'bytes=0-0', 'accept-encoding': 'identity'}
+        with _answer(client, url, probe) as (target, resp):
+            ranged = resp.status_code == 206
+        match = _CONTENT_RANGE.search(resp.headers.get('content-range', '')) if ranged else None
+        size = int(match.group(1)) if match else 0
+        if size > 0:
+            return RangeReader(target, headers, client, size, resp.headers)
     except Exception:
-        client.close()
-        return None
+        pass
+    client.close()
+    return None

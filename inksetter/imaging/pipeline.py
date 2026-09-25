@@ -88,15 +88,13 @@ def _bayer_cells(h: int, w: int) -> np.ndarray:
     return (cell * 256).astype(np.int16)
 
 
+_LEVEL_LUT = np.clip(np.rint(np.arange(256, dtype=np.float32) / 17.0), 0, 15).astype(np.uint8)
+
+
 def _quantise16(a: np.ndarray, dither: str) -> np.ndarray:
-    if dither == 'bayer' and a.dtype == np.uint8:
-        return _BAYER_LUT[_bayer_cells(*a.shape) + a]
-    x = a.astype(np.float32)
     if dither == 'bayer':
-        h, w = a.shape
-        t = np.tile(_BAYER, (-(-h // _BAYER_N), -(-w // _BAYER_N)))[:h, :w]
-        x = x + (t - 0.5) * 17.0
-    return np.clip(np.rint(x / 17.0), 0, 15).astype(np.uint8)
+        return _BAYER_LUT[_bayer_cells(*a.shape) + a]
+    return _LEVEL_LUT[a]
 
 
 # --------------------------------------------------------------------------
@@ -121,10 +119,6 @@ def _eight_bit(im: pyvips.Image) -> pyvips.Image:
     if im.format == 'uchar' and im.interpretation != 'cmyk':
         return im
     return im.colourspace('srgb')
-
-
-def _band_to_numpy(im: pyvips.Image) -> np.ndarray:
-    return np.ndarray(buffer=im.write_to_memory(), dtype=np.uint8, shape=(im.height, im.width)).astype(np.float32)
 
 
 def _find_peaks(mag: np.ndarray, pixels: int, floor_freq: float, p: Profile) -> list[tuple[int, int]]:
@@ -196,7 +190,7 @@ def _descreen_plane(a: np.ndarray, floor_freq: float, p: Profile) -> np.ndarray 
     return out[:h, :w]
 
 
-def descreen(im: pyvips.Image, p: Profile, scale: float = 1.0) -> pyvips.Image:
+def descreen(im: pyvips.Image, p: Profile, scale: float) -> pyvips.Image:
     if im.width * im.height > p.descreen_max_megapixels * 1_000_000:
         log.debug(
             '    descreen skipped: %.2f Mpx over the %.0f Mpx ceiling',
@@ -211,8 +205,7 @@ def descreen(im: pyvips.Image, p: Profile, scale: float = 1.0) -> pyvips.Image:
         return im
     try:
         with _FFT_SLOTS:
-            luma = im if im.bands == 1 else im.colourspace('b-w')
-            plane = _band_to_numpy(luma)
+            plane = _to_numpy(im if im.bands == 1 else im.colourspace('b-w')).astype(np.float32)
             filtered = _descreen_plane(plane, floor_freq, p)
             if filtered is None:
                 log.debug('    descreen found no periodic peak worth notching')
@@ -286,9 +279,6 @@ def _diagonal_attenuation(
 
 def defringe(plane: pyvips.Image, p: Profile, top: float = 100.0) -> pyvips.Image:
     if p.defringe != 'diagonal':
-        return plane
-    if plane.width * plane.height > p.descreen_max_megapixels * 1_000_000:
-        log.debug('    defringe skipped: %.2f Mpx over the ceiling', plane.width * plane.height / 1e6)
         return plane
     try:
         with _FFT_SLOTS:
@@ -551,18 +541,22 @@ def _geometry(buf: bytes, p: Profile, tw: int, th: int, mono: bool, page: pyvips
 
 _PAD_MIDPOINT = 128.0
 _PAD_FLAT_IQR = 17.0
+_BORDER = 2
 
 
-def _side_stats(im: pyvips.Image) -> tuple[tuple[float, float], ...]:
-    d = 2
-    parts = (
+def _sides(im: pyvips.Image) -> tuple[pyvips.Image, ...]:
+    d = _BORDER
+    return (
         im.crop(0, 0, min(d, im.width), im.height),
         im.crop(max(0, im.width - d), 0, min(d, im.width), im.height),
         im.crop(0, 0, im.width, min(d, im.height)),
         im.crop(0, max(0, im.height - d), im.width, min(d, im.height)),
     )
+
+
+def _side_stats(im: pyvips.Image) -> tuple[tuple[float, float], ...]:
     out = []
-    for part in parts:
+    for part in _sides(im):
         v = _band_stack(part)
         q1, med, q3 = np.percentile(v, (25, 50, 75))
         out.append((float(med), float(q3 - q1)))
@@ -587,14 +581,7 @@ def _mono_pad_level(im: pyvips.Image, horizontal: bool, vertical: bool) -> float
 
 
 def _border_background(im: pyvips.Image) -> list[float]:
-    frame = np.concatenate(
-        [
-            _band_stack(im.crop(0, 0, im.width, min(2, im.height))),
-            _band_stack(im.crop(0, max(0, im.height - 2), im.width, min(2, im.height))),
-            _band_stack(im.crop(0, 0, min(2, im.width), im.height)),
-            _band_stack(im.crop(max(0, im.width - 2), 0, min(2, im.width), im.height)),
-        ]
-    )
+    frame = np.concatenate([_band_stack(part) for part in _sides(im)])
     return [float(v) for v in np.median(frame, axis=0)]
 
 
@@ -604,8 +591,6 @@ def _band_stack(part: pyvips.Image) -> np.ndarray:
 
 
 def _pad_to_box(im: pyvips.Image, tw: int, th: int, level: float | None = None) -> pyvips.Image:
-    if im.width > tw or im.height > th:
-        return im
     if level is not None:
         background = [level] * im.bands
     else:
