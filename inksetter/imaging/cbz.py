@@ -4,16 +4,13 @@ CBZ repacking for the download path.
 
 import re
 import time
-import numpy as np
 import pyvips
 import logging
 import zipfile
-import functools
-import dataclasses
 import collections
 import concurrent.futures
 
-from . import pipeline
+from . import webtoon
 from .pipeline import render_page, same_picture
 from .profiles import Profile, embedded_cover_for
 from .. import cores
@@ -57,209 +54,9 @@ def _entries(zin, infos):
         yield ('page', index, info.filename, zin.read(info))
 
 
-STRIP_GUTTER_FLOOR = 0.50
-STRIP_OVERSHOOT = 2.00
-STRIP_MIN_FILL = 0.85
-STRIP_QUIET = 15
-STRIP_FAINT = 48
-STRIP_GUTTER_MIN = 0.01
-STRIP_TOP_MARGIN = 0.02
-STRIP_GUTTER_WHITE = 235
-STRIP_GUTTER_BLACK = 30
-STRIP_EDGE = 0.005
-STRIP_HARD = 128
-STRIP_HARD_SPAN = 3
-STRIP_PAD = 5
-
-
-def _strip_rows(blob: bytes, p: Profile) -> np.ndarray | None:
-    try:
-        im = pipeline.open_image(blob).autorot()
-        if im.hasalpha():
-            im = im.flatten(background=255)
-        im = pipeline.fit_to_width(im, p.width, p)
-        if im.bands == 1:
-            im = im.colourspace('srgb')
-        elif im.bands > 3:
-            im = im.extract_band(0, n=3)
-        a = np.ndarray(buffer=im.write_to_memory(), dtype=np.uint8, shape=(im.height, im.width, im.bands))
-    except Exception:
-        log.warning('strip: an entry would not decode; it is left out of the page', exc_info=True)
-        return None
-    return a if a.size else None
-
-
-def _inner(rows: np.ndarray) -> np.ndarray:
-    edge = round(rows.shape[1] * STRIP_EDGE)
-    return rows[:, edge : rows.shape[1] - edge] if edge else rows
-
-
-def _spread(rows: np.ndarray) -> np.ndarray:
-    rows = _inner(rows)
-    return rows.max(axis=(1, 2)).astype(np.int16) - rows.min(axis=(1, 2))
-
-
-def _classes(rows: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    rows = _inner(rows)
-    lo, hi = rows.min(axis=(1, 2)), rows.max(axis=(1, 2))
-    spread = hi.astype(np.int16) - lo
-    quiet = spread <= STRIP_QUIET
-    return spread, quiet & (lo >= STRIP_GUTTER_WHITE), quiet & (hi <= STRIP_GUTTER_BLACK)
-
-
-def _long_runs(mask: np.ndarray, at_least: int) -> np.ndarray:
-    edges = np.flatnonzero(np.diff(np.concatenate([[0], mask.astype(np.int8), [0]])))
-    out = np.zeros(len(mask), bool)
-    for start, stop in zip(edges[::2], edges[1::2], strict=True):
-        if stop - start >= at_least:
-            out[start:stop] = True
-    return out
-
-
-def _proper(white: np.ndarray, black: np.ndarray, minrun: int) -> np.ndarray:
-    return _long_runs(white, minrun) | _long_runs(black, minrun)
-
-
-def _busy(rows: np.ndarray, reach: int) -> np.ndarray:
-    y = _inner(rows).astype(np.float32) @ np.array([0.299, 0.587, 0.114], np.float32)
-    hard = (np.abs(y[:, STRIP_HARD_SPAN:] - y[:, :-STRIP_HARD_SPAN]) >= STRIP_HARD).mean(axis=1)
-    detail = np.abs(np.diff(y, axis=1)).mean(axis=1)
-    total = np.concatenate([[0.0], np.cumsum(hard + detail * 1e-4)])
-    i = np.arange(len(hard))
-    lo, hi = np.maximum(i - reach, 0), np.minimum(i + reach + 1, len(hard))
-    return (total[hi] - total[lo]) / (hi - lo)
-
-
-def _run_at(mask: np.ndarray, i: int) -> tuple[int, int]:
-    before, after = mask[i::-1], mask[i:]
-    start = 0 if before.all() else i - int(np.argmin(before)) + 1
-    end = len(mask) if after.all() else i + int(np.argmin(after))
-    return start, end
-
-
-def _seam(block: np.ndarray, limit: int) -> int:
-    lo = max(1, int(limit * STRIP_GUTTER_FLOOR))
-    minrun = max(1, round(limit * STRIP_GUTTER_MIN))
-    head = block[: round(limit * STRIP_OVERSHOOT)]
-    whole = _spread(head)
-    runs = _long_runs(whole <= STRIP_QUIET, minrun)
-    quiet = runs[lo:]
-    up = np.flatnonzero(quiet[: limit - lo])
-    if len(up):
-        at = lo + int(up[-1])
-        start, end = _run_at(runs, at)
-        first = max(start, lo)
-        _, white, black = _classes(head[start:end])
-        proper = np.flatnonzero(_proper(white, black, minrun)[first - start : at - start + 1])
-        return first + int(proper[-1]) if len(proper) else at
-    down = np.flatnonzero(quiet[limit - lo :])
-    if len(down):
-        at = limit + int(down[0])
-        _, white, black = _classes(head[at : _run_at(runs, at)[1]])
-        for inside in (np.flatnonzero(_proper(white, black, minrun)), np.flatnonzero(white | black)):
-            if len(inside):
-                return at + int(inside[0])
-        return at
-    floor = max(lo, int(limit * STRIP_MIN_FILL))
-    start = max(0, floor - minrun)
-    busy = _busy(head[start : limit + minrun], minrun)[floor - start : limit - start]
-    return floor + len(busy) - 1 - int(np.argmin(busy[::-1]))
-
-
-def _opening(a: np.ndarray, step: int, minrun: int) -> tuple[int, int, bool]:
-    parts = []
-    art = None
-    done = 0
-    while done < len(a):
-        chunk = a[done : done + step]
-        parts.append(_classes(chunk))
-        done += len(chunk)
-        spread, white, black = (np.concatenate(x) for x in zip(*parts, strict=True))
-        ink = spread > STRIP_FAINT
-        soft = _long_runs(~ink & ~white & ~black, minrun)
-        found = [x for x in (np.flatnonzero(ink), np.flatnonzero(soft)) if len(x)]
-        if found:
-            art = min(int(x[0]) for x in found)
-            break
-    stop = done if art is None else art
-    gutters = []
-    for level in (white[:stop], black[:stop]):
-        runs = np.flatnonzero(_long_runs(level, minrun))
-        if len(runs):
-            gutters.append(_run_at(level, int(runs[-1])))
-    start, end = max(gutters, key=lambda r: r[1], default=(0, 0))
-    return start, end, art is not None
-
-
-def _strip_tiles(zin, infos, p: Profile, consumed: dict[int, int]):
-    limit = p.height
-    reach = round(limit * STRIP_OVERSHOOT)
-    margin = round(limit * STRIP_TOP_MARGIN)
-    minrun = max(1, round(limit * STRIP_GUTTER_MIN))
-    held: list[np.ndarray] = []
-    rows = index = seen = 0
-    opening = True
-    lead = None
-
-    def take(a: np.ndarray) -> None:
-        nonlocal rows, opening, lead
-        if opening:
-            if lead is not None:
-                a, lead = np.concatenate([lead, a]), None
-            start, end, art = _opening(a, limit, minrun)
-            a = a[max(start, end - margin) :]
-            if not art:
-                lead = a
-                return
-            opening = False
-        held.append(a)
-        rows += len(a)
-
-    def cut_one(name: str):
-        nonlocal held, rows, index, opening
-        block = held[0] if len(held) == 1 else np.concatenate(held)
-        at = _seam(block, limit) if len(block) > limit else len(block)
-        index += 1
-        consumed[index] = seen
-        tile = block[:at].copy()
-        held, rows, opening = [], 0, True
-        if at < len(block):
-            take(block[at:])
-        return ('tile', index, name, tile)
-
-    last = ''
-    for info in infos:
-        name = info.filename
-        if not is_image(name):
-            yield ('copy', name, zin.read(info))
-            continue
-        seen += 1
-        last = name
-        a = _strip_rows(zin.read(info), p)
-        if a is not None:
-            take(a)
-            while rows > reach:
-                yield cut_one(name)
-    while rows > limit:
-        yield cut_one(last)
-    if rows:
-        yield cut_one(last)
-
-
-@functools.lru_cache(maxsize=16)
-def _refit(p: Profile, fit: str) -> Profile:
-    return dataclasses.replace(p, fit=fit, rotate_wide=False, autocrop=False, strip_folio=False)
-
-
-def _tile_image(a: np.ndarray) -> pyvips.Image:
-    return pyvips.Image.new_from_memory(a.tobytes(), a.shape[1], a.shape[0], a.shape[2], 'uchar')
-
-
 def _render(job, profile: Profile):
     if job[0] == 'tile':
-        tile = job[3]
-        tall = len(tile) > profile.height
-        return render_page(b'', _refit(profile, 'box' if tall else 'none'), source=_tile_image(tile))
+        return webtoon.render_tile(job, profile)
     return render_page(job[3], profile)
 
 
@@ -275,9 +72,9 @@ def _emit(zout, job, blob: bytes | None, pad: int) -> tuple[int, int] | None:
     if job[0] == 'copy':
         zout.writestr(job[1], job[2])
         return None
-    _, index, name, piece = job
+    index, name, piece = job[1:4]
     if blob is None:
-        blob = piece if job[0] == 'page' else _tile_image(piece).pngsave_buffer()
+        blob = piece if job[0] == 'page' else webtoon.tile_image(piece).pngsave_buffer()
     zout.writestr(f'{index:0{pad}d}{_suffix_for(blob, name)}', blob)
     return _dimensions(blob)
 
@@ -384,7 +181,7 @@ def repack_iter(
         comicinfo = None
 
     strip = profile.reslice
-    pad = STRIP_PAD if strip else 4
+    pad = webtoon.STRIP_PAD if strip else 4
     if strip:
         log.info('repack: re-cutting the strip into %d px pages', profile.height)
 
@@ -419,7 +216,7 @@ def repack_iter(
                     tell(pages)
 
                 consumed: dict[int, int] = {}
-                jobs = _strip_tiles(zin, infos, profile, consumed) if strip else _entries(zin, infos)
+                jobs = webtoon.strip_tiles(_entries(zin, infos), profile, consumed) if strip else _entries(zin, infos)
                 for job, size in _run(jobs, zout, profile, workers, pad):
                     written += 1
                     if job[0] != 'copy':

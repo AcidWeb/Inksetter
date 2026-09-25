@@ -301,7 +301,7 @@ def _diagonal_attenuation(
     return (1.0 - high).astype(np.float32)
 
 
-def defringe(plane: pyvips.Image, p: Profile, top: float = 100.0, height: int = 0) -> pyvips.Image:
+def defringe(plane: pyvips.Image, p: Profile, top: float = 100.0) -> pyvips.Image:
     if p.defringe != 'diagonal':
         return plane
     try:
@@ -312,7 +312,7 @@ def defringe(plane: pyvips.Image, p: Profile, top: float = 100.0, height: int = 
                 shape=(plane.height, plane.width),
             )
             h, w = a.shape
-            ph, pw = _next_fast_len(max(h, height)), _next_fast_len(w)
+            ph, pw = _next_fast_len(h), _next_fast_len(w)
             src = a if (ph, pw) == (h, w) else np.pad(a, ((0, ph - h), (0, pw - w)), mode='edge')
             spectrum = sfft.rfft2(src)
             atten = _diagonal_attenuation(
@@ -490,7 +490,15 @@ class _Geom(NamedTuple):
     pad: float | None = None
 
 
-def _geometry(buf: bytes, p: Profile, tw: int, th: int, mono: bool, page: pyvips.Image | None = None) -> _Geom:
+def _geometry(
+    buf: bytes,
+    p: Profile,
+    tw: int,
+    th: int,
+    mono: bool,
+    page: pyvips.Image | None = None,
+    pad_level: float | None = None,
+) -> _Geom:
     chatty = log.isEnabledFor(logging.DEBUG)
     mark = time.perf_counter() if chatty else 0.0
 
@@ -554,11 +562,16 @@ def _geometry(buf: bytes, p: Profile, tw: int, th: int, mono: bool, page: pyvips
 
     content = (0, 0, im.width, im.height)
     pad = None
-    if p.fit == 'box' and (im.width < tw or im.height < th):
-        x, y = (tw - im.width) // 2, (th - im.height) // 2
+    if p.fit != 'none' and (im.width < tw or im.height < th):
+        y = {'top': 0, 'bottom': th - im.height}.get(p.fit, (th - im.height) // 2)
+        x = (tw - im.width) // 2
         content = (x, y, im.width, im.height)
-        pad = _mono_pad_level(im, im.width < tw, im.height < th) if mono or p.colour_pad == 'mono' else None
-        im = _pad_to_box(im, tw, th, pad)
+        if pad_level is not None:
+            pad = pad_level
+        elif mono or p.colour_pad == 'mono':
+            short = im.height < th
+            pad = _mono_pad_level(im, im.width < tw, short and p.fit != 'top', short and p.fit != 'bottom')
+        im = _pad_to_box(im, tw, th, x, y, pad)
         if chatty:
             step('pad', f'content {content}, level {pad}')
     return _Geom(im, content, upscale, pad)
@@ -592,16 +605,18 @@ def _side_stats(im: pyvips.Image) -> tuple[tuple[float, float], ...]:
     return tuple(out)
 
 
-def _mono_pad_level(im: pyvips.Image, horizontal: bool, vertical: bool) -> float:
+def _mono_pad_level(im: pyvips.Image, horizontal: bool, top: bool, bottom: bool) -> float:
     try:
-        left, right, top, bottom = _side_stats(im if im.bands == 1 else im.colourspace('b-w'))
+        left, right, upper, lower = _side_stats(im if im.bands == 1 else im.colourspace('b-w'))
     except pyvips.Error, ValueError:
         return 255.0
     sides = []
     if horizontal:
         sides += [left, right]
-    if vertical:
-        sides += [top, bottom]
+    if top:
+        sides.append(upper)
+    if bottom:
+        sides.append(lower)
     flat = [med for med, iqr in sides if iqr <= _PAD_FLAT_IQR]
     if not flat:
         return 255.0
@@ -619,7 +634,7 @@ def _band_stack(part: pyvips.Image) -> np.ndarray:
     return buf.reshape(-1, part.bands)
 
 
-def _pad_to_box(im: pyvips.Image, tw: int, th: int, level: float | None = None) -> pyvips.Image:
+def _pad_to_box(im: pyvips.Image, tw: int, th: int, x: int, y: int, level: float | None = None) -> pyvips.Image:
     if level is not None:
         background = [level] * im.bands
     else:
@@ -627,14 +642,7 @@ def _pad_to_box(im: pyvips.Image, tw: int, th: int, level: float | None = None) 
             background = _border_background(im)
         except pyvips.Error, ValueError:
             background = [255.0] * im.bands
-    return im.embed(
-        (tw - im.width) // 2,
-        (th - im.height) // 2,
-        tw,
-        th,
-        extend='background',
-        background=background,
-    )
+    return im.embed(x, y, tw, th, extend='background', background=background)
 
 
 def _tone(chan: pyvips.Image, p: Profile, top: float) -> pyvips.Image:
@@ -670,15 +678,21 @@ def _flatten_pad(a: np.ndarray, content: tuple[int, int, int, int], level: float
 
 
 def _render_mono(
-    buf: bytes, p: Profile, tw: int, th: int, fmt: str, page: pyvips.Image | None = None
+    buf: bytes,
+    p: Profile,
+    tw: int,
+    th: int,
+    fmt: str,
+    page: pyvips.Image | None = None,
+    pad_level: float | None = None,
 ) -> tuple[bytes, str]:
-    geom = _geometry(buf, p, tw, th, mono=True, page=page)
+    geom = _geometry(buf, p, tw, th, mono=True, page=page, pad_level=pad_level)
     g = geom.image
     if g.bands > 1:
         g = g.colourspace('b-w')
     toned = g.maplut(_tone_lut(p)) if g.format == 'uchar' else _tone(g.cast('float'), p, 255.0)
     g = _unsharp(toned, p, geom.upscale)
-    g = defringe(g, p, 255.0, th).rint().cast('uchar')
+    g = defringe(g, p, 255.0).rint().cast('uchar')
 
     if fmt == 'jpeg':
         return (
@@ -695,8 +709,15 @@ def _render_mono(
     return q.pngsave_buffer(bitdepth=4, compression=p.png_compression, strip=True), 'image/png'
 
 
-def _render_colour(buf: bytes, p: Profile, tw: int, th: int, page: pyvips.Image | None = None) -> tuple[bytes, str]:
-    geom = _geometry(buf, p, tw, th, mono=False, page=page)
+def _render_colour(
+    buf: bytes,
+    p: Profile,
+    tw: int,
+    th: int,
+    page: pyvips.Image | None = None,
+    pad_level: float | None = None,
+) -> tuple[bytes, str]:
+    geom = _geometry(buf, p, tw, th, mono=False, page=page, pad_level=pad_level)
     im = geom.image
     if im.bands == 1:
         im = im.colourspace('srgb')
@@ -713,7 +734,7 @@ def _render_colour(buf: bytes, p: Profile, tw: int, th: int, page: pyvips.Image 
         a, b = a.gaussblur(sigma), b.gaussblur(sigma)
 
     L = _unsharp(_tone(L, p, 100.0), p, geom.upscale)
-    L = defringe(L, p, height=th)
+    L = defringe(L, p)
 
     out = L.bandjoin([a, b]).copy(interpretation='lab').colourspace('srgb').cast('uchar')
 
@@ -797,17 +818,20 @@ def render_page(
     p: Profile,
     max_width: int | None = None,
     source: pyvips.Image | None = None,
+    pad_level: float | None = None,
 ) -> tuple[bytes, str]:
     if p.fmt == 'raw':
         log.debug('render: fmt=raw, %d kB passed through untouched', len(buf) // 1024)
         return buf, ''
     try:
-        return _render_page(buf, p, max_width, source)
+        return _render_page(buf, p, max_width, source, pad_level)
     except pyvips.Error as exc:
         raise UnreadableImage(f'not a readable image ({len(buf)} bytes)') from exc
 
 
-def _render_page(buf: bytes, p: Profile, max_width: int | None, source: pyvips.Image | None) -> tuple[bytes, str]:
+def _render_page(
+    buf: bytes, p: Profile, max_width: int | None, source: pyvips.Image | None, pad_level: float | None
+) -> tuple[bytes, str]:
     started = time.perf_counter()
 
     tw = p.width
@@ -817,7 +841,9 @@ def _render_page(buf: bytes, p: Profile, max_width: int | None, source: pyvips.I
 
     if not p.is_colour:
         log.debug('render: %s %dx%d, mono profile -> %s', p.name, tw, th, p.fmt)
-        return _summarise(_render_mono(buf, p, tw, th, p.fmt, page=source), buf, p, started, 'mono')
+        return _summarise(
+            _render_mono(buf, p, tw, th, p.fmt, page=source, pad_level=pad_level), buf, p, started, 'mono'
+        )
 
     page = source if source is not None else _open(buf).autorot()
     if p.auto_mono and (chroma := _chroma_of(page)) < p.mono_chroma_threshold:
@@ -830,10 +856,12 @@ def _render_page(buf: bytes, p: Profile, max_width: int | None, source: pyvips.I
             p.mono_chroma_threshold,
             p.mono_fmt,
         )
-        return _summarise(_render_mono(buf, p, tw, th, p.mono_fmt, page=page), buf, p, started, 'auto-mono')
+        return _summarise(
+            _render_mono(buf, p, tw, th, p.mono_fmt, page=page, pad_level=pad_level), buf, p, started, 'auto-mono'
+        )
 
     log.debug('render: %s %dx%d -> colour %s', p.name, tw, th, p.fmt)
-    return _summarise(_render_colour(buf, p, tw, th, page=page), buf, p, started, 'colour')
+    return _summarise(_render_colour(buf, p, tw, th, page=page, pad_level=pad_level), buf, p, started, 'colour')
 
 
 def _summarise(result, buf: bytes, p: Profile, started: float, path: str):

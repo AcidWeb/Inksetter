@@ -14,7 +14,7 @@ DITHERS = frozenset({'bayer', 'none'})
 DESCREENS = frozenset({'none', 'mono', 'always'})
 PANELS = frozenset({'mono', 'kaleido'})
 DEFRINGES = frozenset({'diagonal', 'none'})
-FITS = frozenset({'box', 'none'})
+FITS = frozenset({'box', 'top', 'bottom', 'none'})
 COLOUR_PADS = frozenset({'border', 'mono'})
 UPSCALES = frozenset({'panel', 'none'})
 UPSCALE_KERNELS = frozenset({'nearest', 'linear', 'cubic'})
@@ -59,6 +59,8 @@ class Profile:
     rotate_wide: bool = True
     # Pad the finished page out to EXACTLY width x height.
     #   box    every page is panel-sized, centred on its own margin colour
+    #   top    panel-sized too, the page at the top and the pad below it
+    #   bottom panel-sized too, the page at the foot and the pad above it
     #   none   ship whatever size the resize produced
     fit: str = 'box'
     # What the colour path pads with. The mono path always decides as mono does.
