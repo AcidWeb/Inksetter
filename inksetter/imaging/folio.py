@@ -122,6 +122,8 @@ def _read(luma: pyvips.Image, mark: tuple[int, int, int, int], h: int, w: int):
 
 
 def strip(im: pyvips.Image, luma: pyvips.Image, threshold: int) -> pyvips.Image:
+    if _engine_failed:
+        return im
     try:
         h, w = luma.height, luma.width
         if min(h, w) < 64:
@@ -132,11 +134,13 @@ def strip(im: pyvips.Image, luma: pyvips.Image, threshold: int) -> pyvips.Image:
         boxes = [b for b in (_read(luma, m, h, w) for m in marks) if b is not None]
         if not boxes:
             return im
-        paint = np.zeros((h, w), dtype=np.uint8)
-        for x0, y0, x1, y1 in boxes:
-            paint[max(0, y0 - 2) : y1 + 3, max(0, x0 - 2) : x1 + 3] = 255
-        mask = pyvips.Image.new_from_memory(paint.tobytes(), w, h, 1, 'uchar')
         log.debug('    folio erased %d mark(s) from the bottom margin', len(boxes))
-        return (mask > 0).ifthenelse(255, im)
+        out = im
+        for x0, y0, x1, y1 in boxes:
+            left, top = max(0, x0 - 2), max(0, y0 - 2)
+            right, bottom = min(w, x1 + 3), min(h, y1 + 3)
+            white = pyvips.Image.black(right - left, bottom - top).new_from_image([255] * im.bands)
+            out = out.insert(white.cast(im.format), left, top)
     except pyvips.Error, MemoryError, ValueError:
         return im
+    return out

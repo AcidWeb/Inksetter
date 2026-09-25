@@ -48,7 +48,7 @@ def _size_vips() -> None:
 _size_vips()
 
 # Bump this whenever anything in this module changes in a way that alters output pixels. Bump invalidates the cache.
-PIPELINE_VERSION = '7'
+PIPELINE_VERSION = '8'
 
 _BAYER_N = 8
 
@@ -115,15 +115,39 @@ def _open(buf: bytes) -> pyvips.Image:
         raise UnreadableImage(f'not a readable image ({len(buf)} bytes)') from exc
 
 
+_INTEGER_TOP = {'ushort': 65535.0, 'short': 32767.0, 'uint': 4294967295.0, 'int': 2147483647.0, 'char': 127.0}
+
+
+def _levels8(im: pyvips.Image, scale: float) -> pyvips.Image:
+    return _clamp(im * scale, 0.0, 255.0).rint().cast('uchar')
+
+
 def _eight_bit(im: pyvips.Image) -> pyvips.Image:
     if im.format == 'uchar' and im.interpretation != 'cmyk':
         return im
-    return im.colourspace('srgb')
+    if im.interpretation == 'cmyk' or (im.format == 'ushort' and im.interpretation in ('grey16', 'rgb16')):
+        return im.colourspace('srgb')
+    alpha = None
+    if im.hasalpha():
+        im, alpha = im.extract_band(0, n=im.bands - 1), im.extract_band(im.bands - 1)
+    if im.format in ('float', 'double') and im.max() <= 1.0:
+        colour = im if im.bands >= 3 else im.bandjoin([im, im])
+        out = colour.copy(interpretation='scrgb').colourspace('srgb')
+        out, scale = (out if im.bands >= 3 else out.extract_band(0)), 255.0
+    elif im.format in ('float', 'double'):
+        out, scale = _levels8(im, 1.0), 1.0
+    elif im.format in _INTEGER_TOP:
+        scale = 255.0 / _INTEGER_TOP[im.format]
+        out = _levels8(im, scale)
+    else:
+        return (im if alpha is None else im.bandjoin(alpha)).colourspace('srgb')
+    if alpha is not None:
+        out = out.bandjoin(_levels8(alpha, scale))
+    return out.copy(interpretation='b-w' if out.bands < 3 else 'srgb')
 
 
-def _find_peaks(mag: np.ndarray, pixels: int, floor_freq: float, p: Profile) -> list[tuple[int, int]]:
+def _find_peaks(mag: np.ndarray, pixels: int, floor_freq: float, width: int, p: Profile) -> list[tuple[int, int]]:
     height, half = mag.shape
-    width = (half - 1) * 2
     floor = float(np.median(mag[::4, ::4]))
     cutoff = max(floor * p.descreen_peak_ratio, p.descreen_min_amplitude * pixels / 2.0)
     rows = min(height // 2, int(np.ceil(floor_freq * height)) + 1)
@@ -176,7 +200,7 @@ def _descreen_plane(a: np.ndarray, floor_freq: float, p: Profile) -> np.ndarray 
 
     spectrum = sfft.rfft2(a if (ph, pw) == (h, w) else np.pad(a, ((0, ph - h), (0, pw - w)), mode='edge'))
     magnitude = np.abs(spectrum)
-    peaks = _find_peaks(magnitude, h * w, floor_freq, p)
+    peaks = _find_peaks(magnitude, h * w, floor_freq, pw, p)
     del magnitude
     log.debug(
         '    descreen notching %d peak(s) of at most %d above %.3f cyc/px', len(peaks), p.descreen_peaks, floor_freq
@@ -250,14 +274,14 @@ def _next_fast_len(n: int, limit: int = 7) -> int:
 @functools.lru_cache(maxsize=4)
 def _diagonal_attenuation(
     height: int,
-    half: int,
+    width: int,
     angle: float,
     tolerance: float,
     min_freq: float,
     strength: float,
 ) -> np.ndarray:
     freq_y = np.fft.fftfreq(height).astype(np.float32)
-    freq_x = np.fft.rfftfreq((half - 1) * 2).astype(np.float32)
+    freq_x = np.fft.rfftfreq(width).astype(np.float32)
 
     radial = np.sqrt(freq_y[:, None] ** 2 + freq_x[None, :] ** 2)
     np.maximum(radial, 1e-6, out=radial)
@@ -277,7 +301,7 @@ def _diagonal_attenuation(
     return (1.0 - high).astype(np.float32)
 
 
-def defringe(plane: pyvips.Image, p: Profile, top: float = 100.0) -> pyvips.Image:
+def defringe(plane: pyvips.Image, p: Profile, top: float = 100.0, height: int = 0) -> pyvips.Image:
     if p.defringe != 'diagonal':
         return plane
     try:
@@ -288,12 +312,12 @@ def defringe(plane: pyvips.Image, p: Profile, top: float = 100.0) -> pyvips.Imag
                 shape=(plane.height, plane.width),
             )
             h, w = a.shape
-            ph, pw = _next_fast_len(h), _next_fast_len(w)
+            ph, pw = _next_fast_len(max(h, height)), _next_fast_len(w)
             src = a if (ph, pw) == (h, w) else np.pad(a, ((0, ph - h), (0, pw - w)), mode='edge')
             spectrum = sfft.rfft2(src)
             atten = _diagonal_attenuation(
                 ph,
-                spectrum.shape[1],
+                pw,
                 p.defringe_angle,
                 p.defringe_tolerance,
                 p.defringe_min_freq,
@@ -484,13 +508,18 @@ def _geometry(buf: bytes, p: Profile, tw: int, th: int, mono: bool, page: pyvips
         im = im.flatten(background=255)
         if chatty:
             step('flatten', 'alpha over white')
+    luma = None
     if p.strip_folio:
         before = im
-        im = folio.strip(im, im if im.bands == 1 else im.colourspace('b-w'), p.autocrop_threshold)
-        if chatty and im is not before:
-            step('folio', 'page number erased from the bottom margin')
+        luma = im if im.bands == 1 else im.colourspace('b-w').copy_memory()
+        im = folio.strip(im, luma, p.autocrop_threshold)
+        if im is not before:
+            luma = None
+            if chatty:
+                step('folio', 'page number erased from the bottom margin')
     if p.autocrop:
-        luma = im if im.bands == 1 else im.colourspace('b-w')
+        if luma is None:
+            luma = im if im.bands == 1 else im.colourspace('b-w')
         box = _autocrop_box(luma, p)
         if box is not None:
             im = im.crop(*box)
@@ -565,7 +594,7 @@ def _side_stats(im: pyvips.Image) -> tuple[tuple[float, float], ...]:
 
 def _mono_pad_level(im: pyvips.Image, horizontal: bool, vertical: bool) -> float:
     try:
-        left, right, top, bottom = _side_stats(im)
+        left, right, top, bottom = _side_stats(im if im.bands == 1 else im.colourspace('b-w'))
     except pyvips.Error, ValueError:
         return 255.0
     sides = []
@@ -649,7 +678,7 @@ def _render_mono(
         g = g.colourspace('b-w')
     toned = g.maplut(_tone_lut(p)) if g.format == 'uchar' else _tone(g.cast('float'), p, 255.0)
     g = _unsharp(toned, p, geom.upscale)
-    g = defringe(g, p, 255.0).rint().cast('uchar')
+    g = defringe(g, p, 255.0, th).rint().cast('uchar')
 
     if fmt == 'jpeg':
         return (
@@ -684,7 +713,7 @@ def _render_colour(buf: bytes, p: Profile, tw: int, th: int, page: pyvips.Image 
         a, b = a.gaussblur(sigma), b.gaussblur(sigma)
 
     L = _unsharp(_tone(L, p, 100.0), p, geom.upscale)
-    L = defringe(L, p)
+    L = defringe(L, p, height=th)
 
     out = L.bandjoin([a, b]).copy(interpretation='lab').colourspace('srgb').cast('uchar')
 
