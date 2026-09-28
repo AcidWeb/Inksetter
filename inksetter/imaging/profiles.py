@@ -3,7 +3,6 @@ Device profiles.
 To add or modify device profiles - edit profiles.toml.
 """
 
-import os
 import tomllib
 import importlib.resources
 from dataclasses import dataclass, fields, replace
@@ -345,13 +344,6 @@ def _build(text: str, where: str) -> dict[str, Profile]:
     return out
 
 
-def _folio_enabled() -> bool:
-    """
-    Whether OCR_ENABLED permits the page-number pass at all.
-    """
-    return os.environ.get('OCR_ENABLED', '').strip().lower() not in ('false', '0', 'no', 'off')
-
-
 def _load() -> dict[str, Profile]:
     where = f'{_SHIPPED} (shipped)'
     text = importlib.resources.files(__package__).joinpath(_SHIPPED).read_text(encoding='utf-8')
@@ -359,8 +351,6 @@ def _load() -> dict[str, Profile]:
     absent = sorted(_INTERNAL - set(out))
     if absent:
         raise ValueError(f'{where}: reserved profile(s) {", ".join(absent)} missing; cover_for() needs them')
-    if not _folio_enabled():
-        out = {k: replace(v, strip_folio=False) for k, v in out.items()}
     return out
 
 
@@ -369,6 +359,12 @@ _ALL = _load()
 COVER = _ALL['cover']
 COVER_COLOUR = _ALL['cover-colour']
 PROFILES: dict[str, Profile] = {k: v for k, v in _ALL.items() if k not in _INTERNAL}
+
+
+def use_folio(enabled: bool) -> None:
+    for name, p in _ALL.items():
+        if name not in _INTERNAL:
+            PROFILES[name] = replace(p, strip_folio=p.strip_folio and enabled)
 
 
 def get(name: str) -> Profile | None:

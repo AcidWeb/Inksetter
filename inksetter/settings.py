@@ -4,6 +4,7 @@ All via environment variables.
 """
 
 import os
+import sys
 from pathlib import Path
 from dataclasses import dataclass
 
@@ -15,6 +16,12 @@ def _int(name: str, default: int, minimum: int = 0) -> int:
         return max(minimum, int(os.environ.get(name, default)))
     except ValueError:
         return default
+
+
+def _cache_dir() -> str:
+    if sys.platform == 'win32':
+        return str(Path(os.environ.get('LOCALAPPDATA') or Path.home()) / 'Inksetter' / 'cache')
+    return str(Path(os.environ.get('XDG_CACHE_HOME') or Path.home() / '.cache') / 'Inksetter')
 
 
 @dataclass(frozen=True)
@@ -30,7 +37,7 @@ class Settings:
     public_base: str = os.environ.get('PUBLIC_BASE', '').rstrip('/')
 
     # Location of cache used by OPDS-PSE.
-    cache_dir: Path = Path(os.environ.get('CACHE_DIR', '/cache'))
+    cache_dir: Path = Path(os.environ.get('CACHE_DIR', _cache_dir()))
 
     # Maximum cache size.
     cache_max_bytes: int = _int('CACHE_MAX_BYTES', 8 * 1024**3)
@@ -52,7 +59,10 @@ class Settings:
     spool_max_bytes: int = _int('SPOOL_MAX_BYTES', 32 * 1024**2)
 
     # Where a spilled spool file lands.
-    spool_dir: str = os.environ.get('SPOOL_DIR', '') or str(Path(os.environ.get('CACHE_DIR', '/cache')))
+    spool_dir: str = os.environ.get('SPOOL_DIR', '') or str(Path(os.environ.get('CACHE_DIR', _cache_dir())))
+
+    # OCR finds page numbers in the bottom margin and erases them.
+    ocr_enabled: bool = os.environ.get('OCR_ENABLED', '').strip().lower() not in ('false', '0', 'no', 'off')
 
 
 settings = Settings()

@@ -9,7 +9,8 @@ RUN uv sync --frozen --no-install-project --no-dev \
  && rm -rf /root/.cache/uv
 
 ENV PATH="/app/.venv/bin:$PATH" \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    CACHE_DIR="/cache"
 
 VOLUME ["/cache"]
 EXPOSE 8080

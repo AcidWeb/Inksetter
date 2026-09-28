@@ -24,3 +24,6 @@ override-dependencies = ["opencv-python ; sys_platform == 'never'"]
 dev = [
     "ruff>=0.16.5"
 ]
+build = [
+    "pyinstaller>=6.22.3 ; sys_platform == 'win32'"
+]

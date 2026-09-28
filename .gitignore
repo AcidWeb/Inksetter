@@ -1,9 +1,13 @@
 __pycache__/
 .ruff_cache/
 .venv/
+dist/
+build/
 cache/
 sample/
 .env
+.idea
 *.py[cod]
+Build.sh
 CLAUDE.md
 docker-compose.override.yml

@@ -54,6 +54,7 @@ from inksetter import settings as settings_mod  # noqa: E402
 from inksetter import app as app_mod  # noqa: E402
 from inksetter.app import app  # noqa: E402
 from inksetter import cores  # noqa: E402
+from inksetter import __main__ as entry  # noqa: E402
 from inksetter.imaging import cbz, folio, pipeline, profiles, webtoon  # noqa: E402
 from inksetter import web  # noqa: E402
 from inksetter.opds import rewrite  # noqa: E402
@@ -3156,6 +3157,267 @@ def check_concurrency_defaults() -> None:
     )
 
 
+def check_cache_default() -> None:
+    saved = dict(vars(settings_mod))
+    local = pathlib.Path(TMP) / 'Local App Data'
+    home = pathlib.Path(TMP) / 'home'
+    xdg = pathlib.Path(TMP) / 'xdg cache'
+    unset = {k: v for k, v in os.environ.items() if k not in ('CACHE_DIR', 'SPOOL_DIR', 'XDG_CACHE_HOME')} | {
+        'LOCALAPPDATA': str(local),
+        'HOME': str(home),
+        'USERPROFILE': str(home),
+    }
+    found = {}
+    with mock.patch.dict(os.environ, unset, clear=True):
+        for platform in ('win32', 'linux'):
+            with mock.patch.object(sys, 'platform', platform):
+                s = importlib.reload(settings_mod).settings
+                found[platform] = (s.cache_dir, pathlib.Path(s.spool_dir))
+        os.environ['XDG_CACHE_HOME'] = str(xdg)
+        with mock.patch.object(sys, 'platform', 'linux'):
+            s = importlib.reload(settings_mod).settings
+            found['xdg'] = (s.cache_dir, pathlib.Path(s.spool_dir))
+        os.environ['CACHE_DIR'] = str(pathlib.Path(TMP) / 'chosen')
+        with mock.patch.object(sys, 'platform', 'win32'):
+            s = importlib.reload(settings_mod).settings
+            chosen = (s.cache_dir, pathlib.Path(s.spool_dir))
+    vars(settings_mod).update(saved)
+    want = local / 'Inksetter' / 'cache'
+    check(
+        'on Windows the cache and the spool default to the local app data',
+        found['win32'] == (want, want),
+        f'{found["win32"]}',
+    )
+    check(
+        'elsewhere they default to the XDG cache home, or ~/.cache without one',
+        found['linux'] == (home / '.cache' / 'Inksetter',) * 2 and found['xdg'] == (xdg / 'Inksetter',) * 2,
+        f'{found["linux"]}, with XDG_CACHE_HOME {found["xdg"]}',
+    )
+    docker = (pathlib.Path(entry.__file__).parents[1] / 'Dockerfile').read_text(encoding='utf-8')
+    check(
+        'and Docker points CACHE_DIR at the volume it mounts',
+        re.search(r'^\s*(ENV\s+)?CACHE_DIR="?/cache"?\s*\\?\s*$', docker, re.M) is not None
+        and re.search(r'^VOLUME \["/cache"\]', docker, re.M) is not None,
+    )
+    check(
+        'and CACHE_DIR still wins on Windows',
+        chosen == (pathlib.Path(TMP) / 'chosen',) * 2,
+        f'{chosen}',
+    )
+    check('the reloads leave the settings the app holds in place', settings_mod.settings is app_mod.settings)
+
+
+def _load_or_error(path: pathlib.Path) -> dict | str:
+    try:
+        return entry.load(path)
+    except entry.ConfigError as exc:
+        return str(exc)
+
+
+def check_settings_file() -> None:
+    root = pathlib.Path(TMP) / 'settings file'
+    root.mkdir()
+    path = root / 'inksetter.toml'
+
+    places = {}
+    with mock.patch.dict(os.environ, {'LOCALAPPDATA': str(root / 'Local'), 'XDG_CONFIG_HOME': str(root / 'xdg')}):
+        for platform in ('win32', 'linux'):
+            with mock.patch.object(sys, 'platform', platform):
+                places[platform] = entry.config_path()
+    check(
+        'the settings file is in the local app data on Windows, and in the XDG config home elsewhere',
+        places
+        == {
+            'win32': root / 'Local' / 'Inksetter' / 'inksetter.toml',
+            'linux': root / 'xdg' / 'inksetter' / 'inksetter.toml',
+        },
+        f'{places}',
+    )
+
+    path.write_bytes(
+        '\ufeffupstream_catalog = "http://kavita:5000/api/opds/key"\n'
+        "port = 8081\nocr_enabled = false\nCACHE_DIR = 'D:\\Books\\cache'\n".encode()
+    )
+    values = _load_or_error(path)
+    check(
+        'a file saved with a byte-order mark reads, keys in either case, true and false spelt as the proxy reads them',
+        values
+        == {
+            'UPSTREAM_CATALOG': 'http://kavita:5000/api/opds/key',
+            'PORT': '8081',
+            'OCR_ENABLED': 'false',
+            'CACHE_DIR': 'D:\\Books\\cache',
+        },
+        f'{values}',
+    )
+    check('a missing file is no settings at all', entry.load(root / 'absent.toml') == {})
+
+    refused = {}
+    for label, text in (
+        ('an unknown key', 'prot = 8081\n'),
+        ('a list', 'port = [8081]\n'),
+        ('a fraction', 'cache_max_bytes = 8e9\n'),
+        ('a table', '[upstream_catalog]\nurl = "http://x"\n'),
+        ('a path failing as an escape', 'cache_dir = "D:\\Books\\cache"\n'),
+        ('a path failing as a \\U escape', 'x = 1\ncache_dir = "C:\\Users\\me\\cache"\n'),
+        ('a path read as a newline', 'cache_dir = "D:\\new"\n'),
+    ):
+        path.write_text(text, encoding='utf-8')
+        refused[label] = _load_or_error(path)
+    accepted = [label for label, got in refused.items() if not isinstance(got, str)]
+    check('the file refuses what no setting can take', not accepted, f'accepted {accepted}')
+    check(
+        'and names the key it does not know', "'prot'" in str(refused['an unknown key']), f'{refused["an unknown key"]}'
+    )
+    unhinted = [label for label in list(refused)[4:] if 'single quotes' not in str(refused[label])]
+    check('and says where a Windows path goes', not unhinted, f'no hint for {unhinted}')
+    check('but not when the mistake is something else', 'single quotes' not in str(refused['a list']))
+
+    with mock.patch.dict(os.environ, {'PORT': '9000', 'PUBLIC_BASE': ''}):
+        os.environ.pop('UPSTREAM_CATALOG', None)
+        os.environ.pop('LOG_LEVEL', None)
+        entry.apply({'PORT': '8081', 'UPSTREAM_CATALOG': 'http://kavita:5000/api/opds/key'})
+        applied = (os.environ['PORT'], os.environ['UPSTREAM_CATALOG'])
+        entry.apply({'PUBLIC_BASE': 'http://proxy.lan', 'LOG_LEVEL': ''})
+        empties = (os.environ['PUBLIC_BASE'], 'LOG_LEVEL' in os.environ)
+    check(
+        'a variable set in the environment wins over the file, and the file fills in the rest',
+        applied == ('9000', 'http://kavita:5000/api/opds/key'),
+        f'{applied}',
+    )
+    check(
+        'an empty value is unset on either side: the file fills an empty variable, and sets nothing with one',
+        empties == ('http://proxy.lan', False),
+        f'{empties}',
+    )
+
+    path.write_text(entry.TEMPLATE, encoding='utf-8')
+    shipped = _load_or_error(path)
+    path.write_text(re.sub(r'(?m)^# (\w+ = )', r'\1', entry.TEMPLATE), encoding='utf-8')
+    examples = _load_or_error(path)
+    check('the template sets an empty catalog and nothing else', shipped == {'UPSTREAM_CATALOG': ''}, f'{shipped}')
+    check(
+        'and every example in it is a setting, reads as written, and shows the default where it has one',
+        examples == {'UPSTREAM_CATALOG': '', 'HOST': '0.0.0.0', 'PORT': '8080', 'OCR_ENABLED': 'false'},
+        f'{examples}',
+    )
+
+    read = set()
+    for source in pathlib.Path(entry.__file__).parent.rglob('*.py'):
+        text = source.read_text(encoding='utf-8')
+        read |= set(re.findall(r"environ\.get\(\s*['\"]([A-Z_]+)['\"]", text))
+        read |= set(re.findall(r"environ\[\s*['\"]([A-Z_]+)['\"]\s*\]", text))
+        read |= set(re.findall(r"_int\(\s*['\"]([A-Z_]+)['\"]", text))
+    read -= {'LOCALAPPDATA', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME'}
+    check(
+        'the settings file takes every environment variable the proxy reads, and nothing else',
+        read == entry.SETTING_NAMES,
+        f'unknown to it {sorted(read - entry.SETTING_NAMES)}, read nowhere {sorted(entry.SETTING_NAMES - read)}',
+    )
+
+    local = root / 'first start'
+    made = local / 'Inksetter' / 'inksetter.toml'
+    opened, served, own = [], [], [True]
+    bare = {k: v for k, v in os.environ.items() if k not in entry.SETTING_NAMES} | {
+        'LOCALAPPDATA': str(local),
+        'HOME': str(root / 'home'),
+        'USERPROFILE': str(root / 'home'),
+    }
+    with (
+        mock.patch.dict(os.environ, bare, clear=True),
+        mock.patch.object(sys, 'platform', 'win32'),
+        mock.patch.object(entry, '_own_console', lambda: own[0]),
+        mock.patch.object(entry, '_edit', opened.append),
+        mock.patch.object(uvicorn, 'run', lambda _app, **kw: served.append(kw)),
+        contextlib.redirect_stdout(io.StringIO()),
+    ):
+        first = entry.main()
+        written = made.read_text(encoding='utf-8') if made.exists() else None
+        made.parent.mkdir(parents=True, exist_ok=True)
+        made.write_text(entry.TEMPLATE + '# mine\n', encoding='utf-8')
+        again = entry.main()
+        kept = made.read_text(encoding='utf-8').endswith('# mine\n')
+        own[0] = False
+        from_terminal = entry.main()
+        made.write_text(
+            'upstream_catalog = "http://kavita:5000/api/opds/key"\nhost = "127.0.0.1"\nport = 8081\n', encoding='utf-8'
+        )
+        started = entry.main()
+        os.environ['PORT'] = '9000'
+        overridden = entry.main()
+        os.environ['PORT'] = 'eighty'
+        bad_port = entry.main()
+        made.write_text('prot = 8081\n', encoding='utf-8')
+        os.environ.pop('PORT')
+        bad_file = entry.main()
+    check(
+        'with no catalog anywhere the first start writes the template, opens it and stops',
+        (first, written, opened[:1]) == (1, entry.TEMPLATE, [made]),
+        f'exit {first}, template written {written == entry.TEMPLATE}, opened {opened[:1]}',
+    )
+    check(
+        'a later start with the catalog still empty keeps the file as it is and opens it again',
+        (again, kept, len(opened)) == (1, True, 2),
+        f'exit {again}, kept {kept}, opened {len(opened)} times',
+    )
+    check(
+        'from a terminal it only says so: no editor is opened',
+        (from_terminal, len(opened)) == (1, 2),
+        f'exit {from_terminal}, opened {len(opened)} times',
+    )
+    check(
+        'with the catalog in the file the proxy starts where the file says, and PORT in the environment wins',
+        (started, overridden, served)
+        == (0, 0, [{'host': '127.0.0.1', 'port': 8081}, {'host': '127.0.0.1', 'port': 9000}]),
+        f'exits {started}, {overridden}; served {served}',
+    )
+    check(
+        'a PORT that is not a number, or a file it cannot take, stops it before it starts',
+        (bad_port, bad_file, len(served)) == (1, 1, 2),
+        f'exits {bad_port}, {bad_file}; served {len(served)} times',
+    )
+
+    def _raise(exc):
+        def main():
+            raise exc
+
+        return main
+
+    ends = {}
+    for label, main, is_own in (
+        ('a failure in its own window', lambda: 1, True),
+        ('a clean stop in its own window', lambda: 0, True),
+        ('uvicorn failing to start', _raise(SystemExit(3)), True),
+        ('a crash', _raise(RuntimeError('boom')), True),
+        ('a failure in a terminal', lambda: 1, False),
+    ):
+        paused = []
+        with (
+            mock.patch.object(entry, 'main', main),
+            mock.patch.object(entry, '_own_console', lambda is_own=is_own: is_own),
+            mock.patch('builtins.input', paused.append),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            try:
+                entry.run()
+                code = None
+            except SystemExit as exc:
+                code = exc.code
+        ends[label] = (code, bool(paused))
+    check(
+        'a window of its own stays open after a failure, never after a clean stop or in a terminal',
+        ends
+        == {
+            'a failure in its own window': (1, True),
+            'a clean stop in its own window': (0, False),
+            'uvicorn failing to start': (3, True),
+            'a crash': (1, True),
+            'a failure in a terminal': (1, False),
+        },
+        f'{ends}',
+    )
+
+
 def check_cpu_budget() -> None:
     n = os.process_cpu_count() or 4
 
@@ -5730,32 +5992,49 @@ def check_strip_folio() -> None:
         f'upscale_max={_emb.upscale_max}',
     )
     before_key = cache_mod.render_key('u', profiles.PROFILES['kobo-clara-hd-2e-bw'], None)
-    os.environ['OCR_ENABLED'] = 'false'
+    table = profiles.PROFILES
     try:
-        importlib.reload(profiles)
+        profiles.use_folio(False)
         check(
-            'OCR_ENABLED=false turns the pass off for every profile',
-            not any(p.strip_folio for p in _paged().values()),
+            'with OCR off, the pass is off for every profile, in the table everyone holds',
+            not any(p.strip_folio for p in _paged().values()) and profiles.PROFILES is table,
             f'still on: {[n for n, p in profiles.PROFILES.items() if p.strip_folio]}',
         )
         check(
             'and that reaches the cache key, so no page rendered with it on is served with it off',
             cache_mod.render_key('u', profiles.PROFILES['kobo-clara-hd-2e-bw'], None) != before_key,
         )
-        for junk in ('typo', 'yes', ''):
-            os.environ['OCR_ENABLED'] = junk
-            importlib.reload(profiles)
-            if not all(p.strip_folio for p in _paged().values()):
-                break
-        else:
-            junk = None
-        check('only an explicit false/0/no/off disables it', junk is None, f'{junk!r} disabled it')
     finally:
-        os.environ.pop('OCR_ENABLED', None)
-        importlib.reload(profiles)
+        profiles.use_folio(True)
     check(
         'and the table comes back',
         all(p.strip_folio for p in _paged().values()),
+    )
+    saved, read = dict(vars(settings_mod)), {}
+    for value in ('false', ' OFF ', '0', 'no', 'true', 'yes', 'typo', ''):
+        with mock.patch.dict(os.environ, {'OCR_ENABLED': value}):
+            read[value] = importlib.reload(settings_mod).settings.ocr_enabled
+    vars(settings_mod).update(saved)
+    check(
+        'OCR_ENABLED is read in settings, and only an explicit false, 0, no or off turns it off',
+        [v for v, on in read.items() if not on] == ['false', ' OFF ', '0', 'no'],
+        f'{read}',
+    )
+    code = (
+        'import inksetter.app\n'
+        'from inksetter.imaging import profiles\n'
+        'print(sum(p.strip_folio for p in profiles.PROFILES.values()))'
+    )
+    started = {}
+    for value in ('off', 'on'):
+        r = subprocess.run(
+            [sys.executable, '-c', code], env={**os.environ, 'OCR_ENABLED': value}, capture_output=True, text=True
+        )
+        started[value] = r.stdout.strip() or r.stderr.strip()[-200:]
+    check(
+        'and the app turns the pass off on every profile as it starts',
+        started['off'] == '0' and started['on'] not in ('0', ''),
+        f'{started}',
     )
     check(
         'a folio-free page is untouched by the strip',
@@ -7558,6 +7837,10 @@ async def main() -> int:
     print('concurrency defaults')
     check_concurrency_defaults()
     check_cpu_budget()
+    print('cache default')
+    check_cache_default()
+    print('settings file')
+    check_settings_file()
     print('parallel repack')
     check_repack_parallel()
     print('range repack')

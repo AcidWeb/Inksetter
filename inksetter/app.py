@@ -30,6 +30,7 @@ from .opds.upstream import CREDENTIAL_REQUEST, FORWARD_RESPONSE, UpstreamError, 
 from .settings import settings
 
 logs.configure()
+profiles.use_folio(settings.ocr_enabled)
 
 cache = DiskCache(settings.cache_dir, settings.cache_max_bytes)
 prefetcher = Prefetcher()

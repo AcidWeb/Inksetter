@@ -8,9 +8,17 @@ This proxy supports OPDS V1, OPDS-PSE and OPDS V2. It has been extensively teste
 
 ## Deployment
 
+### Docker
+
 The recommended way to deploy this application is Docker Compose. An example `docker-compose.yml` is bundled. The application requires only one mandatory environment variable: `UPSTREAM_CATALOG` that points to the original OPDS server feed.
 
-The application itself has a fairly simple structure, so you can deploy it in a different way on your own – in which case, however, I would advise you to ensure that the `pyvips` library uses the bundled `libvips` rather than the version installed in the system. The latter is most likely out of date and will cause issues.
+### Windows
+
+Additionally, for testing and short-term deployments, a Windows binary is also provided.
+
+Unpack it anywhere and run `Inksetter.exe`. On the first start, it creates its settings file, `%LOCALAPPDATA%\Inksetter\inksetter.toml`, and opens it in Notepad: put the catalog URL in it, save it, and start `Inksetter.exe` again. The file lists the common settings, and any other environment variable can be set there too. The proxy listens on port 8080, like the container, and keeps its cache in `%LOCALAPPDATA%\Inksetter\cache`.
+
+On the first start, Windows Firewall might ask whether to let it accept connections. Allow it on private networks, or the e-reader will not reach it.
 
 ## Usage
 
