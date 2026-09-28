@@ -5936,7 +5936,7 @@ def check_profile_config() -> None:
 PASS, FAIL = [], []
 
 
-def _folio_page(number: str = '123', attached: bool = False, w: int = 900) -> bytes:
+def _folio_page(number: str = '123', attached: bool = False, w: int = 900, rule: str = '', gap: int = 4) -> bytes:
     h = w * 13 // 9
     a = np.full((h, w), 255, np.uint8)
     k = w / 900
@@ -5946,15 +5946,25 @@ def _folio_page(number: str = '123', attached: bool = False, w: int = 900) -> by
         y0, y1, x0, x1 = sc(y0, y1, x0, x1)
         a[y0:y1, x0:x1] = 20
     a[sc(300)[0] : sc(700)[0], sc(200)[0] : sc(640)[0]] = 90
+    t = pyvips.Image.text(number or '123', dpi=300, font='DejaVu Sans')
+    g = 255 - np.ndarray(buffer=t.cast('uchar').write_to_memory(), dtype=np.uint8, shape=(t.height, t.width))
+    top = int(h * (1.0 - folio.BAND))
+    y = top + 2 if attached else top + int(h * folio.BAND * 0.45)
+    x = (w - t.width) // 2
     if number:
-        t = pyvips.Image.text(number, dpi=300, font='DejaVu Sans')
-        g = 255 - np.ndarray(buffer=t.cast('uchar').write_to_memory(), dtype=np.uint8, shape=(t.height, t.width))
-        top = int(h * (1.0 - folio.BAND))
-        y = top + 2 if attached else top + int(h * folio.BAND * 0.45)
-        x = (w - t.width) // 2
         a[y : y + t.height, x : x + t.width] = np.minimum(a[y : y + t.height, x : x + t.width], g)
         if attached:
             a[y - 8 : y - 2, x + 6 : x + 26] = 20
+    rows, cols = np.nonzero((g < 243).any(axis=1))[0], np.nonzero((g < 243).any(axis=0))[0]
+    gy0, gy1, gx0, gx1 = y + int(rows[0]), y + int(rows[-1]), x + int(cols[0]), x + int(cols[-1])
+    if rule == 'above':
+        a[gy0 - gap - 5 : gy0 - gap, sc(60)[0] : sc(840)[0]] = 20
+    elif rule == 'below':
+        a[gy1 + gap + 1 : gy1 + gap + 6, sc(60)[0] : sc(840)[0]] = 20
+    elif rule == 'left':
+        a[top - 30 : h, gx0 - gap - 5 : gx0 - gap] = 20
+    elif rule == 'right':
+        a[top - 30 : h, gx1 + gap + 1 : gx1 + gap + 6] = 20
     return pyvips.Image.new_from_memory(a.tobytes(), w, h, 1, 'uchar').pngsave_buffer()
 
 
@@ -6077,7 +6087,8 @@ def check_strip_folio() -> None:
         y = band_top + 6 + k * 14
         ca[y : y + 10, 120 + k * 90 : 134 + k * 90] = 20
     crowded_png = pyvips.Image.new_from_memory(ca.tobytes(), crowded.width, crowded.height, 1, 'uchar').pngsave_buffer()
-    seen_marks = folio._marks((255 - ca.astype(np.int16)) > off.autocrop_threshold, crowded.height, crowded.width)
+    crowded_ink = (255 - ca.astype(np.int16)) > off.autocrop_threshold
+    seen_marks = folio._marks(crowded_ink[folio._first_row(crowded.height) :], crowded.height, crowded.width)
     reads = []
     real_read = folio._read
 
@@ -6107,9 +6118,9 @@ def check_strip_folio() -> None:
     _seen: list = []
     _real_marks = folio._marks
 
-    def _capturing_marks(ink, h_, w_):
+    def _capturing_marks(ink, h_, w_, *lines):
         _seen.append(ink)
-        return _real_marks(ink, h_, w_)
+        return _real_marks(ink, h_, w_, *lines)
 
     folio._marks = _capturing_marks
     try:
@@ -6120,7 +6131,7 @@ def check_strip_folio() -> None:
             _pa = np.ndarray(
                 buffer=_page.cast('uchar').write_to_memory(), dtype=np.uint8, shape=(_page.height, _page.width)
             )
-            _want = (255 - _pa.astype(np.int16)) > _thr
+            _want = ((255 - _pa.astype(np.int16)) > _thr)[folio._first_row(_page.height) :]
             if not (_seen and np.array_equal(_seen[0], _want)):
                 break
         else:
@@ -6158,7 +6169,8 @@ def check_strip_folio() -> None:
 
     raw3 = pyvips.Image.new_from_buffer(_folio_page(number='123'), '')
     a3 = np.ndarray(buffer=raw3.cast('uchar').write_to_memory(), dtype=np.uint8, shape=(raw3.height, raw3.width))
-    marks = folio._marks((255 - a3.astype(np.int16)) > off.autocrop_threshold, raw3.height, raw3.width)
+    ink3 = (255 - a3.astype(np.int16)) > off.autocrop_threshold
+    marks = folio._marks(ink3[folio._first_row(raw3.height) :], raw3.height, raw3.width)
     check('a three-digit folio is offered to the reader as one mark', len(marks) == 1, f'{len(marks)} marks')
 
     fw, fh = 900, 1300
@@ -6172,7 +6184,7 @@ def check_strip_folio() -> None:
             ink[y : y + 8, x + 4 + across : x + 8 + across] = True
         else:
             ink[y + 8 + down : y + 16 + down, x : x + 4] = True
-        return len(folio._marks(ink, fh, fw))
+        return len(folio._marks(ink[folio._first_row(fh) :], fh, fw))
 
     joins = {
         'across': (dots(2 * jx, 0), dots(2 * jx + 1, 0)),
@@ -6191,6 +6203,310 @@ def check_strip_folio() -> None:
     check(
         'an isolated blob that reads as nothing is not erased',
         pipeline.render_page(blob, on)[0] == pipeline.render_page(blob, off)[0],
+    )
+
+    rng = np.random.default_rng(5)
+    runs_wrong = []
+    for _ in range(300):
+        m = rng.random((int(rng.integers(1, 7)), int(rng.integers(1, 30)))) < rng.random()
+        length = int(rng.integers(1, 33))
+        want = np.zeros_like(m)
+        for r, row in enumerate(m):
+            start = None
+            for c, v in enumerate([*row, False]):
+                if v and start is None:
+                    start = c
+                elif not v and start is not None:
+                    want[r, start:c] = c - start >= length
+                    start = None
+        if not np.array_equal(folio._long_runs(m, length), want):
+            runs_wrong.append((m.shape, length))
+    check(
+        'the ruler takes exactly the pixels lying in a straight run at least as long as asked',
+        not runs_wrong,
+        f'{len(runs_wrong)} of 300 masks wrong, first {runs_wrong[:1]}',
+    )
+
+    def _ink(png: bytes):
+        im_ = pyvips.Image.new_from_buffer(png, '')
+        a_ = np.ndarray(buffer=im_.cast('uchar').write_to_memory(), dtype=np.uint8, shape=(im_.height, im_.width))
+        return a_ < (255 - off.autocrop_threshold), im_.height, im_.width
+
+    ruled = {r: (_folio_page(rule=r), _folio_page(number='', rule=r)) for r in ('above', 'below', 'left', 'right')}
+    unruled = {}
+    for r, (png, _b) in ruled.items():
+        ink_, h_, w_ = _ink(png)
+        rows_ = ink_[folio._first_row(h_) :]
+        unruled[r] = len(folio._marks(rows_, h_, w_, np.zeros_like(rows_)))
+    check(
+        'a border that close joins the folio, or crowds its halo, unless the ruler takes it out',
+        not any(unruled.values()),
+        f'marks found with no line left out: {unruled}',
+    )
+    tucked = {r: pipeline.render_page(n, on)[0] == pipeline.render_page(b, on)[0] for r, (n, b) in ruled.items()}
+    check(
+        'a folio tucked against a panel border on any side is erased and the border kept whole',
+        all(tucked.values())
+        and all(pipeline.render_page(n, off)[0] != pipeline.render_page(n, on)[0] for n, _b in ruled.values()),
+        f'renders as the unnumbered page: {tucked}',
+    )
+
+    left_alone, taken = {}, {}
+    for r in ('above', 'below', 'left', 'right'):
+        at_line, one_off = _folio_page(rule=r, gap=0), _folio_page(rule=r, gap=1)
+        left_alone[r] = pipeline.render_page(at_line, on)[0] == pipeline.render_page(at_line, off)[0]
+        taken[r] = pipeline.render_page(one_off, on)[0] != pipeline.render_page(one_off, off)[0]
+    check(
+        'a mark touching a border is art cut loose from it and left alone; one clear row away it is a folio',
+        all(left_alone.values()) and all(taken.values()),
+        f'touching left alone: {left_alone}, a row away erased: {taken}',
+    )
+
+    bh_, bw_ = 1300, 900
+    border_y = bh_ - 40
+
+    def _bordered(attached: int, folio_there: bool = True, slivers: bool = False) -> int:
+        ink_ = np.zeros((bh_, bw_), bool)
+        ink_[border_y - 4 : border_y, 100:800] = True
+        ink_[bh_ - 300 : border_y, 100:104] = True
+        for x in range(300, 340, 6):
+            ink_[border_y : border_y + attached, x : x + 3] = True
+        if folio_there:
+            ink_[border_y + 4 : border_y + 26, 310:330] = True
+        if slivers:
+            for y in range(border_y - 25, border_y - 5, 8):
+                ink_[y : y + 5, 104] = True
+            for x in range(104, 150, 8):
+                ink_[border_y, x : x + 5] = True
+            ink_[border_y + 3 : border_y + 5, 120:122] = True
+        return len(folio._marks(ink_[folio._first_row(bh_) :], bh_, bw_))
+
+    check(
+        'specks hanging a pixel off a border do not cost the folio they join, two pixels are art',
+        _bordered(1) == 1 and _bordered(2) == 0,
+        f'marks with one-pixel specks {_bordered(1)}, with two-pixel {_bordered(2)}',
+    )
+    check(
+        'slivers hugging a panel corner, with nothing speck-sized clear of the border, are not offered to the reader',
+        _bordered(0, folio_there=False, slivers=True) == 0,
+        f'{_bordered(0, folio_there=False, slivers=True)} marks',
+    )
+    specked = pyvips.Image.new_from_buffer(_folio_page(rule='above', gap=4), '')
+    sa = np.ndarray(
+        buffer=specked.cast('uchar').write_to_memory(), dtype=np.uint8, shape=(specked.height, specked.width)
+    )
+    sa = sa.copy()
+    line_rows = np.nonzero((sa[:, 60:840] < 128).all(axis=1))[0]
+    under = int(line_rows[line_rows > sa.shape[0] * (1 - folio.BAND) - 20][-1]) + 1
+    for x in range(420, 480, 9):
+        sa[under, x : x + 3] = 20
+    specked_png = pyvips.Image.new_from_memory(sa.tobytes(), specked.width, specked.height, 1, 'uchar').pngsave_buffer()
+    check(
+        'and that folio is erased, specks with it, and the border kept whole',
+        pipeline.render_page(specked_png, on)[0]
+        == pipeline.render_page(_folio_page(number='', rule='above', gap=4), on)[0]
+        and pipeline.render_page(specked_png, on)[0] != pipeline.render_page(specked_png, off)[0],
+    )
+
+    def _eight(white: bool, number: str = '8') -> np.ndarray:
+        a_ = np.full((bh_, bw_), 255, np.uint8)
+        a_[60:1100, 60:840] = 245
+        a_[300:700, 200:640] = 90
+        if white:
+            a_[bh_ - 120 :, :] = 0
+        if number:
+            t = pyvips.Image.text(number, dpi=480, font='DejaVu Sans Bold')
+            g_ = np.ndarray(buffer=t.cast('uchar').write_to_memory(), dtype=np.uint8, shape=(t.height, t.width))
+            y_, x_ = bh_ - 10 - t.height, (bw_ - t.width) // 2
+            region = a_[y_ : y_ + t.height, x_ : x_ + t.width]
+            region[:] = np.maximum(region, g_) if white else np.minimum(region, 255 - g_)
+        return a_
+
+    def _block_eight(number: bool = True) -> np.ndarray:
+        a_ = _eight(False, '')
+        if number:
+            top_ = bh_ - 80
+            a_[top_ : top_ + 62, 430:470] = 0
+            a_[top_ + 10 : top_ + 26, 440:460] = 255
+            a_[top_ + 34 : top_ + 50, 440:460] = 255
+        return a_
+
+    counters = {}
+    with mock.patch.object(folio, '_read', lambda _luma, m, _h, _w: m):
+        for name, a_, blank_ in (
+            ('white on black', _eight(True), _eight(True, '')),
+            ('black on white', _eight(False), _eight(False, '')),
+            ('hard-edged, strokes wider than the halo', _block_eight(), _block_eight(False)),
+        ):
+            im_ = pyvips.Image.new_from_memory(a_.tobytes(), bw_, bh_, 1, 'uchar')
+            out_ = folio.strip(im_, im_, off.autocrop_threshold)
+            counters[name] = np.array_equal(
+                np.ndarray(buffer=out_.write_to_memory(), dtype=np.uint8, shape=(bh_, bw_)), blank_
+            )
+    check(
+        'the counters of an 8 are not a folio: offered whatever it is shown, the pass erases the digit and no more',
+        all(counters.values()),
+        f'comes out as the page without it: {counters}',
+    )
+
+    def _white_folio(number: str = '123', ground=(0, 0, 0), stripes=None) -> bytes:
+        wh, ww = 1300, 900
+        a_ = np.full((wh, ww, 3), 255, np.uint8)
+        a_[60:1100, 60:840] = 245
+        a_[300:700, 200:640] = 90
+        a_[wh - 110 :, :] = ground
+        if stripes is not None:
+            a_[wh - 110 :: 2, :] = stripes
+        t = pyvips.Image.text('123', dpi=300, font='DejaVu Sans')
+        g_ = np.ndarray(buffer=t.cast('uchar').write_to_memory(), dtype=np.uint8, shape=(t.height, t.width))
+        y_, x_ = wh - 70, (ww - t.width) // 2
+        if number:
+            region = a_[y_ : y_ + t.height, x_ : x_ + t.width]
+            region[:] = np.maximum(region, g_[:, :, None])
+        return pyvips.Image.new_from_memory(a_.tobytes(), ww, wh, 3, 'uchar').pngsave_buffer()
+
+    on_colour = dataclasses.replace(profiles.PROFILES['kindle-colorsoft'], strip_folio=True)
+    off_colour = dataclasses.replace(on_colour, strip_folio=False)
+    white_cases = {
+        'black': (_white_folio(), _white_folio(number=''), on, off),
+        'dark blue, in colour': (
+            _white_folio(ground=(20, 24, 70)),
+            _white_folio(number='', ground=(20, 24, 70)),
+            on_colour,
+            off_colour,
+        ),
+    }
+    whites = {
+        k: pipeline.render_page(n, p_on)[0] == pipeline.render_page(b, p_on)[0]
+        and pipeline.render_page(n, p_on)[0] != pipeline.render_page(n, p_off)[0]
+        for k, (n, b, p_on, p_off) in white_cases.items()
+    }
+    check(
+        'a white folio on dark ground is erased with the colour around it',
+        all(whites.values()),
+        f'renders as the page without it: {whites}',
+    )
+    on_grey = _white_folio(ground=(110, 110, 110))
+    on_stripes = _white_folio(stripes=(110, 110, 110))
+    check(
+        'but a white mark on grey is art and left alone, and so is one on ground only half black',
+        pipeline.render_page(on_grey, on)[0] == pipeline.render_page(on_grey, off)[0]
+        and pipeline.render_page(on_stripes, on)[0] == pipeline.render_page(on_stripes, off)[0],
+    )
+
+    def _edged(number: str) -> bytes:
+        im_ = pyvips.Image.new_from_buffer(_folio_page(number=number), '')
+        a_ = np.ndarray(
+            buffer=im_.cast('uchar').write_to_memory(), dtype=np.uint8, shape=(im_.height, im_.width)
+        ).copy()
+        h_, w_ = a_.shape
+        for y0_ in (h_ - 34, h_ - 12):
+            a_[y0_ : y0_ + 10, :14] = 20
+            a_[y0_ : y0_ + 10, w_ - 14 :] = 20
+        for x0_ in (200, 650):
+            a_[h_ - 12 :, x0_ : x0_ + 14] = 20
+        return pyvips.Image.new_from_memory(a_.tobytes(), w_, h_, 1, 'uchar').pngsave_buffer()
+
+    edged, edged_blank = _edged('123'), _edged('')
+    ink_, h_, w_ = _ink(edged)
+    found = folio._marks(ink_[folio._first_row(h_) :], h_, w_)
+    folio_bottom = max(m[3] for m in found if 0 < m[0] and m[2] < w_ - 1 and m[3] < h_ - 1)
+    per_edge = {
+        'left': sum(m[0] == 0 and m[3] > folio_bottom for m in found),
+        'right': sum(m[2] == w_ - 1 and m[3] > folio_bottom for m in found),
+        'bottom': sum(m[3] == h_ - 1 for m in found),
+    }
+    check(
+        'each edge of the page holds more marks below the folio than the reader is asked about',
+        all(n >= folio.MAX_READS for n in per_edge.values()),
+        f'{per_edge}, MAX_READS={folio.MAX_READS}',
+    )
+    check(
+        'marks on the page edge are read after the rest, so art running off the page does not crowd the folio out',
+        pipeline.render_page(edged, on)[0] == pipeline.render_page(edged_blank, on)[0]
+        and pipeline.render_page(edged, on)[0] != pipeline.render_page(edged, off)[0],
+    )
+
+    def _fake(line=('123', 1.0), found=('123', 1.0), calls=None):
+        def engine(img, use_det=True, **_kw):
+            if calls is not None:
+                calls.append('line' if use_det is False else 'detector')
+            if use_det is False:
+                return ([list(line)] if line else None), 0.0
+            ih, iw = img.shape[:2]
+            return ([[[[0, 0], [iw, 0], [iw, ih], [0, ih]], found[0], found[1]]] if found else None), 0.0
+
+        return engine
+
+    held_engine = folio._reader()
+
+    def _erases(engine, png: bytes = numbered) -> bool:
+        folio._engine = engine
+        try:
+            raw = pyvips.Image.new_from_buffer(png, '')
+            return folio.strip(raw, raw, off.autocrop_threshold) is not raw
+        finally:
+            folio._engine = held_engine
+
+    hair = float(np.nextafter(folio.MIN_SCORE, 0))
+    taken = {
+        'at': _erases(_fake(line=('123', 0.5), found=('123', folio.MIN_SCORE))),
+        'under': _erases(_fake(line=('123', 0.5), found=('123', hair))),
+    }
+    check(
+        'a read the detector is MIN_SCORE sure of is taken, and one a hair less sure is not',
+        taken == {'at': True, 'under': False},
+        f'{taken}',
+    )
+    line_hair = float(np.nextafter(folio.LINE_SCORE, 0))
+    routes = {}
+    for name, line in (
+        ('two digits at LINE_SCORE', ('12', folio.LINE_SCORE)),
+        ('a hair under', ('12', line_hair)),
+        ('one digit', ('7', 1.0)),
+        ('digits in other text', ('12a', 1.0)),
+        ('no digit', ('ab', 1.0)),
+        ('nothing', None),
+    ):
+        calls = []
+        erased = _erases(_fake(line=line, found=None, calls=calls))
+        routes[name] = (erased, 'detector' in calls)
+    check(
+        'a mark read off as one line of two digits or more, LINE_SCORE sure, is erased without the detector',
+        routes['two digits at LINE_SCORE'] == (True, False),
+        f'{routes}',
+    )
+    check(
+        'any other line read with a digit in it goes to the detector, and one with none is not a folio',
+        routes['a hair under'] == (False, True)
+        and routes['one digit'] == (False, True)
+        and routes['digits in other text'] == (False, True)
+        and routes['no digit'] == (False, False)
+        and routes['nothing'] == (False, False),
+        f'{routes}',
+    )
+
+    def _vertical(ratio_over: bool) -> bytes:
+        im_ = pyvips.Image.new_from_buffer(_folio_page(number=''), '')
+        a_ = np.ndarray(
+            buffer=im_.cast('uchar').write_to_memory(), dtype=np.uint8, shape=(im_.height, im_.width)
+        ).copy()
+        h_, w_ = a_.shape
+        mw_ = 8
+        mh_ = int(mw_ * folio.TALL) + (1 if ratio_over else 0)
+        y_ = h_ - 20 - mh_
+        a_[y_ : y_ + mh_, w_ // 2 : w_ // 2 + mw_] = 20
+        return pyvips.Image.new_from_memory(a_.tobytes(), w_, h_, 1, 'uchar').pngsave_buffer()
+
+    tall = {}
+    for over in (False, True):
+        calls = []
+        _erases(_fake(line=('12', 1.0), found=None, calls=calls), _vertical(over))
+        tall['past TALL' if over else 'at TALL'] = calls[:1]
+    check(
+        'a mark more than TALL times taller than wide may be set vertically, so only the detector reads it',
+        tall == {'at TALL': ['line'], 'past TALL': ['detector']},
+        f'first call: {tall}',
     )
 
 
