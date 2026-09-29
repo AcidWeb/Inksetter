@@ -108,6 +108,13 @@ class UnreadableImage(ValueError):
     pass
 
 
+class RenderFailed(UnreadableImage):
+    pass
+
+
+_RENDER_FAILURES: set[str] = set()
+
+
 def _open(buf: bytes) -> pyvips.Image:
     try:
         return _eight_bit(pyvips.Image.new_from_buffer(buf, ''))
@@ -362,11 +369,7 @@ _LINE_MAX = 4  # never shave more than this off one side
 
 def _strip_edge_lines(luma: pyvips.Image, threshold: int) -> tuple[int, int, int, int]:
     try:
-        a = np.ndarray(
-            buffer=luma.cast('uchar').write_to_memory(),
-            dtype=np.uint8,
-            shape=(luma.height, luma.width),
-        )
+        a = _to_numpy(luma.cast('uchar'))
     except pyvips.Error, ValueError:
         return (0, 0, 0, 0)
     ink = a < 255 - threshold
@@ -626,7 +629,7 @@ def _mono_pad_level(im: pyvips.Image, horizontal: bool, top: bool, bottom: bool)
 
 def _border_background(im: pyvips.Image) -> list[float]:
     frame = np.concatenate([_band_stack(part) for part in _sides(im)])
-    return [float(v) for v in np.median(frame, axis=0)]
+    return [float(v) for v in np.rint(np.median(frame, axis=0))]
 
 
 def _band_stack(part: pyvips.Image) -> np.ndarray:
@@ -825,8 +828,18 @@ def render_page(
         return buf, ''
     try:
         return _render_page(buf, p, max_width, source, pad_level)
+    except UnreadableImage:
+        raise
     except pyvips.Error as exc:
         raise UnreadableImage(f'not a readable image ({len(buf)} bytes)') from exc
+    except Exception as exc:
+        kind = type(exc).__name__
+        if kind in _RENDER_FAILURES:
+            log.warning('render: %s failed on a %d kB page (%s again)', p.name, len(buf) // 1024, kind)
+        else:
+            _RENDER_FAILURES.add(kind)
+            log.warning('render: %s failed on a %d kB page', p.name, len(buf) // 1024, exc_info=True)
+        raise RenderFailed(f'Inksetter failed to render the page ({type(exc).__name__})') from exc
 
 
 def _render_page(

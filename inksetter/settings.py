@@ -37,7 +37,7 @@ class Settings:
     public_base: str = os.environ.get('PUBLIC_BASE', '').rstrip('/')
 
     # Location of cache used by OPDS-PSE.
-    cache_dir: Path = Path(os.environ.get('CACHE_DIR', _cache_dir()))
+    cache_dir: Path = Path(os.environ.get('CACHE_DIR') or _cache_dir())
 
     # Maximum cache size.
     cache_max_bytes: int = _int('CACHE_MAX_BYTES', 8 * 1024**3)
@@ -59,7 +59,7 @@ class Settings:
     spool_max_bytes: int = _int('SPOOL_MAX_BYTES', 32 * 1024**2)
 
     # Where a spilled spool file lands.
-    spool_dir: str = os.environ.get('SPOOL_DIR', '') or str(Path(os.environ.get('CACHE_DIR', _cache_dir())))
+    spool_dir: str = os.environ.get('SPOOL_DIR', '') or str(Path(os.environ.get('CACHE_DIR') or _cache_dir()))
 
     # OCR finds page numbers in the bottom margin and erases them.
     ocr_enabled: bool = os.environ.get('OCR_ENABLED', '').strip().lower() not in ('false', '0', 'no', 'off')

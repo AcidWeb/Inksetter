@@ -38,6 +38,7 @@ _DIGIT = re.compile(r'\d')
 _engine = None
 _engine_lock = threading.Lock()
 _engine_failed = False
+_pass_warned = False
 
 
 def _reader():
@@ -217,7 +218,7 @@ def _ground_colour(im: pyvips.Image, box: tuple[int, int, int, int], h: int, w: 
     px = np.ndarray(buffer=region.write_to_memory(), dtype=np.uint8, shape=(oy1 - oy0, ox1 - ox0, im.bands))
     ring = np.ones(px.shape[:2], bool)
     ring[y0 - oy0 : y1 + 1 - oy0, x0 - ox0 : x1 + 1 - ox0] = False
-    return [float(v) for v in np.median(px[ring], axis=0)]
+    return [float(v) for v in np.rint(np.median(px[ring], axis=0))]
 
 
 def strip(im: pyvips.Image, luma: pyvips.Image, threshold: int) -> pyvips.Image:
@@ -260,5 +261,13 @@ def strip(im: pyvips.Image, luma: pyvips.Image, threshold: int) -> pyvips.Image:
                 patch = mask.ifthenelse(out.crop(left, top, right - left, bottom - top), patch)
             out = out.insert(patch, left, top)
     except pyvips.Error, MemoryError, ValueError:
+        return im
+    except Exception:
+        global _pass_warned
+        if _pass_warned:
+            log.debug('folio: the pass failed on this page; it ships with its page number', exc_info=True)
+        else:
+            _pass_warned = True
+            log.warning('folio: the pass failed on a page, which ships with its page number', exc_info=True)
         return im
     return out

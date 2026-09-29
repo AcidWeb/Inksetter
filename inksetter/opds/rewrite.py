@@ -5,6 +5,7 @@ Feed rewriting for OPDS 1.x (Atom), OPDS 2.0 (JSON) and Readium manifests.
 import re
 import json
 import base64
+import codecs
 from lxml import etree
 from dataclasses import dataclass
 from urllib.parse import quote, urljoin, urlsplit
@@ -113,8 +114,12 @@ def _names(spec: str) -> list[str]:
     return [n.strip() for n in spec.split(',') if n.strip()]
 
 
+def _bare(name: str) -> str:
+    return name.removesuffix('?').partition(':')[0].removesuffix('*')
+
+
 def _is_search_name(name: str) -> bool:
-    return name.removesuffix('?') in SEARCH_VARIABLES
+    return _bare(name) in SEARCH_VARIABLES
 
 
 def is_search_template(href: str | None) -> bool:
@@ -122,16 +127,20 @@ def is_search_template(href: str | None) -> bool:
 
 
 def fill_search(template: str, term: str) -> str:
-    value = quote(term, safe='')
+    def value(name: str) -> str:
+        size = name.removesuffix('?').partition(':')[2]
+        most = int(size) if size.isdecimal() else 0
+        return quote(term[:most] if 0 < most < 10000 else term, safe='')
 
     def expand(match: re.Match[str]) -> str:
         op, spec = match.groups()
         names = _names(spec)
         if op:
-            pairs = [f'{n}={value}' for n in names if _is_search_name(n)]
+            pairs = [f'{_bare(n)}={value(n)}' for n in names if _is_search_name(n)]
             return f'{op}{"&".join(pairs)}' if pairs else ''
-        if any(_is_search_name(n) for n in names):
-            return value
+        found = [n for n in names if _is_search_name(n)]
+        if found:
+            return ','.join(value(n) for n in found)
         return '' if spec.strip().endswith('?') else match.group(0)
 
     return EXPRESSION.sub(expand, template)
@@ -250,7 +259,7 @@ def _rewrite_link(link, ctx: Ctx, page_mime: str | None, cover: str | None) -> N
 def rewrite_atom(body: bytes, ctx: Ctx, page_mime: str | None, stream: bool = True) -> bytes:
     root = root_or_none(body)
     if root is None:
-        return body
+        return _unrewritten(body)
 
     if root.tag == f'{{{OSD_NS}}}OpenSearchDescription':
         return _rewrite_osd(root, ctx)
@@ -387,10 +396,10 @@ def _walk_json(
 
 def rewrite_json(body: bytes, ctx: Ctx, page_mime: str | None, stream: bool = True) -> bytes:
     try:
-        doc = json.loads(body)
-    except ValueError:
-        return body
-    try:
+        try:
+            doc = json.loads(body)
+        except ValueError:
+            return _unrewritten(body)
         _walk_json(doc, ctx, page_mime, stream=stream)
         return json.dumps(doc, ensure_ascii=False).encode('utf-8')
     except RecursionError as exc:
@@ -408,13 +417,36 @@ def rewrite(body: bytes, ctx: Ctx, page_mime: str | None, stream: bool = True) -
         return rewrite_json(body, ctx, page_mime, stream)
     if head == b'<':
         return rewrite_atom(body, ctx, page_mime, stream)
+    return _unrewritten(body)
+
+
+def _unrewritten(body: bytes) -> bytes:
+    secret = _secret()
+    if secret and secret.encode() in _narrow(body):
+        raise FeedError('upstream feed could not be parsed, and it holds the upstream key')
     return body
 
 
 _LEADING = b' \t\r\n\xef\xbb\xbf'
+_WIDE = (
+    (codecs.BOM_UTF32_LE, 'utf-32-le'),
+    (codecs.BOM_UTF32_BE, 'utf-32-be'),
+    (codecs.BOM_UTF16_LE, 'utf-16-le'),
+    (codecs.BOM_UTF16_BE, 'utf-16-be'),
+)
+_WIDE_BOMS = tuple(bom for bom, _ in _WIDE)
+
+
+def _narrow(body: bytes) -> bytes:
+    for bom, codec in _WIDE:
+        if body.startswith(bom):
+            return body[len(bom) :].decode(codec, 'ignore').encode('utf-8')
+    return body
 
 
 def _head(body: bytes) -> bytes:
+    if body.startswith(_WIDE_BOMS):
+        body = _narrow(body[:256])
     return body.lstrip(_LEADING)[:1]
 
 
@@ -434,6 +466,7 @@ def is_json(body: bytes) -> bool:
 
 
 def looks_like_feed(body: bytes) -> bool:
+    body = _narrow(body)
     if is_json(body):
         return b'"href"' in body
     root = _XML_ROOT.match(body.lstrip(_LEADING))

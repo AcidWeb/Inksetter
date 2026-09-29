@@ -11,7 +11,7 @@ import collections
 import concurrent.futures
 
 from . import webtoon
-from .pipeline import render_page, same_picture
+from .pipeline import RenderFailed, render_page, same_picture
 from .profiles import Profile, embedded_cover_for
 from .. import cores
 
@@ -82,8 +82,10 @@ def _emit(zout, job, blob: bytes | None, pad: int) -> tuple[int, int] | None:
 def _emit_rendered(zout, job, pad: int, render, *args) -> tuple[int, int] | None:
     try:
         blob, _ = render(*args)
-    except Exception:
-        log.warning('page %s failed to render; shipping it unchanged', job[2], exc_info=True)
+    except Exception as exc:
+        log.warning(
+            'page %s failed to render; shipping it unchanged', job[2], exc_info=not isinstance(exc, RenderFailed)
+        )
         blob = None
     return _emit(zout, job, blob, pad)
 

@@ -119,43 +119,54 @@ class _Kavita:
         self._token: str | None = None
         self._token_at = 0.0
         self._series: dict[int, tuple[dict | None, float | None]] = {}
-        self._lock = asyncio.Lock()
+        self._locks: dict[int, asyncio.Lock] = {}
+        self._auth_lock = asyncio.Lock()
+
+    def _lock(self, sid: int) -> asyncio.Lock:
+        lock = self._locks.get(sid)
+        if lock is None:
+            if len(self._locks) > 512:
+                self._locks = {k: v for k, v in self._locks.items() if v.locked()}
+            lock = self._locks[sid] = asyncio.Lock()
+        return lock
 
     def base(self) -> str:
         catalog = settings.upstream_catalog or ''
         cut = _OPDS_KEY.search(catalog)
         return catalog[: cut.start()] if cut and urlsplit(catalog).netloc else ''
 
-    async def _auth(self, *, refresh: bool = False) -> str | None:
-        if not refresh and self._token and time.monotonic() - self._token_at < 3600:
+    async def _auth(self, *, stale: str | None = None) -> str | None:
+        async with self._auth_lock:
+            if self._token and self._token != stale and time.monotonic() - self._token_at < 3600:
+                return self._token
+            self._token = None
+            resp = await client.raw.post(
+                f'{self.base()}/api/Plugin/authenticate',
+                params={'apiKey': api_key(), 'pluginName': 'inksetter'},
+            )
+            if resp.status_code != 200:
+                return None
+            self._token = resp.json().get('token')
+            self._token_at = time.monotonic()
             return self._token
-        self._token = None
-        resp = await client.raw.post(
-            f'{self.base()}/api/Plugin/authenticate',
-            params={'apiKey': api_key(), 'pluginName': 'inksetter'},
-        )
-        if resp.status_code != 200:
-            return None
-        self._token = resp.json().get('token')
-        self._token_at = time.monotonic()
-        return self._token
 
     async def _fetch(self, sid: int, token: str) -> dict | None:
         head = {'Authorization': f'Bearer {token}'}
-        meta = await client.raw.get(f'{self.base()}/api/Series/metadata', params={'seriesId': sid}, headers=head)
-        ser = await client.raw.get(f'{self.base()}/api/Series/{sid}', headers=head)
+        meta, ser = await asyncio.gather(
+            client.raw.get(f'{self.base()}/api/Series/metadata', params={'seriesId': sid}, headers=head),
+            client.raw.get(f'{self.base()}/api/Series/{sid}', headers=head),
+        )
         if 401 in (meta.status_code, ser.status_code):
             raise _Reauth
         if meta.status_code != 200 or ser.status_code != 200:
             return None
         series = ser.json()
-        manga = False
+        fetches = [client.raw.get(f'{self.base()}/api/Series/volumes', params={'seriesId': sid}, headers=head)]
         if isinstance(series.get('libraryId'), int):
-            lib = await client.raw.get(
-                f'{self.base()}/api/Library/type', params={'libraryId': series['libraryId']}, headers=head
-            )
-            manga = lib.status_code == 200 and _json_or_none(lib) == _MANGA_LIBRARY
-        vols = await client.raw.get(f'{self.base()}/api/Series/volumes', params={'seriesId': sid}, headers=head)
+            library = {'libraryId': series['libraryId']}
+            fetches.append(client.raw.get(f'{self.base()}/api/Library/type', params=library, headers=head))
+        vols, *lib = await asyncio.gather(*fetches)
+        manga = bool(lib) and lib[0].status_code == 200 and _json_or_none(lib[0]) == _MANGA_LIBRARY
         numbers, covers = {}, {}
         if vols.status_code == 200:
             for v in vols.json():
@@ -187,7 +198,7 @@ class _Kavita:
         hit = self._cached(sid)
         if hit is not _MISS:
             return hit
-        async with self._lock:
+        async with self._lock(sid):
             hit = self._cached(sid)
             if hit is not _MISS:
                 return hit
@@ -198,7 +209,7 @@ class _Kavita:
                     try:
                         out = await self._fetch(sid, token)
                     except _Reauth:
-                        token = await self._auth(refresh=True)
+                        token = await self._auth(stale=token)
                         out = await self._fetch(sid, token) if token else None
             except Exception:
                 out = None

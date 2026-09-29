@@ -545,6 +545,20 @@ def _kavita_like_feed(key: str):
     return Response(body, media_type='application/atom+xml;profile=opds-catalog')
 
 
+@upstream.get('/api/opds/{key}/odd/{shape}')
+def _kavita_odd(key: str, shape: str):
+    feed = _kavita_like_feed(key).body.decode()
+    keyed = json.dumps({'links': [{'href': f'/api/opds/{key}/feed'}]})
+    body, media = {
+        'html': (feed, 'text/html; charset=utf-8'),
+        'utf16': (feed.replace('encoding="utf-8"', 'encoding="utf-16"').encode('utf-16'), 'application/atom+xml'),
+        'broken': (keyed[:-2], 'application/opds+json'),
+        'utf16-json': (keyed.encode('utf-16'), 'application/octet-stream'),
+        'very-deep': ('[' * 200000 + ']' * 200000, 'application/json'),
+    }[shape]
+    return Response(body, media_type=media)
+
+
 LONG_JSON = json.dumps(
     {'metadata': {'title': 'Long', 'description': 'x' * 8000}, 'links': [{'href': f'/api/opds/{SEAL_KEY}/feed'}]}
 )
@@ -1923,11 +1937,31 @@ async def check_comicinfo() -> None:
 
     async def stays_down(k):
         await k.series_metadata(21)
+        first = len(api.urls)
         await k.series_metadata(21)
-        return None
+        return first
 
-    await with_kavita(api, stays_down, ttl=300.0)
-    check('a failure inside the TTL costs one round trip, not two', len(api.urls) == 1, f'{len(api.urls)} requests')
+    first = await with_kavita(api, stays_down, ttl=300.0)
+    check(
+        'a failure inside the TTL costs one round trip, not two',
+        first > 0 and len(api.urls) == first,
+        f'{first} requests, then {len(api.urls) - first} more',
+    )
+
+    class _SlowAuth(_Api):
+        async def post(self, url, params=None, **kw):
+            await asyncio.sleep(0.01)
+            return await super().post(url, params, **kw)
+
+    api = _SlowAuth()
+    await with_kavita(api, lambda k: asyncio.gather(k.series_metadata(21), k.series_metadata(22)))
+    check('two series looked up at once share one sign-in', api.auths == 1, f'{api.auths} auths')
+
+    api = _Api()
+    api.reject = {'JWT-1'}
+    await with_kavita(api, lambda k: k.series_metadata(21))
+    volumes = sum('/api/Series/volumes' in u for u in api.urls)
+    check('a lookup refused with a stale token asks for the volumes once', volumes == 1, f'{volumes} requests')
 
     api = _Api()
     vol1 = '/api/opds/KEY/series/21/volume/265/chapter/283/download/x.cbz'
@@ -6597,6 +6631,239 @@ async def check_epub(c) -> None:
             )
 
 
+async def check_fail_closed(c) -> None:
+    import logging as _logging
+    from inksetter import kavita
+
+    up = 'http://127.0.0.1:8899'
+    wide_key = SEAL_KEY.encode('utf-16-le')
+    real = kavita.settings
+    kavita.settings = dataclasses.replace(settings_mod.settings, upstream_catalog=f'{up}/api/opds/{SEAL_KEY}')
+    try:
+
+        def odd(shape: str) -> str:
+            return encode_token(f'{up}/api/opds/{SEAL_KEY}/odd/{shape}')
+
+        r = await _get(c, f'/kobo-clara-hd-2e-bw/f/{odd("html")}')
+        check(
+            'a feed labelled text/html is still rewritten, key and all',
+            r.status_code == 200 and SEAL_KEY not in r.text and '/kobo-clara-hd-2e-bw/' in r.text,
+            f'{r.status_code} {r.text[:60]}',
+        )
+        r = await _get(c, f'/kobo-clara-hd-2e-bw/f/{odd("utf16")}')
+        body = getattr(r, 'content', b'')
+        text = body.decode('utf-8', 'replace')
+        check(
+            'a UTF-16 feed is rewritten, key and all',
+            r.status_code == 200 and SEAL_KEY not in text and wide_key not in body and '/kobo-clara-hd-2e-bw/' in text,
+            f'{r.status_code} {text[:60]}',
+        )
+        r = await _get(c, f'/kobo-clara-hd-2e-bw/f/{odd("broken")}')
+        check(
+            'a keyed feed that will not parse is refused, not passed through',
+            r.status_code == 502 and SEAL_KEY not in r.text,
+            f'{r.status_code} {r.text[:60]}',
+        )
+        r = await _get(c, f'/kobo-clara-hd-2e-bw/dl/{odd("utf16-json")}')
+        check(
+            'a download of a UTF-16 JSON feed is refused too',
+            r.status_code == 502 and wide_key not in getattr(r, 'content', b''),
+            f'{r.status_code}',
+        )
+        r = await _get(c, f'/kobo-clara-hd-2e-bw/f/{odd("very-deep")}')
+        check('JSON too deep even to parse is a 502, not a crash', r.status_code == 502, f'{r.status_code}')
+
+        ctx = rewrite.Ctx('kobo-clara-hd-2e-bw', 'http://proxy.test', f'{up}/')
+        plain = '<<no key here'.encode('utf-16')
+        check('premise: a keyless body that will not parse passes through', rewrite.rewrite(plain, ctx, None) == plain)
+        try:
+            rewrite.rewrite(f'<<{SEAL_KEY}'.encode('utf-16'), ctx, None)
+            got = 'passed through'
+        except rewrite.FeedError:
+            got = 'FeedError'
+        check('a UTF-16 body holding the key that will not parse is refused', got == 'FeedError', got)
+    finally:
+        kavita.settings = real
+
+    for tpl, want in (
+        ('http://u/s{?searchTerms?}', 'http://u/s?searchTerms=a%20b'),
+        ('http://u/s{?query*}', 'http://u/s?query=a%20b'),
+        ('http://u/s/{searchTerms:40}', 'http://u/s/a%20b'),
+    ):
+        got = rewrite.fill_search(tpl, 'a b')
+        check(f'a search variable written {tpl[tpl.index("{") :]} is filled', got == want, got)
+    for tpl, want in (
+        ('http://u/s/{searchTerms:3}', 'http://u/s/abc'),
+        ('http://u/s{?query:2}', 'http://u/s?query=ab'),
+    ):
+        got = rewrite.fill_search(tpl, 'abcdef')
+        check(f'a prefix modifier {tpl[tpl.index("{") :]} keeps only that many characters', got == want, got)
+    for tpl, want in (
+        ('http://u/s/{searchTerms:0}', 'http://u/s/abcdef'),
+        ('http://u/s/{searchTerms:10000}', 'http://u/s/abcdef'),
+        ('http://u/s/{searchTerms,query}', 'http://u/s/abcdef,abcdef'),
+    ):
+        got = rewrite.fill_search(tpl, 'abcdef')
+        check(f'{tpl[tpl.index("{") :]} expands as RFC 6570 says', got == want, got)
+
+    with tempfile.TemporaryDirectory() as d:
+        dc = cache_mod.DiskCache(pathlib.Path(d), 150)
+        keys = [f'{i:02d}' + 'a' * 62 for i in range(3)]
+        for i, k in enumerate(keys):
+            dc.put(k, b'x' * 100, 'image/png')
+            os.utime(dc._paths(k)[0], (1000 + i, 1000 + i))
+        stuck = dc._paths(keys[0])[0]
+        real_unlink = pathlib.Path.unlink
+
+        def unlink(self, *a, **kw):
+            if self == stuck:
+                raise PermissionError('in use')
+            return real_unlink(self, *a, **kw)
+
+        try:
+            with mock.patch.object(pathlib.Path, 'unlink', unlink):
+                dc._trim()
+            escaped = ''
+        except OSError as exc:
+            escaped = type(exc).__name__
+        check('a cache trim carries on past a file it cannot delete', not escaped, escaped)
+        check('and leaves that entry whole, type and all', dc.get(keys[0]) is not None)
+        check('premise: the trim still freed what it could', not dc._paths(keys[1])[0].exists())
+
+    with tempfile.TemporaryDirectory() as d:
+        dc = cache_mod.DiskCache(pathlib.Path(d), 150)
+        for i in range(3):
+            dc.put(f'{i:02d}' + 'b' * 62, b'x' * 100, 'image/png')
+        trims = []
+        real_trim = dc._trim
+
+        def counted():
+            trims.append(1)
+            return real_trim()
+
+        mine, real_unlink = pathlib.Path(d), pathlib.Path.unlink
+
+        def refuse(self, *a, **kw):
+            if mine in self.parents:
+                raise PermissionError('in use')
+            return real_unlink(self, *a, **kw)
+
+        with mock.patch.object(dc, '_trim', counted), mock.patch.object(pathlib.Path, 'unlink', refuse):
+            await dc.maybe_trim()
+            over = dc._size
+            await dc.maybe_trim()
+        check('premise: a trim that can delete nothing stays over the cap', over is not None and over > dc.max_bytes)
+        check('and it is not retried on the very next miss', len(trims) == 1, f'{len(trims)} trims')
+
+    page = (pyvips.Image.black(200, 200) + 255).cast('uchar')
+    records = []
+
+    class _Grab(_logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    def boom(*_a, **_k):
+        raise RuntimeError('engine fell over')
+
+    grab = _Grab(level=_logging.DEBUG)
+    folio.log.addHandler(grab)
+    try:
+        with (
+            mock.patch.object(folio, '_ruled', boom),
+            mock.patch.object(folio, '_engine_failed', False),
+            mock.patch.object(folio, '_pass_warned', False),
+            mock.patch.object(folio.log, 'propagate', False),
+        ):
+            try:
+                outs, escaped = [folio.strip(page, page, 12) for _ in range(2)], ''
+            except Exception as exc:
+                outs, escaped = [], type(exc).__name__
+    finally:
+        folio.log.removeHandler(grab)
+    check('a folio pass that raises ships the page as it was', not escaped and all(o is page for o in outs), escaped)
+    warned = [r for r in records if r.levelno == _logging.WARNING]
+    check('and says so once, not on every page', len(warned) == 1, f'{len(warned)} warnings')
+
+    def broken(*_a, **_k):
+        raise IndexError('numpy fell over')
+
+    with (
+        mock.patch.object(pipeline, '_render_page', broken),
+        mock.patch.object(pipeline, '_RENDER_FAILURES', set()),
+        mock.patch.object(pipeline.log, 'warning') as warn,
+    ):
+        for _ in range(2):
+            try:
+                pipeline.render_page(b'x', profiles.PROFILES['kobo-clara-hd-2e-bw'])
+                got = 'returned'
+            except pipeline.UnreadableImage:
+                got = 'UnreadableImage'
+            except Exception as exc:
+                got = type(exc).__name__
+    check('a render that fails outside libvips is an unreadable page, not a crash', got == 'UnreadableImage', got)
+    traced = [bool(call.kwargs.get('exc_info')) for call in warn.call_args_list]
+    check('and the same failure again logs a line, not another traceback', traced == [True, False], f'{traced}')
+
+    page_url = encode_token('http://127.0.0.1:8899/opds/v1.2/books/7/pages/7')
+    with mock.patch.object(pipeline, '_render_page', broken), mock.patch.object(pipeline.log, 'warning'):
+        r = await _get(c, f'/kobo-clara-hd-2e-bw/pf/{page_url}', params={'maxWidth': 613})
+    check(
+        'and the route blames Inksetter for it, not the upstream',
+        r.status_code == 502 and 'upstream' not in r.text and 'Inksetter' in r.text,
+        f'{r.status_code} {r.text[:80]}',
+    )
+
+    records.clear()
+    grab = _Grab(level=_logging.DEBUG)
+    cbz.log.addHandler(grab)
+    try:
+        with mock.patch.object(cbz.log, 'propagate', False):
+            for exc in (pipeline.RenderFailed('ours'), RuntimeError('other')):
+
+                def fails(exc=exc):
+                    raise exc
+
+                cbz._emit_rendered(zipfile.ZipFile(io.BytesIO(), 'w'), ('page', 1, 'p1.jpg', b'x'), 4, fails)
+    finally:
+        cbz.log.removeHandler(grab)
+    traced = [bool(r.exc_info) for r in records if r.levelno == _logging.WARNING]
+    check(
+        'a download logs the traceback of a render failure once, not again beside render_page',
+        traced == [False, True],
+        f'{traced}',
+    )
+
+    code = 'from inksetter.settings import settings; print(settings.cache_dir); print(settings.spool_dir)'
+
+    def dirs(**env) -> list[str]:
+        e = {k: v for k, v in os.environ.items() if k not in ('CACHE_DIR', 'SPOOL_DIR')} | env
+        r = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, cwd=os.getcwd(), env=e)
+        return r.stdout.strip().splitlines()
+
+    unset, empty = dirs(), dirs(CACHE_DIR='')
+    check(
+        'an empty CACHE_DIR is unset, not the working directory',
+        len(unset) == 2 and '.' not in unset and empty == unset,
+        f'{empty} against {unset}',
+    )
+
+    pf = cache_mod.Prefetcher()
+    runs = []
+
+    async def job():
+        await asyncio.sleep(0)
+        runs.append(1)
+
+    pf.spawn(job(), 'k')
+    pf.spawn(job(), 'k')
+    await asyncio.gather(*pf._tasks)
+    await asyncio.sleep(0)
+    check('a prefetch in flight is not started twice', len(runs) == 1, f'{len(runs)} runs')
+    pf.spawn(job(), 'k')
+    await asyncio.gather(*pf._tasks)
+    check('a finished prefetch can be asked for again', len(runs) == 2, f'{len(runs)} runs')
+
+
 def _raw_token(token: str) -> str:
     return base64.urlsafe_b64decode(token + '=' * (-len(token) % 4)).decode('utf-8', 'replace')
 
@@ -7531,6 +7798,27 @@ async def main() -> int:
         pf = time.time() - t
         check('next page prefetched', r3.status_code == 200 and pf < 0.2, f'{pf * 1000:.0f}ms')
 
+        clara = profiles.PROFILES['kobo-clara-hd-2e-bw']
+        tpl = rewrite.decode_token(pse)
+        key1 = cache_mod.render_key(
+            tpl.replace('{pageNumber}', '1').replace('{maxWidth}', str(max(clara.width, 1072))), clara, 1072
+        )
+        url1 = tpl.replace('{pageNumber}', '1').replace('{maxWidth}', str(max(clara.width, 1072)))
+        reads = []
+        real_get = app_mod.cache.get
+
+        def get(key):
+            reads.append(key)
+            return real_get(key)
+
+        with mock.patch.object(app_mod.cache, 'get', get):
+            await app_mod._prefetch(url1, clara, 1072, {}, key1)
+            skipped = list(reads)
+            await app_mod._prefetch(url1, clara, 1072, {}, '0' * 64)
+        check('premise: the next page is in the cache', app_mod.cache.has(key1))
+        check('premise: a prefetch the cache check lets through reads the cache', key1 in reads, f'{len(reads)} reads')
+        check('a page already in the cache is not prefetched again', not skipped, f'{len(skipped)} reads')
+
         r = await c.get(f'/kobo-clara-hd-2e-bw/p/{pse}', params={'page': 0, 'maxWidth': 600})
         w2, _, _ = grey_levels(r.content)
         check('maxWidth clamps down', w2 <= 600, f'width={w2}')
@@ -8023,6 +8311,8 @@ async def main() -> int:
 
         print('security')
         await check_security(c)
+        print('failing closed')
+        await check_fail_closed(c)
 
         print('http edges')
         await check_http_edges(c)

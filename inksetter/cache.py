@@ -7,6 +7,7 @@ import os
 import time
 import asyncio
 import hashlib
+import contextlib
 import dataclasses
 from pathlib import Path
 
@@ -40,6 +41,7 @@ class DiskCache:
         self._trimming = False
         self._size: int | None = None
         self._written_during_trim = 0
+        self._next_trim = 0.0
         self.root.mkdir(parents=True, exist_ok=True)
 
     def _paths(self, key: str) -> tuple[Path, Path]:
@@ -58,6 +60,9 @@ class DiskCache:
         except OSError:
             pass
         return data, ctype
+
+    def has(self, key: str) -> bool:
+        return self._paths(key)[0].exists()
 
     def put(self, key: str, data: bytes, ctype: str) -> None:
         blob, meta = self._paths(key)
@@ -90,7 +95,7 @@ class DiskCache:
         return lock
 
     async def maybe_trim(self) -> None:
-        if self._trimming:
+        if self._trimming or time.monotonic() < self._next_trim:
             return
         if self._size is not None and self._size <= self.max_bytes:
             return
@@ -99,10 +104,13 @@ class DiskCache:
         try:
             total = await asyncio.to_thread(self._trim)
             self._size = total + self._written_during_trim
+            if total > self.max_bytes:
+                self._next_trim = time.monotonic() + self._TRIM_COOLDOWN
         finally:
             self._trimming = False
 
     _ORPHAN_AGE = 60.0
+    _TRIM_COOLDOWN = 300.0
 
     def _sweep_orphans(self) -> None:
         cutoff = time.time() - self._ORPHAN_AGE
@@ -131,9 +139,13 @@ class DiskCache:
         for _, size, blob in entries:
             if total <= target:
                 break
-            blob.with_suffix('.type').unlink(missing_ok=True)
-            blob.unlink(missing_ok=True)
+            try:
+                blob.unlink(missing_ok=True)
+            except OSError:
+                continue
             total -= size
+            with contextlib.suppress(OSError):
+                blob.with_suffix('.type').unlink(missing_ok=True)
         return total
 
 
@@ -146,15 +158,11 @@ class Prefetcher:
         if dedup_key in self._seen:
             coro.close()
             return
-        if len(self._seen) > 8192:
-            self._seen.clear()
         self._seen.add(dedup_key)
         task = asyncio.create_task(coro)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
-
-    def forget(self, dedup_key: str) -> None:
-        self._seen.discard(dedup_key)
+        task.add_done_callback(lambda _: self._seen.discard(dedup_key))
 
     async def drain(self) -> None:
         tasks = [t for t in self._tasks if not t.done()]

@@ -23,7 +23,7 @@ from fastapi.responses import (
 from . import kavita, logs, web
 from .cache import DiskCache, Prefetcher, render_key
 from .imaging import cbz, profiles
-from .imaging.pipeline import UnreadableImage, render_page
+from .imaging.pipeline import RenderFailed, UnreadableImage, render_page
 from .imaging.profiles import Profile, cover_for
 from .opds import rewrite
 from .opds.upstream import CREDENTIAL_REQUEST, FORWARD_RESPONSE, UpstreamError, client, open_range, request_headers
@@ -170,7 +170,7 @@ async def _serve_feed(request: Request, profile_name: str, url: str) -> Response
     resp = await client.get(url, request_headers(request.headers, forward_accept=True))
     ctype = resp.headers.get('content-type', '')
     page_mime = None if p.fmt == 'raw' else p.mime
-    if rewrite.is_feed(ctype, resp.content):
+    if rewrite.is_feed(ctype, resp.content) or rewrite.looks_like_feed(resp.content):
         body = rewrite.rewrite(resp.content, _ctx(request, profile_name, str(resp.url)), page_mime, not p.reslice)
     else:
         body = resp.content
@@ -292,7 +292,8 @@ async def _render_cached(url: str, p: Profile, max_width: int | None, headers: d
                 try:
                     blob, ctype = await asyncio.to_thread(render_page, resp.content, p, max_width)
                 except UnreadableImage as exc:
-                    raise UpstreamError(502, f'upstream page: {exc}') from exc
+                    detail = str(exc) if isinstance(exc, RenderFailed) else f'upstream page: {exc}'
+                    raise UpstreamError(502, detail) from exc
         await asyncio.to_thread(cache.put, key, blob, ctype)
 
     await cache.maybe_trim()
@@ -322,10 +323,8 @@ async def page(profile: str, token: str, request: Request, page: str = '0', maxW
 
     for n in range(page_no + 1, page_no + 1 + settings.prefetch):
         url = build(n)
-        prefetcher.spawn(
-            _prefetch(url, p, max_width or None, headers),
-            render_key(url, p, max_width or None, _credentials(headers)),
-        )
+        key = render_key(url, p, max_width or None, _credentials(headers))
+        prefetcher.spawn(_prefetch(url, p, max_width or None, headers, key), key)
 
     return Response(
         blob,
@@ -334,12 +333,10 @@ async def page(profile: str, token: str, request: Request, page: str = '0', maxW
     )
 
 
-async def _prefetch(url: str, p: Profile, max_width: int | None, headers: dict[str, str]) -> None:
-    key = render_key(url, p, max_width, _credentials(headers))
-    try:
-        await _render_cached(url, p, max_width, headers)
-    except Exception:
-        prefetcher.forget(key)
+async def _prefetch(url: str, p: Profile, max_width: int | None, headers: dict[str, str], key: str) -> None:
+    with contextlib.suppress(Exception):
+        if not await asyncio.to_thread(cache.has, key):
+            await _render_cached(url, p, max_width, headers)
 
 
 @app.api_route('/{profile}/pf/{token}', methods=['GET', 'HEAD'])
