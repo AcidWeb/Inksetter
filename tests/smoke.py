@@ -4775,6 +4775,428 @@ def check_reslice_edges() -> None:
     )
 
 
+def _lettering(text: str, width: int = 1272, x: int | None = None) -> np.ndarray:
+    t = pyvips.Image.text(text, dpi=300, font='DejaVu Sans Bold')
+    ink = np.ndarray(buffer=t.cast('uchar').write_to_memory(), dtype=np.uint8, shape=(t.height, t.width)) > 128
+    used = np.flatnonzero(ink.any(axis=1))
+    ink = ink[used[0] : used[-1] + 1]
+    rows = np.full((len(ink), width, 3), 255, np.uint8)
+    x = (width - ink.shape[1]) // 2 if x is None else x
+    rows[:, x : x + ink.shape[1]][ink] = 0
+    return rows
+
+
+def check_strip_lettering() -> None:
+    p = profiles.PROFILES['kindle-colorsoft-webtoon']
+    L = p.height
+    reader = folio._reader()
+    check('premise: the text detector is there to ask', reader is not None)
+
+    def bubble(gap: int, first: str | None = 'I NEEDED', first_x=None, second_x=None, lead=0, over=0, under=0):
+        above = _lettering(first, x=first_x) if first else _panel_strip(('smooth', 60))
+        parts = [
+            _panel_strip(('smooth', lead or round(1.05 * L))),
+            _panel_strip(('white', 8)),
+            above,
+            _panel_strip(('smooth', over)),
+            _panel_strip(('white', gap)),
+            _panel_strip(('smooth', under), seed=9),
+            _lettering('TO BE AN EXAMPLE', x=second_x),
+            _panel_strip(('white', 200)),
+            _panel_strip(('smooth', L), seed=8),
+        ]
+        g0 = sum(len(x) for x in parts[:4])
+        return np.concatenate(parts), g0, g0 + gap, g0 + gap + under + len(parts[6])
+
+    asked = []
+
+    def spy(img, *args, **kw):
+        asked.append((args, kw))
+        return reader(img, *args, **kw)
+
+    block, g0, g1, l2 = bubble(26)
+    lohi = webtoon._lohi(block)
+    blind = webtoon._gutter_seam(lohi, L)
+    check(
+        'premise: past the fold, the first gutter the seam finds is the gap between two lines of one bubble',
+        L < g0 and g0 <= (blind or 0) < g1,
+        f'cut at {blind}, gap {g0}..{g1}, fold {L}',
+    )
+    with mock.patch.object(folio, '_engine', spy):
+        got = webtoon._gutter_seam(lohi, L, block)
+        check(
+            'shown the rows, it reads the lettering and cuts after the second line instead',
+            got == l2,
+            f'cut at {got}, second line ends at {l2}',
+        )
+        check(
+            'and asks the detector for boxes alone, with no argument that would retune it for the folio pass',
+            asked and all(a == () and k == {'use_det': True, 'use_cls': False, 'use_rec': False} for a, k in asked),
+            f'{asked}',
+        )
+        wide, w0, w1, _ = bubble(60)
+        before = len(asked)
+        got = webtoon._gutter_seam(webtoon._lohi(wide), L, wide)
+        check(
+            'a gap between lines as tall as a gutter can be is a gutter, and the detector is not asked',
+            w0 <= (got or 0) < w1 and len(asked) == before,
+            f'cut at {got}, gap {w0}..{w1}, asked {len(asked) - before}',
+        )
+        lines = [_lettering(t) for t in ('I KNEW', 'IT WOULD', 'WORK OUT')]
+        three = np.concatenate(
+            [
+                _panel_strip(('smooth', round(1.05 * L))),
+                _panel_strip(('white', 8)),
+                lines[0],
+                _panel_strip(('white', 26)),
+                lines[1],
+                _panel_strip(('white', 60)),
+                lines[2],
+                _panel_strip(('white', 200)),
+                _panel_strip(('smooth', L), seed=8),
+            ]
+        )
+        t0 = round(1.05 * L) + 8 + len(lines[0])
+        t1 = t0 + 26 + len(lines[1])
+        t2 = t1 + 60 + len(lines[2])
+        blind = webtoon._gutter_seam(webtoon._lohi(three), L)
+        got = webtoon._gutter_seam(webtoon._lohi(three), L, three)
+        check(
+            'premise: a bubble of three lines, the first gap short and the second as tall as a gutter can be',
+            t0 <= (blind or 0) < t0 + 26,
+            f'cut at {blind}, gaps {t0}..{t0 + 26} and {t1}..{t1 + 60}',
+        )
+        check(
+            'once one gap proves to lie between lines, the next is read whatever its height: the bubble stays whole',
+            got == t2,
+            f'cut at {got}, last line ends at {t2}',
+        )
+        lone, o0, o1, _ = bubble(26, first=None)
+        before = len(asked)
+        got = webtoon._gutter_seam(webtoon._lohi(lone), L, lone)
+        check(
+            'a short gap with lettering below it and artwork above is a gutter',
+            o0 <= (got or 0) < o1 and len(asked) > before,
+            f'cut at {got}, gap {o0}..{o1}, asked {len(asked) - before}',
+        )
+        for side_, kw in (('above', {'over': 50}), ('below', {'under': 50})):
+            apart, a0, a1, _ = bubble(26, **kw)
+            before = len(asked)
+            got = webtoon._gutter_seam(webtoon._lohi(apart), L, apart)
+            check(
+                f'lettering 50 rows {side_} a short gap, beyond artwork, is another bubble, and the gap is a gutter',
+                a0 <= (got or 0) < a1 and len(asked) > before,
+                f'cut at {got}, gap {a0}..{a1}, asked {len(asked) - before}',
+            )
+        far, f0, f1, _ = bubble(26, lead=round(2.0 * L) - 20 - 8 - len(_lettering('I NEEDED')))
+        before = len(asked)
+        got = webtoon._gutter_seam(webtoon._lohi(far), L, far)
+        check(
+            'a gap running on past the end of the search window may be a gutter too long to see, and is taken',
+            f0 < round(2.0 * L) < f1 and f0 <= (got or 0) < f1 and len(asked) == before,
+            f'cut at {got}, gap {f0}..{f1}, window ends {round(2.0 * L)}, asked {len(asked) - before}',
+        )
+    side, s0, s1, _ = bubble(26, first_x=40, second_x=620)
+    found, _ = reader(side[s0 - 300 : s1 + 300].copy(), use_det=True, use_cls=False, use_rec=False)
+    ys = [(min(q[1] for q in b) + s0 - 300, max(q[1] for q in b) + s0 - 300) for b in found or []]
+    check(
+        'premise: the detector finds a line above that gap and one below it',
+        any(b < s0 + 4 for _, b in ys) and any(t > s1 - 4 for t, _ in ys),
+        f'{ys}, gap {s0}..{s1}',
+    )
+    got = webtoon._gutter_seam(webtoon._lohi(side), L, side)
+    check(
+        'but a line to the left above a line to the right is two bubbles, and the gap between them is a gutter',
+        s0 <= (got or 0) < s1,
+        f'cut at {got}, gap {s0}..{s1}',
+    )
+
+    def broken(*_a, **_k):
+        raise RuntimeError('the model is gone')
+
+    with mock.patch.object(folio, '_engine', broken):
+        got = webtoon._gutter_seam(lohi, L, block)
+    check('a detector that fails leaves the gap a gutter, as before', g0 <= (got or 0) < g1, f'cut at {got}')
+    with mock.patch.object(folio, '_engine', None), mock.patch.object(folio, '_engine_failed', True):
+        got = webtoon._gutter_seam(lohi, L, block)
+    check('and so does a reader that could not start', g0 <= (got or 0) < g1, f'cut at {got}')
+
+    def first_page(q, *slices) -> int:
+        z = zipfile.ZipFile(io.BytesIO(_archive_of(*slices)))
+        order = sorted(z.infolist(), key=lambda i: cbz.natural_key(i.filename))
+        return next(len(t[3]) for t in webtoon.strip_tiles(cbz._entries(z, order), q, {}) if t[0] == 'tile')
+
+    on = first_page(p, block)
+    try:
+        profiles.use_folio(False)
+        off = first_page(profiles.PROFILES['kindle-colorsoft-webtoon'], block)
+    finally:
+        profiles.use_folio(True)
+    check('a download keeps both lines of the bubble on one page', on == l2, f'first page {on} rows, lines end {l2}')
+    check(
+        'and with OCR turned off, the cut is where it always was',
+        g0 <= off < g1,
+        f'first page {off} rows, gap {g0}..{g1}',
+    )
+    window = round(2.0 * L)
+    edge, e0, e1, _ = bubble(26, lead=window - 8 - 26 - 8 - len(_lettering('I NEEDED')))
+    whole, split = first_page(p, edge), first_page(p, edge[: window + 1], edge[window + 1 :])
+    check(
+        'premise: a gap ending 8 rows short of the search window, its second line running on past the window',
+        e1 == window - 8,
+        f'gap {e0}..{e1}, window ends {window}',
+    )
+    check(
+        'the detector sees the line running past the window, so that gap is not taken for a gutter either',
+        not e0 <= whole < e1,
+        f'first page {whole} rows, gap {e0}..{e1}',
+    )
+    check(
+        'and the rows past the window are always there to show it, so the cut does not hang on how the strip is sliced',
+        whole == split,
+        f'first page {whole} rows from one slice, {split} from two',
+    )
+
+
+def check_strip_fill() -> None:
+    p = profiles.PROFILES['kindle-colorsoft-webtoon']
+    L = p.height
+
+    def strip(first, gap, second, after=0.20):
+        parts = [
+            _panel_strip(('smooth', round(first * L))),
+            _panel_strip(('white', round(gap * L))),
+            _panel_strip(('smooth', round(second * L)), seed=9),
+            _panel_strip(('white', round(after * L))),
+            _panel_strip(('smooth', L), seed=8),
+        ]
+        edges = np.cumsum([len(x) for x in parts])
+        return np.concatenate(parts), edges
+
+    def first_page(block, q=p) -> np.ndarray:
+        z = zipfile.ZipFile(io.BytesIO(_archive_of(block)))
+        order = sorted(z.infolist(), key=lambda i: cbz.natural_key(i.filename))
+        return next(t[3] for t in webtoon.strip_tiles(cbz._entries(z, order), q, {}) if t[0] == 'tile')
+
+    block, (a1, g1, b1, g2, _) = strip(0.45, 0.15, 0.48)
+    lohi = webtoon._lohi(block)
+    before = webtoon._gutter_seam(lohi, L)
+    check(
+        'premise: artwork to 45% of a screen, a gutter to 60%, and the next artwork ending past the fold, at 108%',
+        a1 <= (before or 0) < g1 and L < b1 < g2,
+        f'cut at {before}, gutter {a1}..{g1}, next artwork ends {b1}, fold {L}',
+    )
+    page = first_page(block)
+    check(
+        'a page that would be over half blank takes the next artwork too, down to the gutter after it',
+        len(page) == b1 and np.array_equal(page, block[:b1]),
+        f'first page {len(page)} rows, next artwork ends {b1}, gutter before it at {a1}..{g1}',
+    )
+    check(
+        'and is shrunk to fit no smaller than 90%',
+        0.9 <= L / len(page) < 1.0,
+        f'shown at {L / len(page):.3f}',
+    )
+    far, (fa, f1, fb, _, _) = strip(0.45, 0.15, 0.55)
+    got = len(first_page(far))
+    check(
+        'an artwork ending at 115% of a screen would shrink the page below 90%, so it starts the next page instead',
+        fa <= got < f1 and fb > L / 0.9,
+        f'first page {got} rows, gutter {fa}..{f1}, next artwork ends {fb}',
+    )
+    tight, (ta, t1, tb, tg, _) = strip(0.45, 0.15, 0.48, after=0.02)
+    got = len(first_page(tight))
+    check(
+        'the gutter after the next artwork must be as tall as a band, not a gap between two lines of large lettering',
+        ta <= got < t1 and tg - tb > round(L * webtoon.STRIP_GUTTER_MIN),
+        f'first page {got} rows, gutter {ta}..{t1}, the next artwork is followed by {tg - tb} rows of white',
+    )
+    parts = [
+        _panel_strip(('smooth', round(0.45 * L))),
+        _panel_strip(('white', round(0.15 * L))),
+        _panel_strip(('smooth', round(0.40 * L)), seed=9),
+        _panel_strip(('white', 8)),
+        _lettering('THE GREATEST'),
+        _panel_strip(('white', 60)),
+        _lettering('ESTATE'),
+        _panel_strip(('white', 200)),
+        _panel_strip(('smooth', L), seed=8),
+    ]
+    logo = np.concatenate(parts)
+    la, lf = (sum(len(x) for x in parts[:k]) for k in (1, 2))
+    lg = sum(len(x) for x in parts[:5])
+    got = len(first_page(logo))
+    try:
+        profiles.use_folio(False)
+        blind = len(first_page(logo, profiles.PROFILES['kindle-colorsoft-webtoon']))
+    finally:
+        profiles.use_folio(True)
+    check(
+        'premise: with OCR off, the page takes the next artwork down to a 60-row gap between two lines of a title',
+        blind == lg and 60 > round(L * webtoon.STRIP_BAND_MIN) and L < lg <= L / 0.9,
+        f'first page {blind} rows, the gap starts at {lg}',
+    )
+    check(
+        'the detector reads that gap, taller than any the lettering rule reads, and the title stays whole',
+        la <= got < lf and 60 > round(L * webtoon.STRIP_LETTERING),
+        f'first page {got} rows, gutter {la}..{lf}',
+    )
+    parts[5] = _panel_strip(('white', round(0.10 * L)))
+    apart = np.concatenate(parts)
+    asked = []
+    reader = folio._reader()
+
+    def spy(img, *args, **kw):
+        asked.append(1)
+        return reader(img, *args, **kw)
+
+    with mock.patch.object(folio, '_engine', spy):
+        got = len(first_page(apart))
+    check(
+        'but white a tenth of a screen tall is a gutter whatever lies round it: the detector is not asked, '
+        'and the page takes the next artwork down to it',
+        got == lg and not asked,
+        f'first page {got} rows, the gap starts at {lg}, detector asked {len(asked)} times',
+    )
+    full, (ua, uf, ub, _, _) = strip(0.65, 0.10, 0.28)
+    got = len(first_page(full))
+    check(
+        'a page 35% blank below its artwork is left as it is, though the next artwork would fit at 97%',
+        ua <= got < uf and L < ub <= L / 0.9,
+        f'first page {got} rows, gutter {ua}..{uf}, next artwork ends {ub}',
+    )
+    grey = np.concatenate(
+        [
+            _panel_strip(('smooth', round(0.45 * L))),
+            _panel_strip(('grey', round(0.20 * L))),
+            _panel_strip(('white', round(0.05 * L))),
+            _panel_strip(('smooth', round(0.32 * L)), seed=9),
+            _panel_strip(('white', round(0.20 * L))),
+            _panel_strip(('smooth', L), seed=8),
+        ]
+    )
+    g_art, g_white, g_next = round(0.65 * L), round(0.70 * L), round(1.02 * L)
+    got = len(first_page(grey))
+    check(
+        'a flat grey panel edge below the artwork is not blank: white from 65% down leaves the page as it is',
+        g_art <= got < g_white and L < g_next <= L / 0.9,
+        f'first page {got} rows, white {g_art}..{g_white}, next artwork ends {g_next}',
+    )
+    across = np.concatenate(
+        [
+            _panel_strip(('smooth', round(0.45 * L))),
+            _panel_strip(('white', round(0.62 * L))),
+            _panel_strip(('smooth', round(0.02 * L)), seed=9),
+            _panel_strip(('white', round(0.20 * L))),
+            _panel_strip(('smooth', L), seed=8),
+        ]
+    )
+    plain = webtoon._gutter_seam(webtoon._lohi(across), L)
+    got = webtoon._gutter_seam(webtoon._lohi(across), L, None, True)
+    check(
+        'a gutter running on across the fold is cut where it always was, with nothing after it on the screen',
+        got == plain,
+        f'cut at {got}, without the rule at {plain}',
+    )
+    margin = round(L * webtoon.STRIP_TOP_MARGIN)
+    fresh = webtoon._cut(block, lohi, L, margin, False)[0]
+    resumed = webtoon._cut(block, lohi, L, margin, True)[0]
+    check(
+        'a page carried on from a cut through artwork ends at its first gutter, as a planned artwork needs it to',
+        fresh == b1 and a1 <= resumed < g1,
+        f'opening on a gutter {fresh}, carried on {resumed}',
+    )
+
+
+def check_strip_decode_ahead() -> None:
+    p = profiles.PROFILES['kindle-colorsoft-webtoon']
+    src = _strip_cbz([900, 700, 1100, 800, 1000, 600, 1200, 900, 700, 1000], gutter=[(1, 300), (4, 500), (7, 200)])
+
+    def cut(threads: int, entries=None):
+        real = webtoon.STRIP_DECODE_THREADS
+        webtoon.STRIP_DECODE_THREADS = threads
+        try:
+            z = zipfile.ZipFile(io.BytesIO(src))
+            order = sorted(z.infolist(), key=lambda i: cbz.natural_key(i.filename))
+            got = entries(cbz._entries(z, order)) if entries else cbz._entries(z, order)
+            return [(t[3].tobytes(), t[4], t[5]) for t in webtoon.strip_tiles(got, p, {}) if t[0] == 'tile']
+        finally:
+            webtoon.STRIP_DECODE_THREADS = real
+
+    serial, ahead = cut(0), cut(webtoon.STRIP_DECODE_THREADS)
+    check(
+        'slices decoded ahead are cut into exactly the pages decoded one at a time',
+        len(serial) > 3 and ahead == serial,
+        f'{len(serial)} pages one at a time, {len(ahead)} ahead, same: {ahead == serial}',
+    )
+
+    lock, now, most, where = threading.Lock(), [0], [0], set()
+    real_rows = webtoon._strip_rows
+
+    def slow(blob, q):
+        with lock:
+            now[0] += 1
+            most[0] = max(most[0], now[0])
+            where.add(threading.current_thread().name)
+        time.sleep(0.05)
+        try:
+            return real_rows(blob, q)
+        finally:
+            with lock:
+                now[0] -= 1
+
+    pulled, added, gap = [0], [0], [0]
+    real_add = webtoon._Held.add
+
+    def counted(entries):
+        for e in entries:
+            pulled[0] += 1
+            yield e
+
+    def add(self, a):
+        added[0] += 1
+        gap[0] = max(gap[0], pulled[0] - added[0])
+        return real_add(self, a)
+
+    with mock.patch.object(webtoon, '_strip_rows', slow), mock.patch.object(webtoon._Held, 'add', add):
+        slowed = cut(2, counted)
+    check('and decoded slowly, the pages are still the same', slowed == serial)
+    check(
+        'the slices are decoded two at a time, off the thread that cuts them',
+        most[0] == 2 and threading.current_thread().name not in where,
+        f'at most {most[0]} at once, on {sorted(where)}',
+    )
+    check(
+        'and never more than four entries ahead of the cutter',
+        0 < gap[0] <= 4,
+        f'at most {gap[0]} entries read ahead of the rows the cutter took',
+    )
+
+    started = [0]
+
+    def slower(blob, q):
+        started[0] += 1
+        time.sleep(0.2)
+        return real_rows(blob, q)
+
+    z = zipfile.ZipFile(io.BytesIO(src))
+    order = sorted(z.infolist(), key=lambda i: cbz.natural_key(i.filename))
+    with mock.patch.object(webtoon, '_strip_rows', slower):
+        strip = webtoon.strip_tiles(cbz._entries(z, order), p, {})
+        first = next(t for t in strip if t[0] == 'tile')
+        running = any(t.name.startswith('strip-decode') for t in threading.enumerate())
+        strip.close()
+        closed = started[0]
+        left = [t.name for t in threading.enumerate() if t.name.startswith('strip-decode')]
+        time.sleep(0.5)
+    check(
+        'a download closed after its first page leaves no decoding behind, nor starts any',
+        first is not None and running and not left and started[0] == closed < len(order),
+        f'decoding while cutting: {running}; threads left: {left}; decodes started {closed} by the close, '
+        f'{started[0]} after, of {len(order)}',
+    )
+
+
 def check_strip_rescue() -> None:
     p = profiles.PROFILES['kindle-colorsoft-webtoon']
     limit, w = p.height, p.width
@@ -5252,9 +5674,10 @@ def check_strip_plan() -> None:
         first[5] == 'bottom' and len(first[3]) < limit,
         f'first page {len(first[3])} rows, anchored {first[5]}',
     )
+    decoding = 2 * webtoon.STRIP_DECODE_THREADS
     check(
-        'and no more than eight screens are read to find that out',
-        pulled[0] * 500 <= 8 * limit + 2 * 500 + 150,
+        'and no more than eight screens are read to find that out, bar the entries decoded ahead',
+        pulled[0] * 500 <= 8 * limit + (2 + decoding) * 500 + 150,
         f'{pulled[0] * 500} rows read before the first page, eight screens {8 * limit}',
     )
 
@@ -7797,6 +8220,10 @@ async def main() -> int:
         r3 = await c.get(f'/kobo-clara-hd-2e-bw/p/{pse}', params={'page': 1, 'maxWidth': 1072})
         pf = time.time() - t
         check('next page prefetched', r3.status_code == 200 and pf < 0.2, f'{pf * 1000:.0f}ms')
+        for _ in range(200):
+            if all(task.done() for task in app_mod.prefetcher._tasks):
+                break
+            await asyncio.sleep(0.05)
 
         clara = profiles.PROFILES['kobo-clara-hd-2e-bw']
         tpl = rewrite.decode_token(pse)
@@ -8393,6 +8820,9 @@ async def main() -> int:
     print('webtoon re-slicing')
     check_reslice()
     check_reslice_edges()
+    check_strip_lettering()
+    check_strip_fill()
+    check_strip_decode_ahead()
     print('no gutter in reach')
     check_strip_rescue()
     print('split artwork')

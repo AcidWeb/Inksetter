@@ -154,7 +154,7 @@ height = 1680
 
 
 # --------------------------------------------------------------------------
-# Webtoons: vertical strips, read in KOReader's continuous mode.
+# Webtoons: vertical strips.
 # --------------------------------------------------------------------------
 
 [mixins.kaleido-webtoon]

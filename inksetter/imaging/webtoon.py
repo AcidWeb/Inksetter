@@ -7,9 +7,11 @@ import pyvips
 import math
 import logging
 import functools
+import collections
 import dataclasses
+import concurrent.futures
 
-from . import pipeline
+from . import folio, pipeline
 from .pipeline import render_page
 from .profiles import Profile
 
@@ -36,6 +38,12 @@ STRIP_OVERLAP_FAR = 0.25
 STRIP_EVEN_FLOOR = 0.80
 STRIP_EVEN_SLACK = 0.06
 STRIP_PLAN_REACH = 8.00
+STRIP_LETTERING = 0.025
+STRIP_READ_ROWS = 736
+STRIP_DECODE_THREADS = 2
+STRIP_FILL_BLANK = 0.40
+STRIP_FILL_FLOOR = 0.90
+STRIP_FILL_READ = 0.08
 
 
 def _strip_rows(blob: bytes, p: Profile) -> np.ndarray | None:
@@ -53,6 +61,29 @@ def _strip_rows(blob: bytes, p: Profile) -> np.ndarray | None:
         log.warning('strip: an entry would not decode; it is left out of the page', exc_info=True)
         return None
     return a if a.size else None
+
+
+def _decoded(entries, p: Profile):
+    if STRIP_DECODE_THREADS <= 0:
+        for entry in entries:
+            yield entry, _strip_rows(entry[3], p) if entry[0] == 'page' else None
+        return
+    pool = concurrent.futures.ThreadPoolExecutor(STRIP_DECODE_THREADS, thread_name_prefix='strip-decode')
+    ahead = collections.deque()
+    source = iter(entries)
+    try:
+        while True:
+            while len(ahead) < 2 * STRIP_DECODE_THREADS:
+                entry = next(source, None)
+                if entry is None:
+                    break
+                ahead.append((entry, pool.submit(_strip_rows, entry[3], p) if entry[0] == 'page' else None))
+            if not ahead:
+                return
+            entry, decoding = ahead.popleft()
+            yield entry, decoding.result() if decoding is not None else None
+    finally:
+        pool.shutdown(cancel_futures=True)
 
 
 def _inner(rows: np.ndarray) -> np.ndarray:
@@ -128,7 +159,37 @@ def _run_at(mask: np.ndarray, i: int) -> tuple[int, int]:
     return start, end
 
 
-def _gutter_seam(lohi: np.ndarray, limit: int) -> int | None:
+def _between_lines(
+    block: np.ndarray, head: np.ndarray, start: int, end: int, limit: int, longest: float | None
+) -> bool:
+    near = (head[:, 0] >= STRIP_GUTTER_WHITE) | (head[:, 1] <= STRIP_GUTTER_BLACK)
+    a, b = _run_at(near, start) if near[start] else (start, end)
+    reach = round(limit * STRIP_LETTERING)
+    tall = longest is not None and max(b, end) - min(a, start) >= round(limit * longest)
+    if tall or max(b, end) == len(head):
+        return False
+    engine = folio._reader()
+    if engine is None:
+        return False
+    rows = min(len(block), STRIP_READ_ROWS)
+    top = max(0, min((start + end - rows) // 2, len(block) - rows))
+    try:
+        found, _ = engine(block[top : top + rows].copy(), use_det=True, use_cls=False, use_rec=False)
+    except Exception:
+        log.debug('strip: the text detector failed on a gap; it is taken for a gutter', exc_info=True)
+        return False
+    boxes = [
+        (top + q[:, 1].min(), top + q[:, 1].max(), q[:, 0].min(), q[:, 0].max()) for q in map(np.asarray, found or [])
+    ]
+    above = [q for q in boxes if q[0] < start and start - reach <= q[1] <= end]
+    below = [q for q in boxes if q[1] > end and start <= q[0] <= end + reach]
+    if not above or not below:
+        return False
+    left = max(min(q[2] for q in above), min(q[2] for q in below))
+    return min(max(q[3] for q in above), max(q[3] for q in below)) > left
+
+
+def _gutter_seam(lohi: np.ndarray, limit: int, block: np.ndarray | None = None, fill: bool = False) -> int | None:
     lo = max(1, int(limit * STRIP_GUTTER_FLOOR))
     minrun = max(1, round(limit * STRIP_GUTTER_MIN))
     head = lohi[: round(limit * STRIP_OVERSHOOT)]
@@ -140,12 +201,34 @@ def _gutter_seam(lohi: np.ndarray, limit: int) -> int | None:
         start, end = _run_at(runs, at)
         first = max(start, lo)
         _, white, black = _classes(head[start:end])
-        proper = np.flatnonzero(_proper(white, black, minrun)[first - start : at - start + 1])
-        return first + int(proper[-1]) if len(proper) else at
-    down = np.flatnonzero(quiet[limit - lo :])
-    if len(down):
-        at = limit + int(down[0])
-        _, white, black = _classes(head[at : _run_at(runs, at)[1]])
+        inside = _proper(white, black, minrun)
+        proper = np.flatnonzero(inside[first - start : at - start + 1])
+        at = first + int(proper[-1]) if len(proper) else at
+        gap = np.flatnonzero(inside)
+        blank = limit - start - (int(gap[0]) if len(gap) else end - start)
+        if not fill or end >= limit or blank < limit * STRIP_FILL_BLANK:
+            return at
+        past = _past_seam(head, runs, limit, minrun, block)
+        if past is None or past > limit / STRIP_FILL_FLOOR:
+            return at
+        band = round(limit * STRIP_BAND_MIN)
+        _, white, black = _classes(head[past : past + band])
+        if len(white) < band or not (white.all() or black.all()):
+            return at
+        s, e = _run_at(runs, past)
+        return at if block is not None and _between_lines(block, head, s, e, limit, STRIP_FILL_READ) else past
+    return _past_seam(head, runs, limit, minrun, block)
+
+
+def _past_seam(head: np.ndarray, runs: np.ndarray, limit: int, minrun: int, block: np.ndarray | None) -> int | None:
+    lettered = False
+    for at, end in _runs(runs[limit:], 1):
+        at, end = limit + at, limit + end
+        if block is not None and _between_lines(block, head, at, end, limit, None if lettered else STRIP_LETTERING):
+            log.debug('strip: a gap between two lines of lettering is not a gutter')
+            lettered = True
+            continue
+        _, white, black = _classes(head[at:end])
         for inside in (np.flatnonzero(_proper(white, black, minrun)), np.flatnonzero(white | black)):
             if len(inside):
                 return at + int(inside[0])
@@ -198,12 +281,12 @@ def _overlap_start(block: np.ndarray, at: int, limit: int) -> int:
 
 
 def _cut(
-    block: np.ndarray, lohi: np.ndarray, limit: int, margin: int, resumed: bool
+    block: np.ndarray, lohi: np.ndarray, limit: int, margin: int, resumed: bool, lettering: bool = False
 ) -> tuple[int, int, float | None, str]:
     minrun = max(1, round(limit * STRIP_GUTTER_MIN))
     if len(block) <= limit:
         return len(block), len(block), None, 'top'
-    at = _gutter_seam(lohi, limit)
+    at = _gutter_seam(lohi, limit, block if lettering else None, not resumed)
     if at is not None:
         return at, at, _gutter_at(lohi, at, minrun) if at < len(block) else None, 'top'
     head = lohi[: round(limit * STRIP_OVERSHOOT)]
@@ -331,6 +414,8 @@ def strip_tiles(entries, p: Profile, consumed: dict[int, int]):
     reach = round(limit * STRIP_OVERSHOOT)
     margin = round(limit * STRIP_TOP_MARGIN)
     minrun = max(1, round(limit * STRIP_GUTTER_MIN))
+    lettering = p.strip_folio
+    ahead = reach + (STRIP_READ_ROWS // 2 if lettering else 0)
     held = _Held(2 * reach)
     index = seen = 0
     opening = True
@@ -363,7 +448,7 @@ def strip_tiles(entries, p: Profile, consumed: dict[int, int]):
         nonlocal chain
         block, lohi = held.rows(), held.stats()
         if chain is None:
-            at, nxt, below, anchor = _cut(block, lohi, limit, margin, resumed)
+            at, nxt, below, anchor = _cut(block, lohi, limit, margin, resumed, lettering)
             if anchor != 'bottom':
                 out = tile(name, block[:at], (_gutter_at(lohi[:at], 0, minrun), below), anchor)
                 carry_on(nxt, nxt < at)
@@ -372,9 +457,12 @@ def strip_tiles(entries, p: Profile, consumed: dict[int, int]):
         plan = None
         while chain[0] + reach <= STRIP_PLAN_REACH * limit:
             pos = chain[0]
-            if not final and len(block) - pos <= reach:
+            if not final and len(block) - pos <= ahead:
                 return []
-            at, nxt, below = chain[2] if chain[1] == 0 else _cut(block[pos:], lohi[pos:], limit, margin, True)[:3]
+            if chain[1] == 0:
+                at, nxt, below = chain[2]
+            else:
+                at, nxt, below = _cut(block[pos:], lohi[pos:], limit, margin, True, lettering)[:3]
             chain[1] += 1
             if nxt >= at:
                 plan = _even(block, pos + at, chain[1], limit)
@@ -397,21 +485,24 @@ def strip_tiles(entries, p: Profile, consumed: dict[int, int]):
         return out
 
     last = ''
-    for entry in entries:
-        if entry[0] == 'copy':
-            yield entry
-            continue
-        _, seen, name, blob = entry
-        last = name
-        a = _strip_rows(blob, p)
-        if a is not None:
-            held.add(a)
-            settle()
-            while rows() > reach:
-                got = cut(name, False)
-                if not got:
-                    break
-                yield from got
+    decoded = _decoded(entries, p)
+    try:
+        for entry, a in decoded:
+            if entry[0] == 'copy':
+                yield entry
+                continue
+            _, seen, name, _ = entry
+            last = name
+            if a is not None:
+                held.add(a)
+                settle()
+                while rows() > ahead:
+                    got = cut(name, False)
+                    if not got:
+                        break
+                    yield from got
+    finally:
+        decoded.close()
     while rows():
         yield from cut(last, True)
 
