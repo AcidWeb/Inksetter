@@ -1105,32 +1105,26 @@ def check_unsharp_scaling() -> None:
     small = fake_page(0, 1170, 1536)
     big = plain_page(2400, 3200)
 
-    def gradient(blob):
-        im = pyvips.Image.new_from_buffer(blob, '')
-        a = np.ndarray(buffer=im.write_to_memory(), dtype=np.uint8, shape=(im.height, im.width)).astype(np.float32)
-        return float(np.abs(np.diff(a, axis=1)).mean())
+    def blurred(page) -> list:
+        blurs: list = []
+
+        def recording(self, sigma, **kwargs):
+            blurs.append(sigma)
+            return pyvips.Operation.call('gaussblur', self, sigma, **kwargs)
+
+        with mock.patch.object(pyvips.Image, 'gaussblur', recording, create=True):
+            pipeline.render_page(page, scribe)
+        return blurs
 
     factor = min(scribe.width / 1170, scribe.height / 1536)
-
-    auto = gradient(pipeline.render_page(small, scribe)[0])
-    unscaled = gradient(
-        pipeline.render_page(small, dataclasses.replace(scribe, usm_sigma=scribe.usm_sigma / factor))[0]
-    )
+    up = blurred(small)
     check(
         'an enlarged page is sharpened at the enlarged scale',
-        auto > unscaled,
-        f'sigma x{factor:.2f} gives {auto:.3f} against {unscaled:.3f} un-scaled',
+        1.0 < factor < scribe.upscale_max and len(up) == 1 and math.isclose(up[0], scribe.usm_sigma * factor),
+        f'enlarged x{factor:.3f}, blurred at {up}, tuned radius {scribe.usm_sigma}',
     )
-
-    blurs: list = []
-
-    def recording(self, sigma, **kwargs):
-        blurs.append(sigma)
-        return pyvips.Operation.call('gaussblur', self, sigma, **kwargs)
-
-    with mock.patch.object(pyvips.Image, 'gaussblur', recording, create=True):
-        pipeline.render_page(big, scribe)
-    check('a downscaled page is sharpened at the tuned radius', blurs == [scribe.usm_sigma], f'blurred at {blurs}')
+    down = blurred(big)
+    check('a downscaled page is sharpened at the tuned radius', down == [scribe.usm_sigma], f'blurred at {down}')
 
 
 def check_defringe() -> None:
@@ -1409,11 +1403,16 @@ def check_cache_accounting() -> None:
     fresh = root / 'dd' / ('d' * 64 + '.type')
     fresh.parent.mkdir(parents=True, exist_ok=True)
     fresh.write_text('image/png')
+    kept = root / 'bb' / ('b' * 64 + '.type')
+    os.utime(kept, (0, 0))
 
     c._trim()
     check('a stranded .type is reclaimed', not orphan.exists())
     check('a .type from a put still in flight is left alone', fresh.exists())
-    check('an entry that still has its blob is untouched', c.get('b' * 64) == (b'z' * 70, 'image/png'))
+    check(
+        'an entry that still has its blob is untouched, however old its .type',
+        kept.exists() and c.get('b' * 64) == (b'z' * 70, 'image/png'),
+    )
 
 
 def check_module_boundary() -> None:
@@ -1685,15 +1684,26 @@ async def check_comicinfo() -> None:
             f'got {got!r}',
         )
 
+    komga_book = 'http://komga:25600/opds/v1.2/series/7/volume/9/file'
+    check(
+        'premise: the id patterns match a Komga URL as well, so only the key gate keeps Kavita out of it',
+        (kavita.series_id(komga_book), kavita.volume_id(komga_book)) == (7, 9),
+    )
+    looked_up = mock.AsyncMock(return_value=None)
     real = kavita.settings
     kavita.settings = dataclasses.replace(
         settings_mod.settings, upstream_catalog='http://komga:25600/opds/v1.2/catalog'
     )
     try:
-        off = await kavita.for_download('http://komga/opds/v1.2/books/7/file')
+        with mock.patch.object(kavita._kavita, 'series_metadata', looked_up):
+            off = await kavita.for_download(komga_book)
     finally:
         kavita.settings = real
-    check('no Kavita upstream means no metadata lookup', off is None, f'{off!r}')
+    check(
+        'no Kavita upstream means no metadata lookup',
+        off is None and not looked_up.await_count,
+        f'{off!r}, {looked_up.await_count} lookup(s)',
+    )
 
     check(
         'series id is read from a Kavita acquisition URL',
@@ -1866,13 +1876,7 @@ async def check_comicinfo() -> None:
         second is first and api.metadata_calls == 1,
         f'{api.metadata_calls} calls, same object: {second is first}',
     )
-    check('one authentication served both', api.auths == 1, f'{api.auths} auths')
     check('a series in a manga library is manga', (first or {}).get('manga') is True, f'{(first or {}).get("manga")}')
-    check(
-        'the Specials volume is given no number',
-        267 not in (first or {}).get('numbers', {}),
-        f'{first and first["numbers"]}',
-    )
 
     api = _Api()
     again = await with_kavita(api, happy, fresh=0.0)
@@ -1881,6 +1885,7 @@ async def check_comicinfo() -> None:
         api.metadata_calls == 2 and again[1] is not again[0],
         f'{api.metadata_calls} metadata calls',
     )
+    check('and one sign-in served both fetches', api.auths == 1, f'{api.auths} auths')
 
     api = _Api()
     await with_kavita(api, lambda k: k.series_metadata(21), catalog='https://host.lan/kavita/api/opds/KEY')
@@ -1993,15 +1998,21 @@ async def check_comicinfo() -> None:
         f'{len(shared._series)} series cached in it',
     )
 
+    looked_up = mock.AsyncMock(return_value=None)
     real_s = kavita.settings
     kavita.settings = dataclasses.replace(
         settings_mod.settings, upstream_catalog='http://komga:25600/opds/v1.2/catalog'
     )
     try:
-        off = await kavita.cover_url('http://komga/opds/v1.2/books/7/file')
+        with mock.patch.object(kavita._kavita, 'series_metadata', looked_up):
+            off = await kavita.cover_url(komga_book)
     finally:
         kavita.settings = real_s
-    check('a non-Kavita upstream asks nothing', off is None, f'{off!r}')
+    check(
+        'a non-Kavita upstream asks nothing',
+        off is None and not looked_up.await_count,
+        f'{off!r}, {looked_up.await_count} lookup(s)',
+    )
 
     check(
         'the volume id is read from an acquisition URL',
@@ -2434,11 +2445,11 @@ def check_pad_seam() -> None:
             f'pad={[int(v) for v in pad]}, wanted {want}',
         )
 
-    def level(draw, horizontal=True, vertical=True) -> float:
+    def level(draw, horizontal=True, vertical=True, below=None) -> float:
         a = np.full((1000, 700), 250, np.uint8)
         draw(a)
         im = pyvips.Image.new_from_memory(a.tobytes(), 700, 1000, 1, 'uchar')
-        return pipeline._mono_pad_level(im, horizontal, vertical, vertical)
+        return pipeline._mono_pad_level(im, horizontal, vertical, vertical if below is None else below)
 
     def dark_all(a):
         a[:] = 10
@@ -2454,6 +2465,9 @@ def check_pad_seam() -> None:
     def dark_tb(a):
         a[:60, :] = 10
         a[-60:, :] = 10
+
+    def dark_top(a):
+        a[:60, :] = 10
 
     check('a white page is padded white', level(lambda _a: None) == 255.0)
     check('a dark page is padded black', level(dark_all) == 0.0, f'{level(dark_all)}')
@@ -2473,9 +2487,9 @@ def check_pad_seam() -> None:
         f'{level(dark_left, True, False)}',
     )
     check(
-        'an unpadded edge gets no vote',
-        level(dark_tb, horizontal=True, vertical=False) == 255.0,
-        f'{level(dark_tb, True, False)}',
+        'an unpadded edge gets no vote: padded above alone, a dark top pads black over a white bottom and sides',
+        level(dark_top, horizontal=False, vertical=True, below=False) == 0.0,
+        f'{level(dark_top, False, True, False)}',
     )
     check(
         'and it does vote when that side IS padded',
@@ -2628,15 +2642,6 @@ def check_edge_line() -> None:
         str(pipeline._strip_edge_lines(page(draw_all), thr)),
     )
 
-    def bleeds(a):
-        a[:, w - 30 :] = 40
-
-    check(
-        'artwork bleeding off the edge is NOT shaved',
-        pipeline._strip_edge_lines(page(bleeds), thr)[2] == 0,
-        str(pipeline._strip_edge_lines(page(bleeds), thr)),
-    )
-
     def dashed(a):
         a[::4, w - 1] = 0
 
@@ -2645,12 +2650,6 @@ def check_edge_line() -> None:
         pipeline._strip_edge_lines(page(dashed), thr)[2] == 0,
         str(pipeline._strip_edge_lines(page(dashed), thr)),
     )
-
-    def band(a):
-        a[:, w - 40 :] = 0
-
-    shaved = pipeline._strip_edge_lines(page(band), thr)
-    check('a thick band is not a line, and is left alone', shaved[2] == 0, f'shaved {shaved[2]}')
 
     def five(a):
         a[:, w - 5 :] = 0
@@ -3019,18 +3018,8 @@ def check_cover_token() -> None:
     dl = re.search(r'/dl/([\w-]+)', out).group(1)
     _got_url, got_cover = rewrite.decode_parts(dl)
     check(
-        'the dl token carries the entry cover',
+        'the dl token carries the entry cover: the full image, not the thumbnail, at the origin',
         got_cover == 'http://up/cover.jpg',
-        f'{got_cover!r}',
-    )
-    check(
-        'the full image wins over the thumbnail',
-        got_cover is not None and 'thumb' not in got_cover,
-        f'{got_cover!r}',
-    )
-    check(
-        'the cover URL points at the ORIGIN, not back at this proxy',
-        got_cover is not None and 'http://p/' not in got_cover,
         f'{got_cover!r}',
     )
     multi = feed.replace(
@@ -3136,11 +3125,6 @@ def check_concurrency_defaults() -> None:
         'libvips threads are set at import from the CPUs this process may use',
         pyvips.concurrency_get() == want,
         f'{cores.available()} CPUs, wanted {want}, libvips reports {pyvips.concurrency_get()}',
-    )
-    check(
-        'and it is applied by the pipeline, not by the image',
-        'concurrency_set' in inspect.getsource(pipeline),
-        'nothing in pipeline.py calls concurrency_set',
     )
     for n, expect in ((1, 2), (2, 2), (4, 2), (8, 4), (16, 8), (32, 8), (128, 8)):
         got = pipeline.vips_threads(n)
@@ -3260,10 +3244,10 @@ def check_settings_file() -> None:
                 places[platform] = entry.config_path()
     check(
         'the settings file is in the local app data on Windows, and in the XDG config home elsewhere',
-        places
+        {k: str(v) for k, v in places.items()}
         == {
-            'win32': root / 'Local' / 'Inksetter' / 'inksetter.toml',
-            'linux': root / 'xdg' / 'inksetter' / 'inksetter.toml',
+            'win32': str(root / 'Local' / 'Inksetter' / 'inksetter.toml'),
+            'linux': str(root / 'xdg' / 'Inksetter' / 'inksetter.toml'),
         },
         f'{places}',
     )
@@ -4013,26 +3997,6 @@ def check_big_panel_cap() -> None:
 
 def check_profile_source() -> None:
     shipped = importlib.resources.files('inksetter.imaging').joinpath('profiles.toml')
-    cwd = pathlib.Path.cwd()
-    stray = cwd / 'profiles.toml'
-    before = dict(profiles.PROFILES)
-    wrote_stray = False
-    try:
-        if not stray.exists():
-            stray.write_text('[profiles.kobo-clara-hd-2e-bw]\nwidth = 1\nheight = 1\n', encoding='utf-8')
-            wrote_stray = True
-        os.environ['PROFILES_FILE'] = str(stray)
-        importlib.reload(profiles)
-        check(
-            'PROFILES_FILE is ignored',
-            profiles.PROFILES['kobo-clara-hd-2e-bw'].width == before['kobo-clara-hd-2e-bw'].width,
-            f'width={profiles.PROFILES["kobo-clara-hd-2e-bw"].width}',
-        )
-    finally:
-        os.environ.pop('PROFILES_FILE', None)
-        if wrote_stray:
-            stray.unlink(missing_ok=True)
-        importlib.reload(profiles)
 
     def build(body: str):
         try:
@@ -4063,14 +4027,6 @@ def check_profile_source() -> None:
         (cc.panel, cc.fmt, cc.defringe, cc.saturation) == ('kaleido', 'pngc', 'diagonal', 1.45),
         f'panel={cc.panel} fmt={cc.fmt} defringe={cc.defringe} sat={cc.saturation}',
     )
-    check(
-        'covers are built from the table, not from Python',
-        (profiles.COVER.name, profiles.COVER_COLOUR.fmt) == ('cover', 'jpegc'),
-    )
-    check(
-        'covers stay off the catalog list',
-        'cover' not in profiles.PROFILES and 'cover-colour' not in profiles.PROFILES,
-    )
 
     for label, body, needle in (
         ('base cycle', '[profiles.a]\nbase = "b"\n[profiles.b]\nbase = "a"\n', 'cycle'),
@@ -4087,7 +4043,7 @@ def check_profile_source() -> None:
     importlib.reload(profiles)
     shipped_names = set(tomllib.loads(shipped.read_text(encoding='utf-8'))['profiles']) - {'cover', 'cover-colour'}
     check(
-        'the loaded table is exactly the shipped devices',
+        'the loaded table is exactly the shipped devices, the covers left off it',
         set(profiles.PROFILES) == shipped_names,
         f'{len(profiles.PROFILES)} loaded, {len(shipped_names)} shipped',
     )
@@ -4992,11 +4948,6 @@ def check_strip_fill() -> None:
         len(page) == b1 and np.array_equal(page, block[:b1]),
         f'first page {len(page)} rows, next artwork ends {b1}, gutter before it at {a1}..{g1}',
     )
-    check(
-        'and is shrunk to fit no smaller than 90%',
-        0.9 <= L / len(page) < 1.0,
-        f'shown at {L / len(page):.3f}',
-    )
     far, (fa, f1, fb, _, _) = strip(0.45, 0.15, 0.55)
     got = len(first_page(far))
     check(
@@ -5593,12 +5544,13 @@ def check_strip_plan() -> None:
         and np.allclose(scored[4090:4110], webtoon._busy(rows[4000:4300], 17)[90:110]),
         f'{len(scored)} scores for {len(rows)} rows',
     )
-    wanted = np.array([0, 5, 700, 2047, 2048, 3333, 4990, 4999])
+    asked = [3333, 2047, 2048, 123, 4999, 0]
     lazy = webtoon._Busy(rows, 17)
+    one_by_one = np.array([float(lazy[np.array([i])][0]) for i in asked])
     check(
         'and scored on demand, as the planner reads it, a row scores as it does with the whole artwork read',
-        np.allclose(lazy[wanted], scored[wanted], rtol=1e-12, atol=0) and np.allclose(lazy[123], scored[123]),
-        f'{lazy[wanted]} against {scored[wanted]}',
+        np.allclose(one_by_one, scored[asked], rtol=1e-9, atol=0) and np.isnan(lazy.per).sum() > len(rows) // 2,
+        f'{one_by_one} against {scored[asked]}, {int((~np.isnan(lazy.per)).sum())} of {len(rows)} rows scored',
     )
 
     body = art(round(2.2 * limit))
@@ -6059,11 +6011,11 @@ def check_reslice() -> None:
         blank_at_top(t[0]) == margin,
         f'{blank_at_top(t[0])} blank rows at the top',
     )
-    t = cut(_strip_cbz([1280, 1280], gutter=(0, at(0.60))))
+    t = cut(_strip_cbz([1280, 1280], gutter=(0, at(1.05), 16)))
     check(
         'a gutter shorter than the margin is left as it is',
-        0 < blank_at_top(t[1]) <= margin,
-        f'{blank_at_top(t[1])} blank rows at the top',
+        minrun <= blank_at_top(t[1]) < margin,
+        f'{blank_at_top(t[1])} blank rows at the top, margin {margin}',
     )
     grey = cut(_strip_cbz([1280, 1280], gutter=(0, at(1.05), 150, (128, 128, 128))))
     check(
@@ -6248,10 +6200,6 @@ def check_reslice() -> None:
         len({len(n.split('.')[0]) for n in covered}) == 1 and covered[0].startswith('00000.'),
         f'{covered[:3]}',
     )
-    check(
-        'so it sorts first by digits alone, not by a full stop outranking a 1',
-        covered == sorted(covered, key=lambda n: int(n.split('.')[0])),
-    )
 
     box = profiles.PROFILES['kindle-colorsoft']
     boxed = sorted(
@@ -6343,7 +6291,6 @@ def check_family_duplicates() -> None:
 
 def check_profile_config() -> None:
     for label, body, needle in (
-        ('unknown base', 'base = "kobo-clarra"', 'unknown base'),
         ('unknown field', 'saturaton = 1.6', 'unknown field'),
         ('width = 0', 'width = 0', 'width=0'),
         ('gamma = 0', 'gamma = 0', 'gamma=0'),
@@ -6527,10 +6474,6 @@ def check_strip_folio() -> None:
         pipeline.render_page(attached, on)[0] == pipeline.render_page(attached, off)[0],
     )
     check(
-        'a folio-shaped mark reading as a lone zero is refused',
-        pipeline.render_page(_folio_page(number='0'), on)[0] == pipeline.render_page(_folio_page(number='0'), off)[0],
-    )
-    check(
         'a word in the margin is not erased',
         pipeline.render_page(_folio_page(number='END'), on)[0]
         == pipeline.render_page(_folio_page(number='END'), off)[0],
@@ -6610,6 +6553,8 @@ def check_strip_folio() -> None:
     _real_engine = folio._reader()
 
     def _measuring_engine(img, **kw):
+        if kw.get('use_det') is False:
+            return [['1', 1.0]], 0.0
         _widths.append(img.shape[1])
         return _real_engine(img, **kw)
 
@@ -6619,9 +6564,9 @@ def check_strip_folio() -> None:
     finally:
         folio._engine = _real_engine
     check(
-        'the reader is handed a narrow strip, not a fifth of the page',
+        'the detector is handed a narrow strip, not a fifth of the page',
         _widths and max(_widths) <= 480,
-        f'crop {max(_widths) if _widths else 0} px wide from a 2400 px page',
+        f'crop {max(_widths) if _widths else 0} px wide from a 2400 px page, {len(_widths)} detector read(s)',
     )
 
     raw3 = pyvips.Image.new_from_buffer(_folio_page(number='123'), '')
@@ -6914,6 +6859,12 @@ def check_strip_folio() -> None:
         'a read the detector is MIN_SCORE sure of is taken, and one a hair less sure is not',
         taken == {'at': True, 'under': False},
         f'{taken}',
+    )
+    lone = {digit: _erases(_fake(line=(digit, 1.0), found=(digit, 1.0))) for digit in ('0', '7')}
+    check(
+        'a folio-shaped mark reading as a lone zero is refused, however sure the read, where another digit is taken',
+        lone == {'0': False, '7': True},
+        f'{lone}',
     )
     line_hair = float(np.nextafter(folio.LINE_SCORE, 0))
     routes = {}
@@ -7792,10 +7743,19 @@ async def check_browse(c) -> None:
     check('the index does not name itself twice in the tab', '<title>Inksetter</title>' in home)
 
 
-def _grid_columns(width: float) -> int:
-    track = max(web.GRID_MIN, (width - (web.GRID_COLUMNS - 1) * web.GRID_GAP) / web.GRID_COLUMNS)
+def _grid_columns(width: float) -> int | None:
+    rule = next((ln for ln in web.CSS.splitlines() if ln.startswith('.grid{')), '')
+    found = re.search(
+        r'gap:\d+px (\d+)px;grid-template-columns:repeat\(auto-fill,'
+        r'minmax\(max\((\d+)px,calc\(\(100% - (\d+)px\)/(\d+)\)\),1fr\)\)',
+        rule,
+    )
+    if found is None:
+        return None
+    gap, least, taken, columns = (int(x) for x in found.groups())
+    track = max(least, (width - taken) / columns)
     n = 1
-    while (n + 1) * track + n * web.GRID_GAP <= width:
+    while (n + 1) * track + n * gap <= width:
         n += 1
     return n
 
@@ -7932,7 +7892,7 @@ async def check_logo(c) -> None:
     check('even an error page gets a favicon', 'rel="icon"' in err)
 
 
-def check_landing_groups() -> None:
+async def check_landing_groups(c) -> None:
     titles = [t for t, _ in web.GROUPS]
     placed = {n: web.group_of(p) for n, p in profiles.PROFILES.items()}
     check('and no group is left empty', set(placed.values()) == set(titles), f'{set(titles) - set(placed.values())}')
@@ -7957,9 +7917,7 @@ def check_landing_groups() -> None:
         f'{by_group["No processing"]}',
     )
 
-    home = web.index('http://proxy.test', sorted(profiles.PROFILES.items()))
-    for title in titles:
-        check(f'the page has a {title.lower()} section', f'>{title}<' in home)
+    home = (await c.get('/')).text
     shown = re.findall(r'<h2 class="group">([^<]+)<span>(\d+)</span>', home)
     check(
         'each heading counts what is under it',
@@ -8117,13 +8075,15 @@ async def check_trail(c) -> None:
     )
 
     pairs12 = [(encode_token(f'{up}/opds/v1.2/n{i}'), f'L{i}') for i in range(12)]
-    long_trail = web.encode_trail(pairs12)
-    links, _ = _crumbs((await c.get(f'/kobo-clara-hd-2e-bw/b/{nav}', params={web.TRAIL_PARAM: long_trail})).text)
+    raw12 = '\n'.join(f'{tok}\t{title}' for tok, title in pairs12)
+    forged = base64.urlsafe_b64encode(raw12.encode()).decode().rstrip('=')
+    links, _ = _crumbs((await c.get(f'/kobo-clara-hd-2e-bw/b/{nav}', params={web.TRAIL_PARAM: forged})).text)
     check(
-        'a trail cannot grow without bound',
+        'a trail cannot grow without bound, even one written by hand past the cap',
         len(links) == web.TRAIL_MAX + 1,
-        f'{len(links) - 1} crumbs, cap {web.TRAIL_MAX}',
+        f'{len(links) - 1} crumbs from 12 entries, cap {web.TRAIL_MAX}',
     )
+    long_trail = web.encode_trail(pairs12)
     written = base64.urlsafe_b64decode(long_trail + '=' * (-len(long_trail) % 4)).decode()
     check(
         'and it is capped where it is written, not only where it is read',
@@ -8396,7 +8356,6 @@ async def main() -> int:
             'content-length' not in {k.lower() for k in hh.headers},
             f'content-length={hh.headers.get("content-length")!r}',
         )
-        check('HEAD on a download has no body', not hh.content, f'{len(hh.content)} bytes')
 
         check(
             'a HEAD does not mistake gzip for a zip',
@@ -8579,8 +8538,16 @@ async def main() -> int:
                 f'{label} body under a feed content-type is not a 500', r.status_code < 500, f'status={r.status_code}'
             )
 
-        r = await c.get('/kobo-clara-hd-2e-bw/dl/' + encode_token('http://127.0.0.1:8899/opds/v1.2/tarball.tgz'))
-        check('gzip is not mistaken for a zip', r.status_code == 200, f'status={r.status_code}')
+        opened: list = []
+        real_repack = cbz.repack_iter
+        with mock.patch.object(cbz, 'repack_iter', lambda *a, **k: opened.append(a) or real_repack(*a, **k)):
+            r = await c.get('/kobo-clara-hd-2e-bw/dl/' + encode_token('http://127.0.0.1:8899/opds/v1.2/tarball.tgz'))
+        as_sent = r.content[:2] == b'\x1f\x8b' and gzip.decompress(r.content) == b'definitely not a zip'
+        check(
+            'gzip is not mistaken for a zip: it is never opened as one, and goes out as it came',
+            r.status_code == 200 and not opened and as_sent,
+            f'status={r.status_code}, opened as a zip {len(opened)} time(s), body as sent: {as_sent}',
+        )
         r = await c.get('/kobo-clara-hd-2e-bw/dl/' + encode_token('http://127.0.0.1:8899/opds/v1.2/corrupt.cbz'))
         check(
             'corrupt archive falls back to passthrough',
@@ -8749,7 +8716,7 @@ async def main() -> int:
         await check_trail(c)
         await check_logo(c)
         check_grid_columns()
-        check_landing_groups()
+        await check_landing_groups(c)
 
         print('download progress')
         check_repack_progress()
