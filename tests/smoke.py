@@ -21,6 +21,7 @@ import os
 import pathlib
 import re
 import ssl
+import struct
 import subprocess
 import sys
 import tempfile
@@ -28,6 +29,7 @@ import threading
 import time
 import tomllib
 import zipfile
+import zlib
 from unittest import mock
 
 TMP = tempfile.mkdtemp(prefix='inksetter-smoke-')
@@ -2085,7 +2087,7 @@ def _rich_colour_page(w: int = 900, h: int = 1200) -> bytes:
 
 def check_png_effort() -> None:
     prof = profiles.PROFILES['kindle-colorsoft-1-2']
-    check('the shipped default is the measured one', prof.png_effort == 7, f'{prof.png_effort}')
+    check('the shipped default is the measured one', prof.png_effort == 6, f'{prof.png_effort}')
 
     src = _rich_colour_page()
     lo, _ = pipeline.render_page(src, dataclasses.replace(prof, png_effort=1))
@@ -2106,6 +2108,186 @@ def check_png_effort() -> None:
         except ValueError:
             ok = True
         check(f'png_effort={bad} is refused', ok)
+
+
+def _png_chunks(png: bytes) -> list[tuple[bytes, bytes]]:
+    chunks, at = [], 8
+    while at < len(png):
+        size, kind = struct.unpack('>I4s', png[at : at + 8])
+        chunks.append((kind, png[at + 8 : at + 8 + size]))
+        at += 12 + size
+    return chunks
+
+
+def _indexed_png(idx: np.ndarray, palette: np.ndarray, filters: np.ndarray | None = None) -> bytes:
+    h, w = idx.shape
+    rows = np.zeros((h, w + 1), np.uint8)
+    rows[:, 1:] = idx
+    if filters is not None:
+        rows[:, 0] = filters
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data))
+
+    return (
+        b'\x89PNG\r\n\x1a\n'
+        + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 3, 0, 0, 0))
+        + chunk(b'PLTE', np.asarray(palette, np.uint8).tobytes())
+        + chunk(b'IDAT', zlib.compress(rows.tobytes()))
+        + chunk(b'IEND', b'')
+    )
+
+
+def _indices_of(png: bytes) -> tuple[np.ndarray, np.ndarray]:
+    chunks = _png_chunks(png)
+    w, h = struct.unpack('>II', dict(chunks)[b'IHDR'][:8])
+    rows = np.frombuffer(zlib.decompress(b''.join(d for k, d in chunks if k == b'IDAT')), np.uint8).reshape(h, w + 1)
+    return rows, np.frombuffer(dict(chunks)[b'PLTE'], np.uint8).reshape(-1, 3)
+
+
+def _rgb_of(png: bytes) -> np.ndarray:
+    im = pyvips.Image.new_from_buffer(png, '')
+    return np.ndarray(buffer=im.write_to_memory(), dtype=np.uint8, shape=(im.height, im.width, im.bands))[:, :, :3]
+
+
+def check_palette_pin() -> None:
+    palette = np.array(
+        [(255, 255, 255), (251, 255, 255), (0, 0, 0), (6, 0, 0), (254, 254, 254), (200, 30, 30), (255, 120, 0)]
+        + [(16 * i, 90, 255 - 16 * i) for i in range(9)],
+        np.uint8,
+    )
+    h, w = 120, 200
+    src = np.zeros((h, w, 3), np.uint8)
+    idx = np.zeros((h, w), np.uint8)
+    regions = {
+        'white': ((slice(0, 60), slice(0, 50)), (255, 255, 255), (0, 1)),
+        'black': ((slice(0, 60), slice(50, 100)), (0, 0, 0), (2, 3)),
+        'near-white': ((slice(0, 60), slice(100, 150)), (254, 254, 254), (4, 1)),
+        'orange': ((slice(0, 60), slice(150, 200)), (255, 120, 0), (6, 1)),
+        'red': ((slice(60, 120), slice(0, 200)), (200, 30, 30), (5, 5)),
+    }
+    checker = (np.add.outer(np.arange(h), np.arange(w)) % 2).astype(bool)
+    for where, colour, (even, odd) in regions.values():
+        src[where] = colour
+        idx[where] = np.where(checker[where], odd, even)
+    cast = _indexed_png(idx, palette)
+    before = _rgb_of(cast)
+    pinned = pipeline._pin_extremes(cast, src, 6)
+    after = _rgb_of(pinned)
+    white_at, black_at = (src == 255).all(axis=2), (src == 0).all(axis=2)
+    check(
+        'premise: half the white and half the black of the source come back off-white and off-black',
+        (before[white_at] != 255).any(axis=1).sum() == white_at.sum() // 2
+        and (before[black_at] != 0).any(axis=1).sum() == black_at.sum() // 2,
+    )
+    check(
+        "pinning sends every pure white and pure black pixel of the source to the palette's own",
+        (after[white_at] == 255).all() and (after[black_at] == 0).all(),
+        f'{int((after[white_at] != 255).any(axis=1).sum())} white and '
+        f'{int((after[black_at] != 0).any(axis=1).sum())} black still off',
+    )
+    rest = ~white_at & ~black_at
+    check(
+        'and leaves every other pixel as the quantiser chose, near-white and colours with a 255 in them too',
+        np.array_equal(after[rest], before[rest]),
+        f'{int((after[rest] != before[rest]).any(axis=1).sum())} other pixels moved',
+    )
+    check(
+        'the page keeps its palette and its size',
+        np.array_equal(_indices_of(pinned)[1], palette) and after.shape == before.shape,
+    )
+    check(
+        'a page with nothing to pin is handed back as it came',
+        pipeline._pin_extremes(pinned, src, 6) is pinned,
+    )
+    filtered = _indexed_png(idx, palette, filters=np.r_[2, np.zeros(h - 1, np.uint8)])
+    check(
+        'premise: an Up filter on the first row reads the same as no filter',
+        np.array_equal(_rgb_of(filtered), before),
+    )
+    check(
+        'a page with a filtered row is left alone, since its rows are not plain indices',
+        pipeline._pin_extremes(filtered, src, 6) is filtered,
+    )
+    no_white = palette.copy()
+    no_white[0] = (250, 250, 250)
+    greyed = _indexed_png(idx, no_white)
+    kept = _rgb_of(pipeline._pin_extremes(greyed, src, 6))
+    check(
+        'with no pure white in the palette white is left as it was, and black is still pinned',
+        np.array_equal(kept[white_at], _rgb_of(greyed)[white_at]) and (kept[black_at] == 0).all(),
+    )
+    truecolour = pyvips.Image.new_from_memory(src.tobytes(), w, h, 3, 'uchar').pngsave_buffer()
+    check('a PNG that is not a palette PNG is left alone', pipeline._pin_extremes(truecolour, src, 6) is truecolour)
+    nibbles = pyvips.Image.new_from_memory(src.tobytes(), w, h, 3, 'uchar').pngsave_buffer(
+        palette=True, bitdepth=4, colours=16
+    )
+    try:
+        left = pipeline._pin_extremes(nibbles, src, 6) is nibbles
+    except Exception as exc:
+        left = False
+        print(f'    {type(exc).__name__}: {exc}')
+    check(
+        'premise: a 4-bit palette PNG', _png_chunks(nibbles)[0][1][8:10] == bytes([4, 3]), f'{_png_chunks(nibbles)[0]}'
+    )
+    check('a palette PNG of another depth is left alone, since its rows are not one byte a pixel', left)
+
+    prof = profiles.PROFILES['kindle-colorsoft-1-2']
+    page = pyvips.Image.new_from_buffer(_rich_colour_page(), '')
+    a = np.ndarray(buffer=page.write_to_memory(), dtype=np.uint8, shape=(page.height, page.width, 3)).copy()
+    a[800:1000, 100:800] = 255
+    page_png = pyvips.Image.new_from_memory(a.tobytes(), page.width, page.height, 3, 'uchar').pngsave_buffer()
+    real = pyvips.Image.pngsave_buffer
+    seen: dict = {}
+
+    def faulty(self, **kw):
+        png = real(self, **kw)
+        if not kw.get('palette'):
+            return png
+        rows, pal = _indices_of(png)
+        rows = rows.copy()
+        shown = np.ndarray(buffer=self.write_to_memory(), dtype=np.uint8, shape=(self.height, self.width, self.bands))
+        cells = (np.add.outer(np.arange(self.height), np.arange(self.width)) % 2).astype(bool)
+        moved = np.zeros(cells.shape, bool)
+        for level in (255, 0):
+            own = np.flatnonzero((pal == level).all(axis=1))
+            near = np.argsort(np.abs(pal.astype(int) - level).sum(axis=1))
+            other = next(i for i in near if not (pal[i] == level).all())
+            hit = (shown == level).all(axis=2) & cells
+            if len(own):
+                rows[:, 1:][hit] = other
+                moved |= hit
+                seen[level] = int(hit.sum())
+        seen['moved'], seen['shown'] = moved, shown.copy()
+        seen['cast'] = _indexed_png(rows[:, 1:], pal, rows[:, 0])
+        return seen['cast']
+
+    with mock.patch.object(pyvips.Image, 'pngsave_buffer', faulty):
+        out, _ = pipeline.render_page(page_png, prof)
+    moved = seen.get('moved', np.zeros((1, 1), bool))
+    check(
+        'premise: a colour page with white and black in it, its palette save made to cast them',
+        seen.get(255, 0) > 10_000
+        and seen.get(0, 0) > 10_000
+        and (_rgb_of(seen['cast'])[moved] != seen['shown'][moved]).any(axis=1).all(),
+        f'{seen.get(255, 0)} white and {seen.get(0, 0)} black pixels cast',
+    )
+    got = _rgb_of(out)
+    pure = (seen['shown'] == 255).all(axis=2) | (seen['shown'] == 0).all(axis=2)
+    check(
+        'a rendered colour page ships its pure white and pure black as they were',
+        np.array_equal(got[pure], seen['shown'][pure]),
+        f'{int((got[pure] != seen["shown"][pure]).any(axis=1).sum())} still off',
+    )
+    check(
+        'and every other pixel as the palette save left it',
+        np.array_equal(got[~pure], _rgb_of(seen['cast'])[~pure]),
+    )
+    check(
+        'compressed as tightly as the save it mends',
+        len(out) <= 1.02 * len(seen['cast']),
+        f'{len(out) // 1024} kB against {len(seen["cast"]) // 1024} kB',
+    )
 
 
 def check_colour_pad_ring() -> None:
@@ -8819,6 +9001,8 @@ async def main() -> int:
     await check_comicinfo()
     print('png effort')
     check_png_effort()
+    print('palette pin')
+    check_palette_pin()
     print('colour pad ring')
     check_colour_pad_ring()
     print('webtoon pad')

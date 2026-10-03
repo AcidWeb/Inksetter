@@ -15,10 +15,13 @@ COLOUR (Kaleido 3):
          -> LCh saturation boost -> Lab: blur a/b only
          -> levels+gamma, unsharp and defringe on L only
          -> sRGB -> re-flatten the pad -> encode (palette PNG, PNG or JPEG)
+         -> pin the palette PNG's pure white and pure black
 """
 
 import os
 import time
+import zlib
+import struct
 import logging
 import functools
 import threading
@@ -48,7 +51,7 @@ def _size_vips() -> None:
 _size_vips()
 
 # Bump this whenever anything in this module changes in a way that alters output pixels. Bump invalidates the cache.
-PIPELINE_VERSION = '9'
+PIPELINE_VERSION = '10'
 
 _BAYER_N = 8
 
@@ -680,6 +683,50 @@ def _flatten_pad(a: np.ndarray, content: tuple[int, int, int, int], level: float
     return a
 
 
+_PNG_SIGNATURE = b'\x89PNG\r\n\x1a\n'
+
+
+def _png_chunk(kind: bytes, data: bytes) -> bytes:
+    return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data))
+
+
+def _pin_extremes(png: bytes, rgb: np.ndarray, compression: int) -> bytes:
+    chunks, at = [], len(_PNG_SIGNATURE)
+    while at < len(png):
+        size, kind = struct.unpack('>I4s', png[at : at + 8])
+        chunks.append((kind, png[at + 8 : at + 8 + size]))
+        at += 12 + size
+    head = dict(chunks)
+    width, height, depth, colour = struct.unpack('>IIBB', head[b'IHDR'][:10])
+    if depth != 8 or colour != 3 or b'PLTE' not in head:
+        return png
+    raw = zlib.decompress(b''.join(data for kind, data in chunks if kind == b'IDAT'))
+    rows = np.frombuffer(raw, np.uint8).reshape(height, width + 1)
+    if rows[:, 0].any():
+        return png
+    palette = np.frombuffer(head[b'PLTE'], np.uint8).reshape(-1, 3)
+    fixed = None
+    for level in (255, 0):
+        entry = np.flatnonzero((palette == level).all(axis=1))
+        if not len(entry):
+            continue
+        wrong = (rgb == level).all(axis=2) & (rows[:, 1:] != entry[0])
+        if wrong.any():
+            if fixed is None:
+                fixed = rows.copy()
+            fixed[:, 1:][wrong] = entry[0]
+    if fixed is None:
+        return png
+    out = [_PNG_SIGNATURE]
+    for kind, data in chunks:
+        if kind != b'IDAT':
+            out.append(_png_chunk(kind, data))
+        elif fixed is not None:
+            out.append(_png_chunk(b'IDAT', zlib.compress(fixed.tobytes(), compression)))
+            fixed = None
+    return b''.join(out)
+
+
 def _render_mono(
     buf: bytes,
     p: Profile,
@@ -764,18 +811,19 @@ def _render_colour(
             'image/jpeg',
         )
     if p.palette:
-        return (
-            out.pngsave_buffer(
-                palette=True,
-                bitdepth=8,
-                colours=p.palette_colours,
-                dither=1.0,
-                effort=p.png_effort,
-                compression=p.png_compression,
-                strip=True,
-            ),
-            'image/png',
+        out = out.copy_memory()
+        png = out.pngsave_buffer(
+            palette=True,
+            bitdepth=8,
+            colours=p.palette_colours,
+            dither=1.0,
+            effort=p.png_effort,
+            compression=p.png_compression,
+            filter='none',
+            strip=True,
         )
+        rgb = np.ndarray(buffer=out.write_to_memory(), dtype=np.uint8, shape=(out.height, out.width, out.bands))
+        return _pin_extremes(png, rgb, p.png_compression), 'image/png'
     return out.pngsave_buffer(compression=p.png_compression, strip=True), 'image/png'
 
 
