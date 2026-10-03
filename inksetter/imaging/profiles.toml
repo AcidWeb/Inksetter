@@ -46,8 +46,8 @@ height = 1448
 width = 1236
 height = 1648
 
-# Paperwhite 6, 12th gen, 2024. 7".
-[profiles.kindle-pw-6]
+# Paperwhite 6, 12th gen, 2024. Paperwhite 7, 13th gen, 2026. 7".
+[profiles.kindle-pw-6-7]
 width = 1272
 height = 1696
 
@@ -61,8 +61,8 @@ height = 1448
 width = 1264
 height = 1680
 
-# Kindle, 11th gen, 2022. Kindle, 12th gen, 2024. 6".
-[profiles.kindle-basic-1-2]
+# Kindle, 11th gen, 2022. Kindle, 12th gen, 2024. Kindle, 13th gen, 2026. 6".
+[profiles.kindle-basic-1-2-3]
 width = 1072
 height = 1448
 
@@ -83,13 +83,13 @@ height = 2648
 # Kindle, colour.
 # --------------------------------------------------------------------------
 
-# Colorsoft, 2024. 7".
-[profiles.kindle-colorsoft]
+# Colorsoft, 12th gen, 2024. Colorsoft, 13th gen, 2026. 7".
+[profiles.kindle-colorsoft-1-2]
 base = "kaleido"
 width = 1272
 height = 1696
 
-# Scribe Colorsoft, 2025. 11".
+# Scribe Colorsoft, 12th gen, 2025. 11".
 [profiles.kindle-scribe-colorsoft]
 base = "kaleido-big"
 width = 1986
@@ -177,13 +177,13 @@ base = "kaleido-webtoon"
 width = 1264
 height = 1680
 
-# Colorsoft, 2024. 7".
-[profiles.kindle-colorsoft-webtoon]
+# Colorsoft, 12th gen, 2024. Colorsoft, 13th gen, 2026. 7".
+[profiles.kindle-colorsoft-1-2-webtoon]
 base = "kaleido-webtoon"
 width = 1272
 height = 1696
 
-# Scribe Colorsoft, 2025. 11".
+# Scribe Colorsoft, 12th gen, 2025. 11".
 [profiles.kindle-scribe-colorsoft-webtoon]
 base = "kaleido-webtoon"
 width = 1986
