@@ -296,7 +296,7 @@ async def _render_cached(url: str, p: Profile, max_width: int | None, headers: d
                     raise UpstreamError(502, detail) from exc
         await asyncio.to_thread(cache.put, key, blob, ctype)
 
-    await cache.maybe_trim()
+    prefetcher.spawn(cache.maybe_trim(), 'cache-trim')
     return blob, ctype
 
 

@@ -219,7 +219,7 @@ class RangeReader:
 
     def _read_at(self, pos: int, size: int) -> bytes:
         if size >= _RANGE_BLOCK:
-            return self._fetch(pos, pos + size - 1)
+            return self._read_through(pos, size)
         parts = []
         while size > 0:
             index = pos // _RANGE_BLOCK
@@ -240,10 +240,32 @@ class RangeReader:
             return cached
         start = index * _RANGE_BLOCK
         block = self._fetch(start, min(start + _RANGE_BLOCK, self._size) - 1)
+        self._keep(index, block)
+        return block
+
+    def _read_through(self, pos: int, size: int) -> bytes:
+        parts = []
+        index = pos // _RANGE_BLOCK
+        cached = self._blocks.get(index)
+        if cached is not None:
+            self._blocks.move_to_end(index)
+            head = cached[pos - index * _RANGE_BLOCK :][:size]
+            parts.append(head)
+            pos += len(head)
+            size -= len(head)
+        if size > 0:
+            last = (pos + size - 1) // _RANGE_BLOCK
+            stop = min((last + 1) * _RANGE_BLOCK, self._size)
+            data = self._fetch(pos, stop - 1)
+            parts.append(data[:size])
+            if last * _RANGE_BLOCK >= pos and len(data) == stop - pos:
+                self._keep(last, data[last * _RANGE_BLOCK - pos :])
+        return b''.join(parts)
+
+    def _keep(self, index: int, block: bytes) -> None:
         self._blocks[index] = block
         while len(self._blocks) > _RANGE_CACHE_BLOCKS:
             self._blocks.popitem(last=False)
-        return block
 
     def _fetch(self, first: int, last: int) -> bytes:
         headers = {**self._headers, 'range': f'bytes={first}-{last}', 'accept-encoding': 'identity'}

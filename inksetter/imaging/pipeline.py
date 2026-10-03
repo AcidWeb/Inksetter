@@ -2,10 +2,10 @@
 The e-ink page pipeline.
 
 MONO (mono panels, and the B/W pages auto_mono sends there on Kaleido 3):
-  decode+autorot -> flatten alpha -> folio remover -> autocrop
+  decode+autorot -> flatten alpha -> grayscale -> folio remover -> autocrop
          -> rotate wide spreads -> descreen (FFT notch, only when downscaling)
          -> downscale or upscale -> pad to the panel box
-         -> grayscale -> levels+gamma -> unsharp -> defringe
+         -> levels+gamma -> unsharp -> defringe
          -> quantise/dither -> encode (4-bit PNG, png8 or JPEG)
 
 COLOUR (Kaleido 3):
@@ -51,7 +51,7 @@ def _size_vips() -> None:
 _size_vips()
 
 # Bump this whenever anything in this module changes in a way that alters output pixels. Bump invalidates the cache.
-PIPELINE_VERSION = '10'
+PIPELINE_VERSION = '11'
 
 _BAYER_N = 8
 
@@ -409,7 +409,6 @@ def _opened_trim(luma: pyvips.Image, window: int, fill: float, threshold: int):
         far = (luma < 255 - threshold) if background == 255 else (luma > threshold)
         count = (
             (far & 1)
-            .cast('ushort')
             .embed(
                 edge,
                 edge,
@@ -522,6 +521,10 @@ def _geometry(
         im = im.flatten(background=255)
         if chatty:
             step('flatten', 'alpha over white')
+    if mono and im.bands > 1:
+        im = im.colourspace('b-w').copy_memory()
+        if chatty:
+            step('grey', 'one band from here on')
     luma = None
     if p.strip_folio:
         before = im
@@ -533,7 +536,7 @@ def _geometry(
                 step('folio', 'page number erased from the bottom margin')
     if p.autocrop:
         if luma is None:
-            luma = im if im.bands == 1 else im.colourspace('b-w')
+            luma = im if im.bands == 1 else im.colourspace('b-w').copy_memory()
         box = _autocrop_box(luma, p)
         if box is not None:
             im = im.crop(*box)
@@ -738,8 +741,6 @@ def _render_mono(
 ) -> tuple[bytes, str]:
     geom = _geometry(buf, p, tw, th, mono=True, page=page, pad_level=pad_level)
     g = geom.image
-    if g.bands > 1:
-        g = g.colourspace('b-w')
     toned = g.maplut(_tone_lut(p)) if g.format == 'uchar' else _tone(g.cast('float'), p, 255.0)
     g = _unsharp(toned, p, geom.upscale)
     g = defringe(g, p, 255.0).rint().cast('uchar')

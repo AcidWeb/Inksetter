@@ -365,6 +365,40 @@ def _ranged_file(request: Request):
     )
 
 
+def _large_entries_cbz() -> bytes:
+    rng = np.random.default_rng(3)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_STORED) as z:
+        for i, size in enumerate((1_500_000, 3_300_000, 700_000, 2_100_000, 1 << 20)):
+            z.writestr(f'p{i:03d}.jpg', rng.integers(0, 256, size, dtype=np.uint8).tobytes())
+    return buf.getvalue()
+
+
+_RANGED_LARGE = {'requests': 0, 'bytes': 0}
+_RANGED_LARGE_BODY = _large_entries_cbz()
+
+
+@upstream.get('/opds/v1.2/ranged-large/file.cbz')
+def _ranged_large_file(request: Request):
+    body = _RANGED_LARGE_BODY
+    rng = request.headers.get('range')
+    if not rng:
+        return Response(body, media_type='application/vnd.comicbook+zip')
+    first, _, last = rng.partition('=')[2].partition('-')
+    lo = int(first)
+    hi = min(int(last) if last else len(body) - 1, len(body) - 1)
+    if lo >= len(body) or lo > hi:
+        return Response(status_code=416, headers={'content-range': f'bytes */{len(body)}'})
+    _RANGED_LARGE['requests'] += 1
+    _RANGED_LARGE['bytes'] += hi + 1 - lo
+    return Response(
+        body[lo : hi + 1],
+        status_code=206,
+        media_type='application/vnd.comicbook+zip',
+        headers={'content-range': f'bytes {lo}-{hi}/{len(body)}'},
+    )
+
+
 _BIG = {'yielded': 0}
 _BIG_CHUNK = 64 * 1024
 _BIG_TOTAL = 32 * 1024 * 1024
@@ -1792,7 +1826,11 @@ async def check_comicinfo() -> None:
         _io.BytesIO(b''.join(_cbz.repack_iter(_io.BytesIO(raw), prof, 1, cover=b'not a picture', comicinfo=listed)))
     )
     check('premise: a cover that will not render is left out', len(shipped(z5)) == 3, f'{len(shipped(z5))} pages')
-    check('and the metadata does not count it', len(json.loads(z5.read('ComicInfo.xml'))) == 3)
+    check(
+        'and the metadata does not count it',
+        'ComicInfo.xml' in z5.namelist() and len(json.loads(z5.read('ComicInfo.xml'))) == 3,
+        f'{z5.namelist()}',
+    )
 
     class _R:
         def __init__(self, status, payload=None):
@@ -2904,6 +2942,58 @@ def check_dark_margin_crop() -> None:
     check('a page that is solid ink is refused, not cropped away', pipeline._autocrop_box(solid, prof) is None)
 
 
+def check_mono_one_band() -> None:
+    w, h = 2000, 2800
+    rng = np.random.default_rng(66)
+    grey = np.full((h, w), 255, np.uint8)
+    yy, xx = np.mgrid[0:h, 0:w]
+    grey[200 : h - 200, 150 : w - 150] = (((xx // 3 + yy // 3) % 2) * 200)[200 : h - 200, 150 : w - 150]
+    rgb = np.repeat(grey[..., None], 3, axis=2).astype(np.int16) + rng.integers(-1, 2, (h, w, 3))
+    src = pyvips.Image.new_from_memory(np.clip(rgb, 0, 255).astype(np.uint8).tobytes(), w, h, 3, 'uchar')
+    blob = src.jpegsave_buffer(Q=92)
+
+    seen = {'folio': [], 'descreen': []}
+    real_strip, real_descreen = folio.strip, pipeline.descreen
+
+    def strip(im, *args, **kwargs):
+        seen['folio'].append(im.bands)
+        return real_strip(im, *args, **kwargs)
+
+    def descreen(im, *args, **kwargs):
+        seen['descreen'].append(im.bands)
+        return real_descreen(im, *args, **kwargs)
+
+    folio.strip, pipeline.descreen = strip, descreen
+    try:
+        for name, source in (
+            ('kobo-clara-hd-2e-bw', None),
+            ('kindle-colorsoft-1-2', None),
+            ('kindle-colorsoft-1-2', pyvips.Image.new_from_buffer(blob, '')),
+        ):
+            for got in seen.values():
+                got.clear()
+            prof = profiles.PROFILES[name]
+            try:
+                pipeline.render_page(blob, prof, source=source)
+                err = ''
+            except Exception as exc:
+                err = repr(exc)
+            how = 'handed the page' if source is not None else 'from the bytes'
+            check(
+                f'a grey page stored as RGB reaches the full-size passes as one band ({name}, {how})',
+                not err and seen['folio'] == [1] and seen['descreen'] == [1],
+                err or f'bands seen: {seen}',
+            )
+    finally:
+        folio.strip, pipeline.descreen = real_strip, real_descreen
+    check(
+        'premise: that page is three bands, and grey enough for auto-mono',
+        pyvips.Image.new_from_buffer(blob, '').bands == 3
+        and pipeline._chroma_of(pyvips.Image.new_from_buffer(blob, ''))
+        < profiles.PROFILES['kindle-colorsoft-1-2'].mono_chroma_threshold,
+    )
+
+
 def check_autocrop_open() -> None:
     w, h = 900, 1300
     prof = profiles.PROFILES['kobo-clara-hd-2e-bw']
@@ -2992,9 +3082,10 @@ def check_autocrop_open() -> None:
         ranked = padded.rank(window, window, (window * window) // 2).crop(e, e, im.width, im.height)
         return list(ranked.find_trim(threshold=thr, background=background))
 
-    differs, moved = [], 0
+    differs, moved, tried = [], 0, 0
     levels = [(0, 255), (0, 255 - thr), (255, 0), (255, thr)]
-    for shape, windows in (('blob', (3, 7)), ('frame', (7,))):
+    widest = pipeline._open_window(pyvips.Image.black(20_000, 20_000))
+    for shape, windows in (('blob', (3, 7, widest)), ('frame', (7,))):
         for n, (far, near) in enumerate(levels):
             im = noise(shape, far, near, 10 + n)
             for window in windows:
@@ -3003,10 +3094,11 @@ def check_autocrop_open() -> None:
                     for background in (255, 0):
                         want = median_trim(im, window, fill, background)
                         if shape == 'blob':
+                            tried += 1
                             moved += want != list(im.find_trim(threshold=thr, background=background))
                         if list(find(background)) != want:
                             differs.append(f'{shape} {far}/{near} window {window} pad {fill:.0f} paper {background}')
-    check('premise: the median moves the box on the blobs', moved > 0, f'{moved} of 32')
+    check('premise: the median moves the box on the blobs', moved > 0, f'{moved} of {tried}')
     frame = noise('frame', 0, 255, 10)
     check(
         'premise: on the frame, the pad alone decides whether there is a box',
@@ -3014,7 +3106,8 @@ def check_autocrop_open() -> None:
         f'{median_trim(frame, 7, 255.0, 255)} vs {median_trim(frame, 7, 0.0, 255)}',
     )
     check(
-        'the opened trim finds the box a median filter would, on either paper, pad and threshold boundary',
+        'the opened trim finds the box a median filter would, on either paper, pad and threshold boundary, '
+        f'up to the widest window it takes ({widest})',
         not differs,
         '; '.join(differs[:4]),
     )
@@ -3772,9 +3865,14 @@ def check_range_repack() -> None:
         sorted(z.namelist()) == sorted(_zf.ZipFile(_io.BytesIO(whole)).namelist()),
         f'{sorted(z.namelist())}',
     )
+    try:
+        entry, why = z.read('p001.jpg'), ''
+    except Exception as exc:
+        entry, why = None, f'{type(exc).__name__}: {exc}'
     check(
         'and an entry read that way is byte-identical',
-        z.read('p001.jpg') == _zf.ZipFile(_io.BytesIO(whole)).read('p001.jpg'),
+        entry == _zf.ZipFile(_io.BytesIO(whole)).read('p001.jpg'),
+        why,
     )
     fetched = _RANGED['bytes'] - before['bytes']
     check(
@@ -3784,6 +3882,42 @@ def check_range_repack() -> None:
     )
     reader.close()
     check('closing is idempotent', (reader.close(), reader.closed)[1] is True)
+
+    large = _RANGED_LARGE_BODY
+    start = dict(_RANGED_LARGE)
+    lr = open_range(f'{base}/ranged-large/file.cbz', hdrs)
+    check('a reader for an archive of entries a megabyte and more', lr is not None)
+    if lr is not None:
+        local = _zf.ZipFile(_io.BytesIO(large))
+        remote = _zf.ZipFile(lr)
+        infos = sorted((i for i in remote.infolist() if not i.is_dir()), key=lambda i: cbz.natural_key(i.filename))
+        check(
+            'premise: most of its entries are a range block or more',
+            sum(i.compress_size >= 1 << 20 for i in infos) >= 3,
+            f'{[i.compress_size for i in infos]}',
+        )
+        try:
+            got, why = [remote.read(i) for i in infos], ''
+        except Exception as exc:
+            got, why = [], f'{type(exc).__name__}: {exc}'
+        check(
+            'every entry read through the origin, in order, is byte-identical',
+            got == [local.read(i.filename) for i in infos],
+            why,
+        )
+        fetched = _RANGED_LARGE['bytes'] - start['bytes']
+        asked = _RANGED_LARGE['requests'] - start['requests']
+        check(
+            'each byte of the archive is fetched about once: the archive and at most a block more',
+            fetched <= len(large) + (1 << 20),
+            f'{fetched / 2**20:.2f} MiB fetched for an archive of {len(large) / 2**20:.2f} MiB',
+        )
+        check(
+            'in about one request an entry',
+            asked <= len(infos) + 3,
+            f'{asked} requests for {len(infos)} entries',
+        )
+        lr.close()
 
     check(
         'an origin that ignores Range yields no reader',
@@ -8017,6 +8151,88 @@ def check_repack_progress() -> None:
     check('watching a repack does not change what it produces', _entries_of(no_cb) == _entries_of(out))
 
 
+def check_cover_on_the_pool() -> None:
+    prof = profiles.PROFILES['kobo-clara-hd-2e-bw']
+    cover = fake_page(9, 800, 1200)
+    spans: list = []
+    real = cbz.render_page
+
+    def slow(buf, p, *a, **k):
+        began = time.perf_counter()
+        time.sleep(0.2)
+        out = real(buf, p, *a, **k)
+        spans.append((buf == cover, began, time.perf_counter()))
+        return out
+
+    with mock.patch.object(cbz, 'render_page', slow):
+        got = b''.join(cbz.repack_iter(io.BytesIO(_cbz_bytes(8)), prof, 3, cover=cover))
+    covers = [s for s in spans if s[0]]
+    check('premise: the cover was rendered once, and the pages beside it', len(covers) == 1 and len(spans) == 9)
+    check(
+        'the page workers render pages while the cover renders, not after it',
+        bool(covers) and min(s[1] for s in spans if not s[0]) < covers[0][2],
+        f'first page render began {min(s[1] for s in spans if not s[0]) - covers[0][1]:+.2f} s after the cover began'
+        if covers
+        else 'no cover render',
+    )
+    names = zipfile.ZipFile(io.BytesIO(got)).namelist()
+    check('and the cover is still the first entry', names[:1] == ['0000.png'], f'{names[:3]}')
+
+    taken = [0]
+    real_entries = cbz._entries
+
+    def slow_entries(zin, infos):
+        for item in real_entries(zin, infos):
+            time.sleep(0.15)
+            taken[0] += 1
+            yield item
+
+    with mock.patch.object(cbz, '_entries', slow_entries):
+        stream = cbz.repack_iter(io.BytesIO(_cbz_bytes(8)), prof, 3, cover=cover)
+        next(stream)
+        at_first = taken[0]
+        b''.join(stream)
+    check(
+        'with the archive slow to read, the cover goes out once it is ready, not once the pool is full',
+        at_first < 2 * 3 - 1,
+        f'{at_first} pages read when the first block went out, the pool holds {2 * 3}',
+    )
+
+
+async def check_trim_aside(c) -> None:
+    up = 'http://127.0.0.1:8899'
+    entered, released = threading.Event(), threading.Event()
+    real_trim = app_mod.cache._trim
+
+    def held():
+        entered.set()
+        released.wait(30)
+        return real_trim()
+
+    tok = encode_token(f'{up}/opds/v1.2/books/7/thumbnail?trim={time.time_ns()}')
+    app_mod.cache._size = None
+    with mock.patch.object(app_mod.cache, '_trim', held):
+        try:
+            try:
+                r = await asyncio.wait_for(c.get(f'/kobo-clara-hd-2e-bw/img/{tok}'), 10)
+                answered = r.status_code
+            except TimeoutError:
+                answered = 'still waiting after 10 s'
+            started = await asyncio.to_thread(entered.wait, 10)
+        finally:
+            released.set()
+        for _ in range(200):
+            if not app_mod.cache._trimming:
+                break
+            await asyncio.sleep(0.05)
+    check('premise: a page fetched with the cache size unknown starts a trim', started)
+    check('and the page is answered while that trim is still running', answered == 200, f'{answered}')
+    check(
+        'the trim then finishes and knows the cache size',
+        not app_mod.cache._trimming and app_mod.cache._size is not None,
+    )
+
+
 def check_job_board() -> None:
     board = app_mod.Jobs(limit=3, ttl=900.0)
     board.set('a', stage='fetching')
@@ -8904,8 +9120,12 @@ async def main() -> int:
 
         print('download progress')
         check_repack_progress()
+        check_cover_on_the_pool()
         check_job_board()
         check_progress_script()
+
+        print('cache trim')
+        await check_trim_aside(c)
 
     print('repack + profile config')
     jc = dataclasses.replace(profiles.PROFILES['kindle-scribe-colorsoft'], fmt='jpegc', auto_mono=False)
@@ -9017,6 +9237,7 @@ async def main() -> int:
     check_edge_line()
     print('autocrop')
     check_dark_margin_crop()
+    check_mono_one_band()
     check_autocrop_open()
     print('strip folio')
     check_strip_folio()

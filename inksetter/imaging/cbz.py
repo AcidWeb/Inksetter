@@ -7,6 +7,7 @@ import time
 import pyvips
 import logging
 import zipfile
+import itertools
 import collections
 import concurrent.futures
 
@@ -55,9 +56,25 @@ def _entries(zin, infos):
 
 
 def _render(job, profile: Profile):
+    if job[0] == 'cover':
+        return render_page(job[1], embedded_cover_for(profile))
     if job[0] == 'tile':
         return webtoon.render_tile(job, profile)
     return render_page(job[3], profile)
+
+
+_UNWRITTEN = object()
+
+
+def _emit_cover(zout, pad: int, render, *args):
+    try:
+        blob, _mime = render(*args)
+    except Exception:
+        blob = None
+    if not blob:
+        return _UNWRITTEN
+    zout.writestr(f'{0:0{pad}d}{_suffix_for(blob, "cover.png")}', blob)
+    return _dimensions(blob)
 
 
 def _dimensions(blob: bytes) -> tuple[int, int] | None:
@@ -100,6 +117,8 @@ def _run_serial(jobs, zout, profile: Profile, pad: int):
     for job in jobs:
         if job[0] == 'copy':
             yield job, _emit(zout, job, None, pad)
+        elif job[0] == 'cover':
+            yield job, _emit_cover(zout, pad, _render, job, profile)
         else:
             yield job, _emit_rendered(zout, job, pad, _render, job, profile)
 
@@ -112,14 +131,20 @@ def _run_pooled(jobs, zout, profile: Profile, workers: int, pad: int):
         job, fut = pending.popleft()
         if fut is None:
             return job, _emit(zout, job, None, pad)
+        if job[0] == 'cover':
+            return job, _emit_cover(zout, pad, fut.result)
         return job, _emit_rendered(zout, job, pad, fut.result)
+
+    def ready() -> bool:
+        fut = pending[0][1]
+        return len(pending) >= window or fut is None or fut.done()
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers, thread_name_prefix='repack') as pool:
         try:
             for job in jobs:
                 fut = None if job[0] == 'copy' else pool.submit(_render, job, profile)
                 pending.append((job, fut))
-                while len(pending) >= window:
+                while pending and ready():
                     yield flush_one()
             while pending:
                 yield flush_one()
@@ -203,23 +228,20 @@ def repack_iter(
             sink = _StreamSink()
             zout = zipfile.ZipFile(sink, 'w', zipfile.ZIP_STORED)
             try:
+                consumed: dict[int, int] = {}
+                jobs = webtoon.strip_tiles(_entries(zin, infos), profile, consumed) if strip else _entries(zin, infos)
                 if lead is not None:
-                    try:
-                        blob, _mime = render_page(lead, embedded_cover_for(profile))
-                    except Exception:
-                        blob = None
-                    if blob:
-                        zout.writestr(f'{0:0{pad}d}{_suffix_for(blob, "cover.png")}', blob)
-                        sizes.append(_dimensions(blob))
+                    jobs = itertools.chain([('cover', lead)], jobs)
+                for job, size in _run(jobs, zout, profile, workers, pad):
+                    if job[0] == 'cover':
+                        if size is not _UNWRITTEN:
+                            sizes.append(size)
+                        pages += 1
+                        tell(pages)
                         block = sink.drain()
                         if block:
                             yield block
-                    pages += 1
-                    tell(pages)
-
-                consumed: dict[int, int] = {}
-                jobs = webtoon.strip_tiles(_entries(zin, infos), profile, consumed) if strip else _entries(zin, infos)
-                for job, size in _run(jobs, zout, profile, workers, pad):
+                        continue
                     written += 1
                     if job[0] != 'copy':
                         sizes.append(size)
