@@ -1,4 +1,4 @@
-# Inksetter
+# [<img src="inksetter/logo.png" width="32" alt="">]() Inksetter
 
 Inksetter is a proxy that sits between the OPDS server and the client running on an E-Ink device. The purpose of this app is to optimise the appearance of manga and comics as much as possible without modifying the source files. Transparently offering the same features as the original server’s OPDS feed.
 
@@ -14,7 +14,7 @@ The recommended way to deploy this application is Docker Compose. An example `do
 
 ### Windows
 
-Additionally, for testing and short-term deployments, a Windows binary is also provided.
+Additionally, for testing and short-term deployments, a Windows binary is also [provided](https://github.com/AcidWeb/Inksetter/releases/latest).
 
 Unpack it anywhere and run `Inksetter.exe`. On the first start, it creates its settings file, `%LOCALAPPDATA%\Inksetter\inksetter.toml`, and opens it in Notepad: put the catalog URL in it, save it, and start `Inksetter.exe` again. The file lists the common settings, and any other environment variable can be set there too. The proxy listens on port 8080, like the container, and keeps its cache in `%LOCALAPPDATA%\Inksetter\cache`.
 
@@ -32,7 +32,7 @@ Opening a profile from the root page browses the same catalogue an OPDS client s
 
 ### KOReader
 
-If KOReader is used as client to read downloaded CBZ files it **MUST BE** configured in specific way to display output correctly. Please check the [wiki](https://github.com/AcidWeb/Inksetter/wiki) for more details. Additionally, when an OPDS proxy is added to KOReader, I recommend enabling the `Use server filenames` option.
+If KOReader is used as client to read downloaded CBZ files it **MUST BE** configured in specific way to display output correctly. Please check the [wiki](https://github.com/AcidWeb/Inksetter/wiki/KOReader) for more details. Additionally, when an OPDS proxy is added to KOReader, I recommend enabling the `Use server filenames` option.
 
 ### Kavita specific features
 
@@ -45,7 +45,7 @@ Currently, if the proxy uses Kavita as the OPDS source, two additional features 
 
 * Only CBZ files are supported.
 * The browser pages render OPDS V1 feeds only. An OPDS V2 source still works normally for readers.
-* Webtoon format (long vertical strips) support is limited. Please check the [wiki](https://github.com/AcidWeb/Inksetter/wiki) for more details.
+* Webtoon format (long vertical strips) support is limited. Please check the [wiki](https://github.com/AcidWeb/Inksetter/wiki/Webtoons) for more details.
 * Very big CBZ (1GB+) archives might fail to download if source OPDS server don't support HTTP range requests.
 
 ## Performance
