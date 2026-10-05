@@ -71,6 +71,8 @@ class Profile:
     colour_pad: str = 'border'
     # Ignore where the archive happens to cut the strip and re-cut.
     reslice: bool = False
+    # Enlarge a re-cut strip by no more than this; a narrower strip is padded at its sides.
+    strip_scale_max: float = 2.0
     # Enlarge a source too small to fill the panel.
     #   panel  resize up to the panel box, capped by upscale_max
     #   none   ship it small and let the reader deal with it
@@ -233,6 +235,8 @@ def validate(p: Profile, where: str = 'profile') -> Profile:
         problems.append(f'upscale_kernel={p.upscale_kernel!r} is not one of {", ".join(sorted(UPSCALE_KERNELS))}')
     if not 1.0 <= p.upscale_max <= UPSCALE_MAX_CEILING:
         problems.append(f'upscale_max={p.upscale_max} must be 1.0..{UPSCALE_MAX_CEILING}')
+    if not 1.0 <= p.strip_scale_max <= UPSCALE_MAX_CEILING:
+        problems.append(f'strip_scale_max={p.strip_scale_max} must be 1.0..{UPSCALE_MAX_CEILING}')
     if p.defringe != 'none' and p.panel != 'kaleido':
         problems.append(
             f'defringe={p.defringe!r} with panel={p.panel!r}: only a kaleido panel has a filter array to beat with'

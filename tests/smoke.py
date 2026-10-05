@@ -114,6 +114,9 @@ def fake_colour_page(w: int = 1600, h: int = 2400) -> bytes:
     return pyvips.Image.new_from_memory(rgb.tobytes(), w, h, 3, 'uchar').jpegsave_buffer(Q=95)
 
 
+_PAGE_SUFFIXES = ('.png', '.jpg', '.webp')
+
+
 def fake_page(n: int, w: int = 1600, h: int = 2400) -> bytes:
     a = np.full((h, w), 255, np.uint8)
     yy, xx = np.mgrid[0:h, 0:w]
@@ -1080,7 +1083,7 @@ def check_mask_cache_and_padding() -> None:
         f'{info.misses} miss(es), {info.hits} hit(s)',
     )
 
-    strip = profiles.PROFILES['kindle-scribe-colorsoft-webtoon']
+    strip = _strip_profile('kindle-scribe-colorsoft-webtoon')
     heights = (700, 1300, 1900, strip.height)
     check(
         'premise: those page heights pad to four different lengths on their own',
@@ -1792,7 +1795,7 @@ async def check_comicinfo() -> None:
     def shipped(archive):
         out = []
         for n in sorted(archive.namelist()):
-            if n.lower().endswith(('.png', '.jpg')):
+            if n.lower().endswith(_PAGE_SUFFIXES):
                 im = pyvips.Image.new_from_buffer(archive.read(n), '')
                 out.append([im.width, im.height])
         return out
@@ -1804,7 +1807,7 @@ async def check_comicinfo() -> None:
         for n in with_own_info.namelist():
             if not n.lower().endswith('comicinfo.xml'):
                 z.writestr(n, with_own_info.read(n))
-    strip = profiles.PROFILES['kindle-colorsoft-1-2-webtoon']
+    strip = _strip_profile()
     z4 = _zf.ZipFile(
         _io.BytesIO(
             b''.join(
@@ -2457,7 +2460,7 @@ def check_colour_pad_ring() -> None:
 
 
 def check_webtoon_pad() -> None:
-    strip = profiles.PROFILES['kindle-colorsoft-1-2-webtoon']
+    strip = _strip_profile()
     paged = dataclasses.replace(profiles.PROFILES['kindle-colorsoft-1-2'], auto_mono=False)
     mono = profiles.PROFILES['kobo-clara-hd-2e-bw']
     limit = round(strip.width * strip.aspect)
@@ -2521,7 +2524,7 @@ def check_webtoon_pad() -> None:
 
 
 def check_gutter_pad() -> None:
-    p = profiles.PROFILES['kindle-colorsoft-1-2-webtoon']
+    p = _strip_profile()
     limit, scale = p.height, p.width / 800
     black, white = (6, 6, 8), (255, 255, 255)
     ink, paper = (0, 0, 0), (255, 255, 255)
@@ -2648,7 +2651,7 @@ def check_gutter_pad() -> None:
 def check_strip_width() -> None:
     strips = {n: p for n, p in profiles.PROFILES.items() if p.reslice}
     check('the table carries webtoon profiles', bool(strips), 'none sets reslice = true')
-    prof = profiles.PROFILES['kindle-colorsoft-1-2-webtoon']
+    prof = _strip_profile()
     box = profiles.PROFILES['kindle-colorsoft-1-2']
     check(
         'every webtoon profile leaves the strip alone',
@@ -3869,7 +3872,7 @@ def check_upscale_kernel() -> None:
         f'{got.width}x{got.height} vs {want.width}x{want.height}',
     )
 
-    strip = profiles.PROFILES['kindle-scribe-colorsoft-webtoon']
+    strip = _strip_profile('kindle-scribe-colorsoft-webtoon')
     slice_ = pyvips.Image.new_from_buffer(fake_page(2, 800, 1000), '')
     widened = pipeline.fit_to_width(slice_, strip.width, strip)
     wanted = slice_.resize(strip.width / slice_.width, kernel='cubic')
@@ -4359,10 +4362,10 @@ def check_big_panel_cap() -> None:
     ksc = profiles.PROFILES['kindle-scribe-colorsoft']
     check(
         'a chained base keeps the Kaleido fields as well as the cap',
-        (ksc.upscale_max, ksc.panel, ksc.defringe, ksc.fmt) == (2.2, 'kaleido', 'diagonal', 'pngc'),
+        (ksc.upscale_max, ksc.panel, ksc.defringe, ksc.fmt) == (2.5, 'kaleido', 'diagonal', 'pngc'),
         f'{ksc.upscale_max} {ksc.panel} {ksc.defringe} {ksc.fmt}',
     )
-    for name, (w, h), cap in (('kindle-scribe-3', (700, 1000), 2.2), ('kobo-clara-hd-2e-bw', (500, 690), 2.0)):
+    for name, (w, h), cap in (('kindle-scribe-3', (700, 1000), 2.5), ('kobo-clara-hd-2e-bw', (500, 690), 2.0)):
         prof = dataclasses.replace(profiles.PROFILES[name], autocrop=False, strip_folio=False)
         free = min(prof.width / w, prof.height / h)
         g = pipeline._geometry(fake_page(4, w, h), prof, prof.width, prof.height, True)
@@ -4427,6 +4430,10 @@ def check_profile_source() -> None:
 LF = chr(10)
 
 
+def _strip_profile(name: str = 'kindle-colorsoft-1-2-webtoon') -> profiles.Profile:
+    return dataclasses.replace(profiles.PROFILES[name], fmt='pngc')
+
+
 def _strip_cbz(heights, width=800, gutter=None, noise=0) -> bytes:
     gutters = [gutter] if isinstance(gutter, tuple) else list(gutter or [])
     buf = io.BytesIO()
@@ -4487,7 +4494,7 @@ def _pages_of(blob: bytes):
     z = zipfile.ZipFile(io.BytesIO(blob))
     out = []
     for n in sorted(z.namelist()):
-        if n.lower().endswith(('.png', '.jpg')):
+        if n.lower().endswith(_PAGE_SUFFIXES):
             im = pyvips.Image.new_from_buffer(z.read(n), '')
             out.append((n, im.width, im.height))
     return out
@@ -4530,7 +4537,7 @@ def _seam(block: np.ndarray, limit: int) -> int:
 
 
 def check_seam_defects() -> None:
-    p = profiles.PROFILES['kindle-colorsoft-1-2-webtoon']
+    p = _strip_profile()
     L = round(p.width * p.aspect)
 
     row = _panel_strip(('bubble', 1))
@@ -4839,7 +4846,7 @@ def check_rounding() -> None:
 def check_bit_depth() -> None:
     mono = profiles.PROFILES['kobo-clara-hd-2e-bw']
     colour = dataclasses.replace(profiles.PROFILES['kindle-colorsoft-1-2'], auto_mono=False)
-    strip = profiles.PROFILES['kindle-colorsoft-1-2-webtoon']
+    strip = _strip_profile()
 
     def twins(bands: int) -> tuple[bytes, bytes]:
         a = np.full((1400, 900, bands), 255, np.uint8)
@@ -4964,10 +4971,10 @@ def check_lazy_decode() -> None:
         z.writestr('003.gif', bad)
         for i in range(4, 7):
             z.writestr(f'{i:03d}.jpg', fake_page(i, 800, 1500))
-    strip = profiles.PROFILES['kindle-colorsoft-1-2-webtoon']
+    strip = _strip_profile()
     try:
         out = zipfile.ZipFile(io.BytesIO(b''.join(cbz.repack_iter(io.BytesIO(buf.getvalue()), strip, 1))))
-        pages = [n for n in out.namelist() if n.lower().endswith(('.png', '.jpg'))]
+        pages = [n for n in out.namelist() if n.lower().endswith(_PAGE_SUFFIXES)]
         got = f'{len(pages)} pages' if out.testzip() is None else 'corrupt archive'
     except Exception as exc:
         pages, got = [], f'{type(exc).__name__}: {str(exc)[:40]}'
@@ -4979,7 +4986,7 @@ def check_reslice_edges() -> None:
 
     import itertools
 
-    strip = profiles.PROFILES['kindle-colorsoft-1-2-webtoon']
+    strip = _strip_profile()
 
     def png(a: np.ndarray) -> bytes:
         bands = 1 if a.ndim == 2 else a.shape[2]
@@ -5045,7 +5052,7 @@ def check_reslice_edges() -> None:
     got = []
     out = zipfile.ZipFile(io.BytesIO(b''.join(cbz.repack_iter(io.BytesIO(src), mono, 1))))
     for n in sorted(out.namelist()):
-        if n.endswith(('.png', '.jpg')):
+        if n.endswith(_PAGE_SUFFIXES):
             im = pyvips.Image.new_from_buffer(out.read(n), '')
             a = np.ndarray(buffer=im.write_to_memory(), dtype=np.uint8, shape=(im.height, im.width, im.bands))
             inked = int((a.max(axis=(1, 2)) != a.min(axis=(1, 2))).sum())
@@ -5067,7 +5074,7 @@ def check_reslice_edges() -> None:
     )
     means = []
     for n in sorted(out.namelist()):
-        if n.endswith(('.png', '.jpg')):
+        if n.endswith(_PAGE_SUFFIXES):
             im = pyvips.Image.new_from_buffer(out.read(n), '')
             means.append(round(im.avg()))
     check(
@@ -5091,7 +5098,7 @@ def check_reslice_edges() -> None:
     out = zipfile.ZipFile(
         io.BytesIO(b''.join(cbz.repack_iter(io.BytesIO(src), strip, 1, progress=lambda d, t: calls.append((d, t)))))
     )
-    pages = [n for n in out.namelist() if n.endswith(('.png', '.jpg'))]
+    pages = [n for n in out.namelist() if n.endswith(_PAGE_SUFFIXES)]
     check(
         'webtoon progress moves once per page written',
         len(calls) == len(pages) + 2,
@@ -5118,7 +5125,7 @@ def _lettering(text: str, width: int = 1272, x: int | None = None) -> np.ndarray
 
 
 def check_strip_lettering() -> None:
-    p = profiles.PROFILES['kindle-colorsoft-1-2-webtoon']
+    p = _strip_profile()
     L = p.height
     reader = folio._reader()
     check('premise: the text detector is there to ask', reader is not None)
@@ -5260,7 +5267,7 @@ def check_strip_lettering() -> None:
     on = first_page(p, block)
     try:
         profiles.use_folio(False)
-        off = first_page(profiles.PROFILES['kindle-colorsoft-1-2-webtoon'], block)
+        off = first_page(_strip_profile(), block)
     finally:
         profiles.use_folio(True)
     check('a download keeps both lines of the bubble on one page', on == l2, f'first page {on} rows, lines end {l2}')
@@ -5290,7 +5297,7 @@ def check_strip_lettering() -> None:
 
 
 def check_strip_fill() -> None:
-    p = profiles.PROFILES['kindle-colorsoft-1-2-webtoon']
+    p = _strip_profile()
     L = p.height
 
     def strip(first, gap, second, after=0.20):
@@ -5354,7 +5361,7 @@ def check_strip_fill() -> None:
     got = len(first_page(logo))
     try:
         profiles.use_folio(False)
-        blind = len(first_page(logo, profiles.PROFILES['kindle-colorsoft-1-2-webtoon']))
+        blind = len(first_page(logo, _strip_profile()))
     finally:
         profiles.use_folio(True)
     check(
@@ -5435,7 +5442,7 @@ def check_strip_fill() -> None:
 
 
 def check_strip_decode_ahead() -> None:
-    p = profiles.PROFILES['kindle-colorsoft-1-2-webtoon']
+    p = _strip_profile()
     src = _strip_cbz([900, 700, 1100, 800, 1000, 600, 1200, 900, 700, 1000], gutter=[(1, 300), (4, 500), (7, 200)])
 
     def cut(threads: int, entries=None):
@@ -5459,14 +5466,14 @@ def check_strip_decode_ahead() -> None:
     lock, now, most, where = threading.Lock(), [0], [0], set()
     real_rows = webtoon._strip_rows
 
-    def slow(blob, q):
+    def slow(blob, q, width=None):
         with lock:
             now[0] += 1
             most[0] = max(most[0], now[0])
             where.add(threading.current_thread().name)
         time.sleep(0.05)
         try:
-            return real_rows(blob, q)
+            return real_rows(blob, q, width)
         finally:
             with lock:
                 now[0] -= 1
@@ -5500,10 +5507,10 @@ def check_strip_decode_ahead() -> None:
 
     started = [0]
 
-    def slower(blob, q):
+    def slower(blob, q, width=None):
         started[0] += 1
         time.sleep(0.2)
-        return real_rows(blob, q)
+        return real_rows(blob, q, width)
 
     z = zipfile.ZipFile(io.BytesIO(src))
     order = sorted(z.infolist(), key=lambda i: cbz.natural_key(i.filename))
@@ -5524,7 +5531,7 @@ def check_strip_decode_ahead() -> None:
 
 
 def check_strip_rescue() -> None:
-    p = profiles.PROFILES['kindle-colorsoft-1-2-webtoon']
+    p = _strip_profile()
     limit, w = p.height, p.width
     floor = int(limit * webtoon.STRIP_MIN_FILL)
     rng = np.random.default_rng(31)
@@ -5703,7 +5710,7 @@ def check_strip_rescue() -> None:
 
 
 def check_strip_plan() -> None:
-    p = profiles.PROFILES['kindle-colorsoft-1-2-webtoon']
+    p = _strip_profile()
     limit, w = p.height, p.width
     margin = round(limit * webtoon.STRIP_TOP_MARGIN)
     rng = np.random.default_rng(37)
@@ -6009,11 +6016,93 @@ def check_strip_plan() -> None:
     )
 
 
+def check_strip_scale_max() -> None:
+    p = _strip_profile()
+    check('the default cap is 2.0', p.strip_scale_max == 2.0, f'{p.strip_scale_max}')
+    limit = round(p.width * p.aspect)
+
+    def cut(src: bytes, prof) -> list[np.ndarray]:
+        z = zipfile.ZipFile(io.BytesIO(b''.join(cbz.repack_iter(io.BytesIO(src), prof, 1))))
+        out = []
+        for n in sorted(n for n in z.namelist() if n[0].isdigit()):
+            im = pyvips.Image.new_from_buffer(z.read(n), '').colourspace('b-w')[0]
+            out.append(np.ndarray(buffer=im.write_to_memory(), dtype=np.uint8, shape=(im.height, im.width)))
+        return out
+
+    def artwork(page: np.ndarray) -> tuple[int, int]:
+        cols = np.flatnonzero(page.max(axis=0).astype(np.int16) - page.min(axis=0) > 0)
+        return int(cols[0]), int(cols[-1] - cols[0] + 1)
+
+    src = _strip_cbz([1200, 900, 1200], width=400)
+    full = cut(src, dataclasses.replace(p, strip_scale_max=profiles.UPSCALE_MAX_CEILING))
+    capped = cut(src, dataclasses.replace(p, strip_scale_max=2.0))
+    check(
+        'a capped strip still ships every page at exactly the panel size',
+        bool(capped) and {a.shape for a in capped} == {(limit, p.width)},
+        f'{sorted({a.shape for a in capped})}',
+    )
+    spans = [artwork(a) for a in capped]
+    check(
+        'and its artwork is the slice enlarged by the cap alone, centred between margins',
+        all(abs(w - 800) <= 4 and abs(x - (p.width - 800) // 2) <= 4 for x, w in spans),
+        f'(left, width) {sorted(set(spans))}',
+    )
+    check(
+        'uncapped, the artwork still fills the panel width',
+        bool(full) and all(artwork(a)[1] >= p.width - 4 for a in full),
+        f'{sorted({artwork(a) for a in full})}',
+    )
+    check('and the capped strip takes fewer pages', len(capped) < len(full), f'{len(capped)} vs {len(full)}')
+    loose = cut(src, dataclasses.replace(p, strip_scale_max=4.0))
+    check(
+        'a cap the slices never reach changes nothing',
+        len(loose) == len(full) and all(np.array_equal(a, b) for a, b in zip(loose, full, strict=False)),
+    )
+
+    rng = np.random.default_rng(12)
+    first = rng.integers(0, 256, (900, 400, 3), np.uint8)
+    wider = rng.integers(0, 256, (900, 500, 3), np.uint8)
+    try:
+        mixed = cut(_archive_of(first, wider, first), dataclasses.replace(p, strip_scale_max=2.0))
+        err = ''
+    except Exception as exc:
+        mixed, err = [], repr(exc)
+    check(
+        'slices of another width are fitted to the strip the first slice set',
+        bool(mixed) and all(abs(artwork(a)[1] - 800) <= 4 for a in mixed),
+        err or f'{sorted({artwork(a) for a in mixed})}',
+    )
+
+    key = cache_mod.render_key('http://x/p/1', p, None)
+    check(
+        'the cap is not part of the render key, since it only changes how a download is cut',
+        key == cache_mod.render_key('http://x/p/1', dataclasses.replace(p, strip_scale_max=1.5), None),
+    )
+    for cap, good in ((0.99, False), (8.01, False), (1.0, True), (8.0, True)):
+        try:
+            profiles.validate(dataclasses.replace(p, strip_scale_max=cap))
+            ok = good
+        except ValueError:
+            ok = not good
+        check(f'strip_scale_max={cap} is {"taken" if good else "refused"}', ok)
+
+
 def check_reslice() -> None:
-    p = profiles.PROFILES['kindle-colorsoft-1-2-webtoon']
+    p = _strip_profile()
     limit = round(p.width * p.aspect)
     floor = int(limit * webtoon.STRIP_MIN_FILL)
     check('the webtoon profiles ask to be re-cut', p.reslice)
+    for name in sorted(n for n, q in profiles.PROFILES.items() if q.reslice):
+        shipped = profiles.PROFILES[name]
+        z = zipfile.ZipFile(io.BytesIO(b''.join(cbz.repack_iter(io.BytesIO(_strip_cbz([1280, 1000])), shipped, 1))))
+        names = [n for n in z.namelist() if n[0].isdigit()]
+        suffix = {'image/webp': '.webp', 'image/jpeg': '.jpg'}.get(shipped.mime, '.png')
+        sizes = {(i.width, i.height) for i in (pyvips.Image.new_from_buffer(z.read(n), '') for n in names)}
+        check(
+            f'{name} re-cuts a strip into panel-sized pages in its own format',
+            bool(names) and all(n.endswith(suffix) for n in names) and sizes == {(shipped.width, shipped.height)},
+            f'{names[:2]} {sizes}',
+        )
 
     heights = [1280, 1000, 1000, 1, 1280, 640, 1000]
     src = _strip_cbz(heights)
@@ -6492,16 +6581,18 @@ def check_reslice() -> None:
         f'{blank_at_top(bd[1])} blank rows at the top, then {opens_on(bd[1])}',
     )
 
-    source = np.random.default_rng(11).integers(0, 256, (1280, 800, 3), dtype=np.uint8)
-    source[640:680] = 0
-    source[640:680, [0, 799]] = 18
-    edged = _archive_of(source)
     for name, q in sorted(profiles.PROFILES.items()):
         if not q.reslice:
             continue
-        s = q.width / 800
-        z = zipfile.ZipFile(io.BytesIO(edged))
-        rows = webtoon._strip_rows(z.read('0000.png'), q)[round(650 * s) : round(670 * s)]
+        s = min(q.width / 800, q.strip_scale_max)
+        screen = q.height / s
+        top, tall = round(0.6 * screen), round(0.02 * screen)
+        source = np.random.default_rng(11).integers(0, 256, (round(1.2 * screen), 800, 3), dtype=np.uint8)
+        source[top : top + tall] = 0
+        source[top : top + tall, [0, 799]] = 18
+        z = zipfile.ZipFile(io.BytesIO(_archive_of(source)))
+        rows = webtoon._strip_rows(z.read('0000.png'), q, round(800 * s))
+        rows = rows[round((top + 3) * s) : round((top + tall - 3) * s)]
         spread = int((rows.max(axis=(1, 2)).astype(np.int16) - rows.min(axis=(1, 2))).min())
         check(
             f'premise, {name}: the light edge of a black gutter survives the upscale',
@@ -6510,7 +6601,7 @@ def check_reslice() -> None:
         )
         order = sorted(z.infolist(), key=lambda i: cbz.natural_key(i.filename))
         first = next(len(t[3]) for t in webtoon.strip_tiles(cbz._entries(z, order), q, {}) if t[0] == 'tile')
-        lo, hi = round(640 * s), round(680 * s)
+        lo, hi = round(top * s), round((top + tall) * s)
         check(
             f'{name}: a black gutter with a light edge column, as real WebP slices have, is still a gutter',
             lo - 4 <= first <= hi + 4,
@@ -7812,7 +7903,7 @@ def _host_key_of(url: str) -> str | None:
 
 async def check_no_stream(c) -> None:
     up = 'http://127.0.0.1:8899'
-    strip = profiles.PROFILES['kindle-colorsoft-1-2-webtoon']
+    strip = _strip_profile()
     check('premise: the webtoon profile is re-cut', strip.reslice)
 
     r = await c.get(f'/{strip.name}/catalog')
@@ -9249,6 +9340,7 @@ async def main() -> int:
     check_lazy_decode()
     print('webtoon re-slicing')
     check_reslice()
+    check_strip_scale_max()
     check_reslice_edges()
     check_strip_lettering()
     check_strip_fill()

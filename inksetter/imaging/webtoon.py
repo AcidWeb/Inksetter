@@ -46,12 +46,20 @@ STRIP_FILL_FLOOR = 0.90
 STRIP_FILL_READ = 0.08
 
 
-def _strip_rows(blob: bytes, p: Profile) -> np.ndarray | None:
+def _strip_width(blob: bytes, p: Profile) -> int | None:
+    try:
+        width = pipeline.open_image(blob).autorot().width
+    except Exception:
+        return None
+    return min(p.width, round(width * p.strip_scale_max))
+
+
+def _strip_rows(blob: bytes, p: Profile, width: int | None = None) -> np.ndarray | None:
     try:
         im = pipeline.open_image(blob).autorot()
         if im.hasalpha():
             im = im.flatten(background=255)
-        im = pipeline.fit_to_width(im, p.width, p)
+        im = pipeline.fit_to_width(im, width or p.width, p)
         if im.bands == 1:
             im = im.colourspace('srgb')
         elif im.bands > 3:
@@ -64,9 +72,17 @@ def _strip_rows(blob: bytes, p: Profile) -> np.ndarray | None:
 
 
 def _decoded(entries, p: Profile):
+    width = None
+
+    def strip_width(blob: bytes) -> int:
+        nonlocal width
+        if width is None:
+            width = _strip_width(blob, p)
+        return width or p.width
+
     if STRIP_DECODE_THREADS <= 0:
         for entry in entries:
-            yield entry, _strip_rows(entry[3], p) if entry[0] == 'page' else None
+            yield entry, _strip_rows(entry[3], p, strip_width(entry[3])) if entry[0] == 'page' else None
         return
     pool = concurrent.futures.ThreadPoolExecutor(STRIP_DECODE_THREADS, thread_name_prefix='strip-decode')
     ahead = collections.deque()
@@ -77,7 +93,8 @@ def _decoded(entries, p: Profile):
                 entry = next(source, None)
                 if entry is None:
                     break
-                ahead.append((entry, pool.submit(_strip_rows, entry[3], p) if entry[0] == 'page' else None))
+                rows = pool.submit(_strip_rows, entry[3], p, strip_width(entry[3])) if entry[0] == 'page' else None
+                ahead.append((entry, rows))
             if not ahead:
                 return
             entry, decoding = ahead.popleft()
@@ -509,7 +526,7 @@ def strip_tiles(entries, p: Profile, consumed: dict[int, int]):
 
 @functools.lru_cache(maxsize=16)
 def _refit(p: Profile, fit: str) -> Profile:
-    return dataclasses.replace(p, fit=fit, rotate_wide=False, autocrop=False, strip_folio=False)
+    return dataclasses.replace(p, fit=fit, rotate_wide=False, autocrop=False, strip_folio=False, upscale='none')
 
 
 def tile_image(a: np.ndarray) -> pyvips.Image:

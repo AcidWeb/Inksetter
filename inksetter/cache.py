@@ -14,7 +14,7 @@ from pathlib import Path
 from .imaging.profiles import Profile
 from .imaging.pipeline import PIPELINE_VERSION
 
-_KEY_IGNORED_FIELDS = frozenset({'name', 'reslice'})
+_KEY_IGNORED_FIELDS = frozenset({'name', 'reslice', 'strip_scale_max'})
 
 
 def render_key(url: str, profile: Profile, max_width: int | None, credentials: str = '') -> str:

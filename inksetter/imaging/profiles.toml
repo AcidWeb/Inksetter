@@ -20,11 +20,11 @@ panel = "kaleido"
 # --------------------------------------------------------------------------
 
 [mixins.big-panel]
-upscale_max = 2.2
+upscale_max = 2.5
 
 [mixins.kaleido-big]
 base = "kaleido"
-upscale_max = 2.2
+upscale_max = 2.5
 
 
 # --------------------------------------------------------------------------
