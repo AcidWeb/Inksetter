@@ -2148,6 +2148,65 @@ def check_png_effort() -> None:
         check(f'png_effort={bad} is refused', ok)
 
 
+def check_webp_colour() -> None:
+    pngc = profiles.PROFILES['kindle-colorsoft-1-2']
+    webpc = dataclasses.replace(pngc, fmt='webpc')
+    check('webpc is a colour format served as WebP', webpc.is_colour and webpc.mime == 'image/webp', webpc.mime)
+
+    src = _rich_colour_page()
+    blob, media = pipeline.render_page(src, webpc)
+    im = pyvips.Image.new_from_buffer(blob, '')
+    check(
+        'a webpc colour page is a WebP at the panel geometry',
+        media == 'image/webp'
+        and blob[:4] == b'RIFF'
+        and blob[8:12] == b'WEBP'
+        and (im.width, im.height, im.bands) == (pngc.width, pngc.height, 3),
+        f'{media} {blob[:12]!r} {im.width}x{im.height}x{im.bands}',
+    )
+    ref = pyvips.Image.new_from_buffer(pipeline.render_page(src, pngc)[0], '')
+    gap = (im.cast('float').gaussblur(1.5) - ref.cast('float').gaussblur(1.5)).abs().avg()
+    check('and it carries the same picture as the palette PNG', gap < 5.0, f'mean blurred gap {gap:.2f} levels')
+
+    lo, _ = pipeline.render_page(src, dataclasses.replace(webpc, webp_quality=40))
+    hi, _ = pipeline.render_page(src, dataclasses.replace(webpc, webp_quality=98))
+    check('webp_quality reaches the encoder', len(lo) < len(hi), f'{len(lo)} vs {len(hi)} bytes')
+    fast, _ = pipeline.render_page(src, dataclasses.replace(webpc, webp_effort=0))
+    slow, _ = pipeline.render_page(src, dataclasses.replace(webpc, webp_effort=6))
+    check('webp_effort reaches the encoder', fast != slow, f'{len(fast)} vs {len(slow)} bytes')
+    plain = pipeline.render_page(src, dataclasses.replace(webpc, webp_sharp_yuv=False))[0]
+    sharp = pipeline.render_page(src, dataclasses.replace(webpc, webp_sharp_yuv=True))[0]
+    check('webp_sharp_yuv reaches the encoder', plain != sharp, f'{len(plain)} vs {len(sharp)} bytes')
+
+    grey, gmedia = pipeline.render_page(fake_page(0), webpc)
+    check(
+        'a grey page on a webpc profile still goes out as a 4-bit PNG',
+        gmedia == 'image/png' and grey[:4] == b'\x89PNG',
+        gmedia,
+    )
+
+    for q, good in ((0, False), (101, False), (1, True), (100, True)):
+        try:
+            profiles.validate(dataclasses.replace(webpc, webp_quality=q))
+            ok = good
+        except ValueError:
+            ok = not good
+        check(f'webp_quality={q} is {"taken" if good else "refused"}', ok)
+    for e, good in ((-1, False), (7, False), (0, True), (6, True)):
+        try:
+            profiles.validate(dataclasses.replace(webpc, webp_effort=e))
+            ok = good
+        except ValueError:
+            ok = not good
+        check(f'webp_effort={e} is {"taken" if good else "refused"}', ok)
+
+    wc = dataclasses.replace(profiles.PROFILES['kindle-scribe-colorsoft'], fmt='webpc', auto_mono=False)
+    zw = zipfile.ZipFile(io.BytesIO(b''.join(cbz.repack_iter(io.BytesIO(_cbz_bytes(2)), wc))))
+    pages = [n for n in zw.namelist() if n[0].isdigit()]
+    check('webpc repack names WebP pages .webp', pages and all(n.endswith('.webp') for n in pages), f'{pages}')
+    check('webpc repack really contains WebP', all(zw.read(n)[8:12] == b'WEBP' for n in pages))
+
+
 def _png_chunks(png: bytes) -> list[tuple[bytes, bytes]]:
     chunks, at = [], 8
     while at < len(png):
@@ -9221,6 +9280,7 @@ async def main() -> int:
     await check_comicinfo()
     print('png effort')
     check_png_effort()
+    check_webp_colour()
     print('palette pin')
     check_palette_pin()
     print('colour pad ring')

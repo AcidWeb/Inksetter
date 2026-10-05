@@ -7,8 +7,8 @@ import tomllib
 import importlib.resources
 from dataclasses import dataclass, fields, replace
 
-COLOUR_FORMATS = frozenset({'pngc', 'jpegc'})
-FORMATS = frozenset({'png4', 'png8', 'jpeg', 'pngc', 'jpegc', 'raw'})
+COLOUR_FORMATS = frozenset({'pngc', 'jpegc', 'webpc'})
+FORMATS = frozenset({'png4', 'png8', 'jpeg', 'pngc', 'jpegc', 'webpc', 'raw'})
 DITHERS = frozenset({'bayer', 'none'})
 DESCREENS = frozenset({'none', 'mono', 'always'})
 PANELS = frozenset({'mono', 'kaleido'})
@@ -21,6 +21,7 @@ UPSCALE_MAX_CEILING = 8.0
 
 _SHIPPED = 'profiles.toml'
 _INTERNAL = frozenset({'cover', 'cover-colour'})
+_MIMES = {'jpeg': 'image/jpeg', 'jpegc': 'image/jpeg', 'webpc': 'image/webp'}
 
 
 @dataclass(frozen=True)
@@ -35,10 +36,12 @@ class Profile:
     # jpeg  - grey JPEG. Smallest for continuous tone, but rings around lettering.
     # pngc  - colour PNG, optionally palettised. Kaleido default.
     # jpegc - colour JPEG at 4:2:0, which is the Kaleido chroma pitch.
+    # webpc - lossy colour WebP, 4:2:0 too.
     # raw   - no image processing, feed rewriting only.
     fmt: str = 'png4'
 
     jpeg_quality: int = 82
+    webp_quality: int = 90
     png_compression: int = 6
 
     # What the pixels land on, as opposed to how they are encoded.
@@ -132,6 +135,10 @@ class Profile:
     palette_colours: int = 256
     # The quantiser's speed/quality dial
     png_effort: int = 6
+    # libwebp speed/size dial
+    webp_effort: int = 4
+    # Sharp YUV: truer colour edges through 4:2:0, for about twice the WebP encode time
+    webp_sharp_yuv: bool = True
     # Rainbow fringing related settings
     # Approach adapted from Kindle Comic Converter (ISC).
     #   diagonal  attenuate high diagonal frequencies
@@ -154,7 +161,7 @@ class Profile:
 
     @property
     def mime(self) -> str:
-        return 'image/jpeg' if self.fmt in ('jpeg', 'jpegc') else 'image/png'
+        return _MIMES.get(self.fmt, 'image/png')
 
     @property
     def mono_fmt(self) -> str:
@@ -253,6 +260,10 @@ def validate(p: Profile, where: str = 'profile') -> Profile:
         problems.append(f'black={p.black} white={p.white} must satisfy 0 <= black < white <= 255')
     if not 1 <= p.jpeg_quality <= 100:
         problems.append(f'jpeg_quality={p.jpeg_quality} must be 1-100')
+    if not 1 <= p.webp_quality <= 100:
+        problems.append(f'webp_quality={p.webp_quality} must be 1-100')
+    if not 0 <= p.webp_effort <= 6:
+        problems.append(f'webp_effort={p.webp_effort} must be 0-6')
     if not 1 <= p.png_effort <= 10:
         problems.append(f'png_effort={p.png_effort} must be 1-10')
     if not 2 <= p.palette_colours <= 256:

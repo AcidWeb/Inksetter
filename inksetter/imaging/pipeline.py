@@ -811,6 +811,16 @@ def _render_colour(
             ),
             'image/jpeg',
         )
+    if p.fmt == 'webpc':
+        return (
+            out.webpsave_buffer(
+                Q=p.webp_quality,
+                effort=p.webp_effort,
+                smart_subsample=p.webp_sharp_yuv,
+                strip=True,
+            ),
+            'image/webp',
+        )
     if p.palette:
         out = out.copy_memory()
         png = out.pngsave_buffer(

@@ -26,6 +26,7 @@ _NUM = re.compile(r'(\d+)')
 _COMICINFO = 'comicinfo.xml'
 _JPEG_SOI = b'\xff\xd8\xff'
 _PNG_SIG = b'\x89PNG\r\n\x1a\n'
+_WEBP_TAG = b'WEBP'
 
 
 def natural_key(name: str):
@@ -42,6 +43,8 @@ def _suffix_for(blob: bytes, fallback_name: str) -> str:
         return '.jpg'
     if blob.startswith(_PNG_SIG):
         return '.png'
+    if blob.startswith(b'RIFF') and blob[8:12] == _WEBP_TAG:
+        return '.webp'
     return fallback_name[fallback_name.rfind('.') :]
 
 

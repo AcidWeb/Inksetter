@@ -180,12 +180,14 @@ height = 1680
 # Colorsoft, 12th gen, 2024. Colorsoft, 13th gen, 2026. 7".
 [profiles.kindle-colorsoft-1-2-webtoon]
 base = "kaleido-webtoon"
+fmt = "webpc"
 width = 1272
 height = 1696
 
 # Scribe Colorsoft, 12th gen, 2025. 11".
 [profiles.kindle-scribe-colorsoft-webtoon]
 base = "kaleido-webtoon"
+fmt = "webpc"
 width = 1986
 height = 2648
 
