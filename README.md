@@ -1,6 +1,12 @@
-# [<img src="inksetter/logo.png" width="32" alt="">]() Inksetter
+<p align="center">
+  <picture>
+    <img width="640" height="280" alt="Inksetter" src="docs/inksetter-logo.png" />
+  </picture>
+</p>
 
-Inksetter is a proxy that sits between the OPDS server and the client running on an E-Ink device. The purpose of this app is to optimise the appearance of manga and comics as much as possible without modifying the source files. Transparently offering the same features as the original server’s OPDS feed.
+---
+
+**Inksetter** is a proxy that sits between the OPDS server and the client running on an E-Ink device. The purpose of this app is to optimise the appearance of manga and comics as much as possible without modifying the source files. Transparently offering the same features as the original server’s OPDS feed.
 
 Ideally, it downloads volume-sized CBZ files from a server such as [Kavita](https://www.kavitareader.com/) and delivers them to [KOReader](https://koreader.rocks/) in a format fully optimised for E-Ink displays, with particular emphasis on screens using Kaleido 3 technology like Kindle Colorsoft or Kindle Scribe Colorsoft.
 

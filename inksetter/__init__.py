@@ -9,4 +9,4 @@ even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
 PURPOSE. See the GNU Affero General Public License for more details.
 """
 
-__version__ = '0.2.0'
+__version__ = '0.2.1'

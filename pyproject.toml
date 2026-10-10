@@ -1,6 +1,6 @@
 [project]
 name = "inksetter"
-version = "0.2.0"
+version = "0.2.1"
 description = "OPDS proxy that renders manga/comic pages for E-Ink screens"
 license = "AGPL-3.0-or-later"
 license-files = ["LICENSE"]
