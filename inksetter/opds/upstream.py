@@ -168,6 +168,16 @@ class Client:
                     await asyncio.to_thread(sink.write, chunk)
         return resp
 
+    async def request(self, method: str, url: str, **kwargs) -> httpx.Response:
+        for _ in range(MAX_REDIRECTS + 1):
+            check_host(url)
+            resp = await self.raw.request(method, url, **kwargs)
+            target = _redirect_target(url, resp)
+            if target is None:
+                return resp
+            url = target
+        raise UpstreamError(502, f'more than {MAX_REDIRECTS} redirects')
+
 
 client = Client()
 

@@ -141,7 +141,8 @@ class _Kavita:
             if self._token and self._token != stale and time.monotonic() - self._token_at < 3600:
                 return self._token
             self._token = None
-            resp = await client.raw.post(
+            resp = await client.request(
+                'POST',
                 f'{self.base()}/api/Plugin/authenticate',
                 params={'apiKey': api_key(), 'pluginName': 'inksetter'},
             )
@@ -154,18 +155,18 @@ class _Kavita:
     async def _fetch(self, sid: int, token: str) -> dict | None:
         head = {'Authorization': f'Bearer {token}'}
         meta, ser = await asyncio.gather(
-            client.raw.get(f'{self.base()}/api/Series/metadata', params={'seriesId': sid}, headers=head),
-            client.raw.get(f'{self.base()}/api/Series/{sid}', headers=head),
+            client.request('GET', f'{self.base()}/api/Series/metadata', params={'seriesId': sid}, headers=head),
+            client.request('GET', f'{self.base()}/api/Series/{sid}', headers=head),
         )
         if 401 in (meta.status_code, ser.status_code):
             raise _Reauth
         if meta.status_code != 200 or ser.status_code != 200:
             return None
         series = ser.json()
-        fetches = [client.raw.get(f'{self.base()}/api/Series/volumes', params={'seriesId': sid}, headers=head)]
+        fetches = [client.request('GET', f'{self.base()}/api/Series/volumes', params={'seriesId': sid}, headers=head)]
         if isinstance(series.get('libraryId'), int):
             library = {'libraryId': series['libraryId']}
-            fetches.append(client.raw.get(f'{self.base()}/api/Library/type', params=library, headers=head))
+            fetches.append(client.request('GET', f'{self.base()}/api/Library/type', params=library, headers=head))
         vols, *lib = await asyncio.gather(*fetches)
         manga = bool(lib) and lib[0].status_code == 200 and _json_or_none(lib[0]) == _MANGA_LIBRARY
         numbers, covers = {}, {}
@@ -326,7 +327,7 @@ async def sync(method: str, path: str, body: dict | None = None) -> httpx.Respon
     if not key or not base:
         raise UpstreamError(404, 'progress sync needs a Kavita upstream')
     try:
-        return await client.raw.request(
+        return await client.request(
             method, f'{base}/api/koreader/{key}/{path}', json=body, headers={'accept': 'application/json'}
         )
     except httpx.HTTPError, httpx.InvalidURL:

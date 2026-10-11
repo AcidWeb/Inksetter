@@ -52,6 +52,7 @@ books = kosync.Books(settings.cache_dir / 'kosync')
 prefetcher = Prefetcher()
 render_sem = asyncio.Semaphore(settings.render_workers)
 repack_slots = asyncio.Semaphore(settings.repack_workers)
+CPUS = cores.available()
 
 JOB_ID = re.compile(r'^[A-Za-z0-9-]{1,64}$')
 
@@ -221,7 +222,7 @@ async def status_page(request: Request):
         'version': __version__,
         'upstream': _upstream_host(),
         'ocr': settings.ocr_enabled,
-        'cpus': cores.available(),
+        'cpus': CPUS,
         'workers': {
             'render': settings.render_workers,
             'repack': settings.repack_workers,

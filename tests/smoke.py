@@ -485,6 +485,61 @@ def _ko_pull(key: str, doc: str):
     }
 
 
+@upstream.api_route('/moved/{rest:path}', methods=['GET', 'POST', 'PUT'])
+def _ko_moved(rest: str, request: Request):
+    query = f'?{request.url.query}' if request.url.query else ''
+    return Response(status_code=308, headers={'location': f'/{rest}{query}'})
+
+
+KAVITA_API: dict = {'auth': [], 'asked': []}
+_KAVITA_JWT = 'Bearer JWT-real'
+
+
+@upstream.post('/api/Plugin/authenticate')
+def _kv_auth(request: Request):
+    KAVITA_API['auth'].append(request.url.query)
+    if request.query_params.get('apiKey') != SEAL_KEY:
+        return Response(status_code=401)
+    return {'token': _KAVITA_JWT.removeprefix('Bearer ')}
+
+
+@upstream.get('/api/Series/metadata')
+def _kv_metadata(seriesId: int, authorization: str = Header(default='')):
+    KAVITA_API['asked'].append(('metadata', seriesId))
+    if authorization != _KAVITA_JWT:
+        return Response(status_code=401)
+    return {'summary': 'Followed', 'writers': [], 'genres': []}
+
+
+@upstream.get('/api/Series/volumes')
+def _kv_volumes(seriesId: int, authorization: str = Header(default='')):
+    KAVITA_API['asked'].append(('volumes', seriesId))
+    if authorization != _KAVITA_JWT:
+        return Response(status_code=401)
+    return [{'id': 265, 'minNumber': 1, 'coverImage': 'v265.png'}]
+
+
+@upstream.get('/api/Library/type')
+def _kv_library(libraryId: int, authorization: str = Header(default='')):
+    KAVITA_API['asked'].append(('library', libraryId))
+    if authorization != _KAVITA_JWT:
+        return Response(status_code=401)
+    return 0
+
+
+@upstream.get('/api/Series/{sid:int}')
+def _kv_series(sid: int, authorization: str = Header(default='')):
+    KAVITA_API['asked'].append(('series', sid))
+    if authorization != _KAVITA_JWT:
+        return Response(status_code=401)
+    return {'name': 'Redirected Manga', 'format': 1, 'libraryId': 3}
+
+
+@upstream.get('/strayed/{rest:path}')
+def _ko_strayed(rest: str):
+    return Response(status_code=302, headers={'location': f'http://127.0.0.1:8898/{rest}'})
+
+
 CREDS_SEEN: dict[str, str | None] = {}
 
 
@@ -1936,7 +1991,10 @@ async def check_comicinfo() -> None:
 
     class _Stub:
         def __init__(self, api):
-            self.raw = api
+            self.api = api
+
+        async def request(self, method, url, **kw):
+            return await getattr(self.api, method.lower())(url, **kw)
 
     shared = kavita._kavita
 
@@ -8433,6 +8491,13 @@ async def check_status(c) -> None:
         j.headers.get('content-type', ''),
     )
     check('which carries the version', j.json().get('version') == __version__)
+    with mock.patch.object(cores, 'available', wraps=cores.available) as budget:
+        shown = (await c.get('/status')).json().get('cpus')
+    check(
+        'the CPU budget is read once, not on every refresh',
+        budget.call_count == 0 and shown == cores.available(),
+        f'{budget.call_count} reads, {shown} shown',
+    )
     check('HEAD is answered too', (await c.head('/status')).status_code == 200)
     check('the landing page links to it', 'href="http://proxy.test/status"' in (await c.get('/')).text)
     check('the page refreshes itself', f'}},{web.REFRESH_MS});' in r.text)
@@ -8781,6 +8846,36 @@ async def check_reachable_urls(c) -> None:
     check('the probe asks after a documentation address, which nothing answers', sent == [('192.0.2.1', 9)], f'{sent}')
 
 
+async def check_kavita_redirect() -> None:
+    from inksetter import kavita
+
+    up = 'http://127.0.0.1:8899'
+    book = f'{up}/moved/api/opds/{SEAL_KEY}/series/21/volume/265/chapter/1/download/x.cbz'
+    KAVITA_API.update(auth=[], asked=[])
+    with _catalog(kavita, f'{up}/moved/api/opds/{SEAL_KEY}'), mock.patch.object(kavita, '_kavita', kavita._Kavita()):
+        got = await kavita._kavita.series_metadata(21)
+        cover = await kavita.cover_url(book)
+    check(
+        'a Kavita behind a redirect is followed for its metadata, as a feed is',
+        got is not None
+        and got['series']['name'] == 'Redirected Manga'
+        and got['numbers'] == {265: 1}
+        and got['manga'] is True,
+        f'{got}',
+    )
+    check(
+        'its sign-in reaches it past the redirect, the key sent once',
+        KAVITA_API['auth'] == [f'apiKey={SEAL_KEY}&pluginName=inksetter'],
+        f'{KAVITA_API["auth"]}',
+    )
+    check(
+        'and every lookup with it',
+        sorted(KAVITA_API['asked']) == [('library', 3), ('metadata', 21), ('series', 21), ('volumes', 21)],
+        f'{KAVITA_API["asked"]}',
+    )
+    check('so the download takes its cover from Kavita', bool(cover) and 'volumeId=265' in cover, f'{cover}')
+
+
 def _koreader_md5(data: bytes) -> str:
     import hashlib
 
@@ -8800,6 +8895,7 @@ def _page_names(blob: bytes) -> list[str]:
 
 async def check_kosync(c) -> None:
     from inksetter import kavita, kosync
+    from inksetter.opds import upstream as opds_upstream
 
     up = 'http://127.0.0.1:8899'
     keyed = f'{up}/api/opds/{SEAL_KEY}'
@@ -8951,9 +9047,34 @@ async def check_kosync(c) -> None:
         r = await c.get(f'/kosync/syncs/progress/{stranger}')
         check('a pull about one is passed on too', r.status_code == 400 and KOSYNC['calls'][-1] == ('GET', stranger))
 
+        with _catalog(kavita, f'{up}/moved/api/opds/{SEAL_KEY}'):
+            r = await c.get('/kosync/users/auth')
+            check(
+                'a Kavita behind a redirect is followed to it, as a feed is',
+                r.status_code == 200 and answer(r) == {'username': 'reader'},
+                f'status={r.status_code}',
+            )
+            calls = len(KOSYNC['calls'])
+            r = await c.put('/kosync/syncs/progress', json=push)
+            check(
+                'and a push reaches it past the redirect, body and all',
+                r.status_code == 200
+                and len(KOSYNC['calls']) == calls + 1
+                and KOSYNC['calls'][-1][1].get('document') == source,
+                f'status={r.status_code}',
+            )
+        with _catalog(kavita, f'{up}/strayed/api/opds/{SEAL_KEY}'):
+            r = await c.get('/kosync/users/auth')
+        check('a redirect off the upstream host is not followed', r.status_code == 403, f'status={r.status_code}')
+
         calls = len(KOSYNC['calls'])
         for label, attempt in (
             ('a document that is no hash', c.get('/kosync/syncs/progress/not-a-hash')),
+            ('a document with a newline after it', c.get(f'/kosync/syncs/progress/{h1}%0A')),
+            (
+                'a push whose document ends in a newline',
+                c.put('/kosync/syncs/progress', json={**push, 'document': f'{h1}\n'}),
+            ),
             ('a push with no document', c.put('/kosync/syncs/progress', json={'progress': '3'})),
             ('a push that is no JSON', c.put('/kosync/syncs/progress', content=b'{not json')),
             ('a push that is a list', c.put('/kosync/syncs/progress', json=[h1])),
@@ -8987,7 +9108,7 @@ async def check_kosync(c) -> None:
         check('a record is only ever looked up by a hash', books.get('../../etc/passwd') is None)
 
     dead = 'http://127.0.0.1:9/api/opds/' + SEAL_KEY
-    with _catalog(kavita, dead):
+    with _catalog(kavita, dead), _catalog(opds_upstream, dead):
         r = await c.get(f'/kosync/syncs/progress/{h1}')
     check('Kavita out of reach is a 502', r.status_code == 502, f'status={r.status_code}')
     check('and the answer carries neither its address nor the key', SEAL_KEY not in r.text and ':9/' not in r.text)
@@ -9021,6 +9142,54 @@ async def check_kosync(c) -> None:
     check(
         'the records are capped, and it is the oldest that go',
         sorted(p.stem for p in small.root.glob('*.json')) == [f'{2:032x}', f'{3:032x}'],
+    )
+
+    counted = kosync.Books(pathlib.Path(TMP) / 'kosync-count', kept=10)
+
+    def keep(n: int) -> None:
+        counted.put(f'{n:032x}', {'source': source, 'pages': [1]})
+        os.utime(counted.root / f'{n:032x}.json', (1_000_000 + n, 1_000_000 + n))
+
+    def stems() -> list[int]:
+        return sorted(int(p.stem, 16) for p in counted.root.glob('*.json'))
+
+    for n in range(10):
+        keep(n)
+    counted.prune()
+    (counted.root / f'{10:032x}.json').write_text('{}', encoding='utf-8')
+    os.utime(counted.root / f'{10:032x}.json', (1_000_010, 1_000_010))
+    counted.prune()
+    check(
+        'once counted, the records are not scanned again while their count is within the cap',
+        stems() == list(range(11)),
+        f'{stems()}',
+    )
+    keep(11)
+    counted.prune()
+    check(
+        'one past the cap prunes the oldest to a tenth below it, so the next downloads need no scan',
+        stems() == list(range(3, 12)),
+        f'{stems()}',
+    )
+    keep(12)
+    keep(13)
+    unlink = pathlib.Path.unlink
+
+    def stuck(path, missing_ok=False):
+        if path.stem == f'{3:032x}':
+            raise PermissionError('held open')
+        return unlink(path, missing_ok=missing_ok)
+
+    with mock.patch.object(pathlib.Path, 'unlink', stuck):
+        try:
+            counted.prune()
+            escaped = ''
+        except OSError as exc:
+            escaped = type(exc).__name__
+    check(
+        'a record that cannot be removed, as one held open on Windows, is passed over',
+        not escaped and stems() == [3, *range(5, 14)],
+        f'{escaped or stems()}',
     )
 
     rng = np.random.default_rng(5)
@@ -9840,6 +10009,7 @@ async def main() -> int:
 
         print('progress sync')
         await check_kosync(c)
+        await check_kavita_redirect()
 
         print('cache trim')
         await check_trim_aside(c)

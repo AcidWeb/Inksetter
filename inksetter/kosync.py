@@ -8,6 +8,7 @@ import json
 import bisect
 import hashlib
 import logging
+import threading
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -15,11 +16,11 @@ log = logging.getLogger(__name__)
 SAMPLE = 1024
 OFFSETS = (0, *(1024 << 2 * i for i in range(11)))
 KEPT = 5000
-_DIGEST = re.compile(r'^[0-9a-fA-F]{32}$')
+_DIGEST = re.compile(r'[0-9a-fA-F]{32}')
 
 
 def is_digest(value) -> bool:
-    return isinstance(value, str) and bool(_DIGEST.match(value))
+    return isinstance(value, str) and bool(_DIGEST.fullmatch(value))
 
 
 def partial_md5(sample, size: int) -> str:
@@ -89,6 +90,8 @@ class Books:
     def __init__(self, root: Path, kept: int = KEPT) -> None:
         self.root = root
         self.kept = kept
+        self._held: int | None = None
+        self._lock = threading.Lock()
 
     def _path(self, digest: str) -> Path | None:
         return self.root / f'{digest.lower()}.json' if is_digest(digest) else None
@@ -113,6 +116,7 @@ class Books:
         if path is None:
             return
         self.root.mkdir(parents=True, exist_ok=True)
+        fresh = not path.exists()
         tmp = path.with_suffix('.tmp')
         try:
             tmp.write_text(json.dumps(record, separators=(',', ':')), encoding='utf-8')
@@ -120,6 +124,10 @@ class Books:
         except OSError:
             tmp.unlink(missing_ok=True)
             raise
+        if fresh:
+            with self._lock:
+                if self._held is not None:
+                    self._held += 1
 
     def remember(self, digest: str, page: int, source: int) -> None:
         record = self.get(digest)
@@ -127,12 +135,23 @@ class Books:
             self.put(digest, {**record, 'pushed': [page, source]})
 
     def prune(self) -> None:
+        with self._lock:
+            if self._held is not None and self._held <= self.kept:
+                return
         try:
             held = sorted(self.root.glob('*.json'), key=lambda p: p.stat().st_mtime)
         except OSError:
             return
-        for path in held[: max(0, len(held) - self.kept)]:
-            path.unlink(missing_ok=True)
+        gone = 0
+        if len(held) > self.kept:
+            for path in held[: len(held) - (self.kept - self.kept // 10)]:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    continue
+                gone += 1
+        with self._lock:
+            self._held = len(held) - gone
 
 
 class Pending:
