@@ -6,12 +6,15 @@ import os
 import re
 import time
 import asyncio
+import logging
 import tempfile
+import functools
 import threading
 import collections
 import contextlib
 import importlib.resources
-from urllib.parse import urljoin
+from email.message import Message
+from urllib.parse import unquote, urljoin, urlsplit
 from fastapi import FastAPI, Request
 from fastapi.responses import (
     HTMLResponse,
@@ -20,7 +23,7 @@ from fastapi.responses import (
     StreamingResponse,
 )
 
-from . import __version__, kavita, logs, web
+from . import __version__, cores, kavita, logs, status, web
 from .cache import DiskCache, Prefetcher, render_key
 from .imaging import cbz, profiles
 from .imaging.pipeline import RenderFailed, UnreadableImage, render_page
@@ -31,6 +34,15 @@ from .settings import settings
 
 logs.configure()
 profiles.use_folio(settings.ocr_enabled)
+
+
+def _redact(text: str) -> str:
+    key = kavita.api_key()
+    return text.replace(key, '\u2026') if key else text
+
+
+board = status.Board(_redact)
+logging.getLogger('inksetter').addHandler(status.Problems(board))
 
 cache = DiskCache(settings.cache_dir, settings.cache_max_bytes)
 prefetcher = Prefetcher()
@@ -71,9 +83,9 @@ class Jobs:
 jobs = Jobs()
 
 
-def _reporter(job: str):
+def _reporter(track: status.Download):
     def report(done: int, total: int) -> None:
-        jobs.set(job, stage='repacking', done=done, total=total)
+        track.update(stage='repacking', done=done, total=total)
 
     return report
 
@@ -137,11 +149,6 @@ async def _feed_error(request: Request, exc: rewrite.FeedError):
     return _error(request, 502, str(exc))
 
 
-@app.api_route('/healthz', methods=['GET', 'HEAD'])
-async def healthz():
-    return {'name': 'Inksetter', 'version': __version__, 'ok': True, 'profiles': sorted(profiles.PROFILES)}
-
-
 LOGO_BYTES = importlib.resources.files(__package__).joinpath(web.LOGO).read_bytes()
 
 
@@ -158,6 +165,38 @@ async def logo():
 @app.api_route('/', methods=['GET', 'HEAD'], response_class=HTMLResponse)
 async def index(request: Request):
     return web.index(_public_base(request), sorted(profiles.PROFILES.items()))
+
+
+def _upstream_host() -> str:
+    try:
+        parts = urlsplit(settings.upstream_catalog)
+        host, port = parts.hostname or '', parts.port
+    except ValueError:
+        return ''
+    if ':' in host:
+        host = f'[{host}]'
+    shown = f'{host}:{port}' if port else host
+    return f'{shown} (Kavita)' if shown and kavita.api_key() else shown
+
+
+@app.api_route('/status', methods=['GET', 'HEAD'])
+async def status_page(request: Request):
+    snap = {
+        'version': __version__,
+        'upstream': _upstream_host(),
+        'ocr': settings.ocr_enabled,
+        'cpus': cores.available(),
+        'workers': {
+            'render': settings.render_workers,
+            'repack': settings.repack_workers,
+            'pages': settings.repack_page_workers,
+        },
+        'cache': {'dir': str(settings.cache_dir), 'size': cache.size, 'cap': cache.max_bytes},
+        **board.snapshot(),
+    }
+    if 'text/html' in request.headers.get('accept', ''):
+        return HTMLResponse(web.status(snap, _public_base(request)))
+    return JSONResponse(snap)
 
 
 # --------------------------------------------------------------------------
@@ -267,15 +306,20 @@ def _credentials(headers: dict[str, str]) -> str:
     return '\n'.join(f'{k}={headers[k]}' for k in sorted(CREDENTIAL_REQUEST) if headers.get(k))
 
 
-async def _render_cached(url: str, p: Profile, max_width: int | None, headers: dict[str, str]) -> tuple[bytes, str]:
+async def _render_cached(
+    url: str, p: Profile, max_width: int | None, headers: dict[str, str], kind: str = 'page'
+) -> tuple[bytes, str]:
+    began = time.monotonic()
     key = render_key(url, p, max_width, _credentials(headers))
     hit = await asyncio.to_thread(cache.get, key)
     if hit is not None:
+        board.served(kind, True, time.monotonic() - began)
         return hit
 
     async with cache.lock(key):
         hit = await asyncio.to_thread(cache.get, key)
         if hit is not None:
+            board.served(kind, True, time.monotonic() - began)
             return hit
         resp = await client.get(url, headers)
         if p.fmt == 'raw':
@@ -285,14 +329,17 @@ async def _render_cached(url: str, p: Profile, max_width: int | None, headers: d
                 raise UpstreamError(502, 'upstream answered a feed, not a page')
         else:
             async with render_sem:
+                start = time.monotonic()
                 try:
                     blob, ctype = await asyncio.to_thread(render_page, resp.content, p, max_width)
                 except UnreadableImage as exc:
                     detail = str(exc) if isinstance(exc, RenderFailed) else f'upstream page: {exc}'
                     raise UpstreamError(502, detail) from exc
+                board.rendered(kind, time.monotonic() - start)
         await asyncio.to_thread(cache.put, key, blob, ctype)
 
     prefetcher.spawn(cache.maybe_trim(), 'cache-trim')
+    board.served(kind, False, time.monotonic() - began)
     return blob, ctype
 
 
@@ -332,7 +379,7 @@ async def page(profile: str, token: str, request: Request, page: str = '0', maxW
 async def _prefetch(url: str, p: Profile, max_width: int | None, headers: dict[str, str], key: str) -> None:
     with contextlib.suppress(Exception):
         if not await asyncio.to_thread(cache.has, key):
-            await _render_cached(url, p, max_width, headers)
+            await _render_cached(url, p, max_width, headers, 'ahead')
 
 
 @app.api_route('/{profile}/pf/{token}', methods=['GET', 'HEAD'])
@@ -348,7 +395,7 @@ async def page_fixed(profile: str, token: str, request: Request, maxWidth: str =
 async def image(profile: str, token: str, request: Request):
     p = _profile_or_404(profile)
     url = rewrite.decode_token(token)
-    blob, ctype = await _render_cached(url, cover_for(p), None, request_headers(request.headers))
+    blob, ctype = await _render_cached(url, cover_for(p), None, request_headers(request.headers), 'cover')
     return Response(blob, media_type=ctype, headers={'Cache-Control': 'private, max-age=604800'})
 
 
@@ -381,19 +428,23 @@ def _wind_down(chunks, body, turn: threading.Lock) -> None:
             body.close()
 
 
-async def _repacking(chunks, body, job: str = ''):
+async def _repacking(chunks, body, track: status.Download):
     turn = threading.Lock()
-    whole = False
+    outcome = 'error'
     try:
         while True:
             async with repack_slots:
                 block = await asyncio.to_thread(_next_block, chunks, turn)
             if block is None:
-                whole = True
+                outcome = 'done'
                 return
+            track.update(sent=track.sent + len(block))
             yield block
+    except GeneratorExit, asyncio.CancelledError:
+        outcome = 'stopped'
+        raise
     finally:
-        jobs.set(job, stage='done' if whole else 'error')
+        track.finish(outcome)
         threading.Thread(target=_wind_down, args=(chunks, body, turn), name='repack-close', daemon=True).start()
 
 
@@ -467,7 +518,7 @@ def _stale(headers: dict[str, str]) -> dict[str, str]:
     return out
 
 
-async def _repack_over_ranges(url: str, cover_url: str | None, p: Profile, request: Request, job: str = ''):
+async def _repack_over_ranges(url: str, cover_url: str | None, p: Profile, request: Request, track):
     headers = request_headers(request.headers)
     reader = await asyncio.to_thread(open_range, url, headers)
     if reader is None:
@@ -477,7 +528,7 @@ async def _repack_over_ranges(url: str, cover_url: str | None, p: Profile, reque
         if not await asyncio.to_thread(_is_comic_zip, ctype, reader):
             await asyncio.to_thread(reader.close)
             return None
-        return await _repack(reader, url, cover_url, p, request, job, reader.headers)
+        return await _repack(reader, url, cover_url, p, request, track, reader.headers)
     except Exception:
         await asyncio.to_thread(reader.close)
         return None
@@ -486,7 +537,18 @@ async def _repack_over_ranges(url: str, cover_url: str | None, p: Profile, reque
         raise
 
 
-async def _repack(src, url: str, cover_url: str | None, p: Profile, request: Request, job: str, upstream):
+def _download_name(url: str, headers) -> str:
+    try:
+        disposition = Message()
+        disposition['content-disposition'] = headers.get('content-disposition', '')
+        name = disposition.get_filename() or unquote(urlsplit(url).path.rstrip('/').rpartition('/')[2])
+    except Exception:
+        name = ''
+    return _redact(name or 'download')
+
+
+async def _repack(src, url: str, cover_url: str | None, p: Profile, request: Request, track, upstream):
+    track.update(name=_download_name(url, upstream))
     cover = await _pick_cover(url, cover_url, request)
     meta = await kavita.for_download(url)
     chunks = await asyncio.to_thread(
@@ -496,10 +558,10 @@ async def _repack(src, url: str, cover_url: str | None, p: Profile, request: Req
         settings.repack_page_workers,
         cover=cover,
         comicinfo=meta,
-        progress=_reporter(job),
+        progress=_reporter(track),
     )
     return StreamingResponse(
-        _repacking(chunks, src, job),
+        _repacking(chunks, src, track),
         media_type='application/vnd.comicbook+zip',
         headers=_stale(upstream),
     )
@@ -529,17 +591,18 @@ async def download(profile: str, token: str, request: Request, job: str = ''):
         del head.headers['content-length']
         return head
 
-    jobs.set(job, stage='fetching', done=0, total=0)
+    track = board.begin(profile, _download_name(url, {}), functools.partial(jobs.set, job))
+    track.update(stage='fetching', done=0, total=0)
     try:
-        return await _deliver(p, url, cover_url, request, job)
-    except BaseException:
-        jobs.set(job, stage='error')
+        return await _deliver(p, url, cover_url, request, track)
+    except BaseException as exc:
+        track.finish('stopped' if isinstance(exc, asyncio.CancelledError) else 'error')
         raise
 
 
-async def _deliver(p: Profile, url: str, cover_url: str | None, request: Request, job: str) -> Response:
+async def _deliver(p: Profile, url: str, cover_url: str | None, request: Request, track) -> Response:
     if p.fmt != 'raw':
-        ranged = await _repack_over_ranges(url, cover_url, p, request, job)
+        ranged = await _repack_over_ranges(url, cover_url, p, request, track)
         if ranged is not None:
             return ranged
 
@@ -556,7 +619,7 @@ async def _deliver(p: Profile, url: str, cover_url: str | None, request: Request
     if p.fmt != 'raw' and _is_comic_zip(ctype, body):
         try:
             body.seek(0)
-            return await _repack(body, url, cover_url, p, request, job, out_headers)
+            return await _repack(body, url, cover_url, p, request, track, out_headers)
         except Exception:
             body.seek(0)
         except BaseException:
@@ -566,8 +629,9 @@ async def _deliver(p: Profile, url: str, cover_url: str | None, request: Request
     if _is_feed_body(body):
         body.close()
         raise UpstreamError(502, 'upstream answered a feed, not a book')
-    jobs.set(job, stage='done')
     body.seek(0, os.SEEK_END)
     out_headers['content-length'] = str(body.tell())
     body.seek(0)
+    track.update(name=_download_name(url, out_headers), sent=int(out_headers['content-length']))
+    track.finish('done')
     return StreamingResponse(_drain(body), media_type=ctype, headers=out_headers)

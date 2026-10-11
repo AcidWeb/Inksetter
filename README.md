@@ -36,6 +36,8 @@ Please be aware that downloading CBZ might take multiple minutes if the source C
 
 Opening a profile from the root page browses the same catalogue an OPDS client sees. The download link produces exactly the file a reader would have been given. This is convenient for pulling a volume onto a PC, or for seeing what the pipeline does to a book without involving the device at all.
 
+The status page (`/status`) displays the state of current tasks, performance statistics, and list conversion errors.
+
 ### KOReader
 
 If KOReader is used as client to read downloaded CBZ files it **MUST BE** configured in specific way to display output correctly. Please check the [wiki](https://github.com/AcidWeb/Inksetter/wiki/KOReader) for more details. Additionally, when an OPDS proxy is added to KOReader, I recommend enabling the `Use server filenames` option.

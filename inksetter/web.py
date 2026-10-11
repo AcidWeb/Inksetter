@@ -3,6 +3,7 @@ Basic web OPDS client.
 """
 
 import json
+import time
 import base64
 from html import escape
 from dataclasses import dataclass
@@ -77,6 +78,8 @@ color:var(--dim);border:1px dashed var(--line);border-radius:6px;padding:5px 10p
 white-space:nowrap;flex:none}
 li code{font:11px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
 color:var(--dim);word-break:break-all;text-align:right}
+li.fact .m{flex:none}
+li.fact code{flex:1;min-width:0;word-break:normal;overflow-wrap:anywhere}
 h2.group{display:flex;justify-content:space-between;align-items:baseline;gap:12px;
 font:600 11px/1 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;letter-spacing:.09em;
 text-transform:uppercase;color:var(--cap);margin:30px 0 0}
@@ -450,6 +453,151 @@ def error(status: int, detail: str, base: str) -> str:
     )
 
 
+REFRESH_MS = 2000
+STATUS_LABELS = {**STAGE_LABELS, 'stopped': 'Stopped'}
+STATUS_SCRIPT = """
+(function(){
+if(!window.fetch||!window.DOMParser)return;
+setInterval(function(){
+fetch(location.href,{headers:{accept:'text/html'}}).then(function(r){
+return r.ok?r.text():null;}).then(function(t){
+var w=t&&new DOMParser().parseFromString(t,'text/html').querySelector('.wrap'),
+o=document.querySelector('.wrap');
+if(w&&o)o.replaceWith(w);
+}).catch(function(){});
+},__MS__);
+})();
+""".replace('__MS__', str(REFRESH_MS))
+
+
+def _duration(seconds: float) -> str:
+    if seconds < 60:
+        return f'{seconds:.1f} s'
+    whole = round(seconds)
+    if whole < 3600:
+        return f'{whole // 60} min {whole % 60:02d} s'
+    days, rest = divmod(whole // 60, 24 * 60)
+    return f'{days} d {rest // 60} h' if days else f'{rest // 60} h {rest % 60:02d} min'
+
+
+def _each(seconds: float) -> str:
+    return f'{1000 * seconds:.0f} ms' if seconds < 1 else _duration(seconds)
+
+
+def _amount(n: int) -> str:
+    return _human_bytes(str(n)) or '0 B'
+
+
+def _fact(label: str, value: str) -> str:
+    return (
+        f'<li class="fact"><div class="m"><span class="t">{escape(label)}</span></div><code>{escape(value)}</code></li>'
+    )
+
+
+def _download_row(d: dict) -> str:
+    label = STATUS_LABELS.get(d['stage'], d['stage'])
+    took = _duration(d['seconds'])
+    if not d['finished']:
+        badge = f'{label} {d["done"]} / {d["total"]}' if d['total'] else label
+        bits = [f'{took} so far', f'{_amount(d["sent"])} sent' if d['sent'] else '']
+    elif d['stage'] == 'done':
+        badge = label
+        each = f'{_each(d["seconds"] / d["done"])} a page' if d['done'] else ''
+        bits = [f'{d["total"]} pages' if d['total'] else '', f'in {took}', each, _amount(d['sent'])]
+    else:
+        badge = label
+        bits = [f'after {took}', f'at {d["done"]} / {d["total"]} pages' if d['total'] else '']
+    detail = ' \u00b7 '.join(b for b in (d['profile'], *bits) if b)
+    return (
+        f'<li><div class="m"><span class="t">{escape(d["name"])}</span>'
+        f'<div class="s">{escape(detail)}</div></div><span class="working">{escape(badge)}</span></li>'
+    )
+
+
+def _spread(timing: dict | None) -> str:
+    if not timing:
+        return 'none yet'
+    return f'median {timing["median"]} ms, p90 {timing["p90"]} ms, of the last {timing["of"]}'
+
+
+def _share(counts: dict) -> str:
+    served = counts['served']
+    if not served:
+        return 'none yet'
+    return f'{served} served, {round(100 * counts["hits"] / served)}% from the cache'
+
+
+def _section(title: str, count: str, rows: list[str], empty: str) -> str:
+    inner = f'<ul>{"".join(rows)}</ul>' if rows else f'<div class="empty">{escape(empty)}</div>'
+    return f'<h2 class="group">{escape(title)}<span>{escape(count)}</span></h2>{inner}'
+
+
+def status(snap: dict, base: str) -> str:
+    downloads = snap['downloads']
+    running = sum(not d['finished'] for d in downloads)
+    pages, cache = snap['pages'], snap['cache']
+    size = _amount(cache['size']) if cache['size'] is not None else 'not measured yet'
+    problems = [
+        f'<li><div class="m"><span class="t">{escape(p["message"])}</span><div class="s">'
+        f'{escape(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(p["at"])))} \u00b7 '
+        f'{escape(p["where"])} \u00b7 {escape(p["level"].lower())}</div></div></li>'
+        for p in snap['problems']
+    ]
+    workers = snap['workers']
+    body = (
+        f'<nav class="crumbs"><a href="{escape(base)}">Profiles</a></nav>'
+        + _section(
+            'Downloads',
+            f'{running} running',
+            [_download_row(d) for d in downloads],
+            'Nothing has been downloaded since the start.',
+        )
+        + _section(
+            'Streamed pages',
+            '',
+            [
+                _fact('Pages', _share(pages)),
+                _fact('Rendered', f'{pages["rendered"]}, {pages["ahead"]} of them ahead of the reader'),
+                _fact('Render time', _spread(pages['render_ms'])),
+                _fact('Answer time, not cached', _spread(pages['answer_ms'])),
+                _fact('Covers', _share(snap['covers'])),
+            ],
+            '',
+        )
+        + _section(
+            'Cache',
+            '',
+            [_fact('Size', f'{size} of {_amount(cache["cap"])}'), _fact('Location', cache['dir'])],
+            '',
+        )
+        + _section(
+            'Problems',
+            str(len(problems)),
+            problems,
+            'No warnings since the start.',
+        )
+        + _section(
+            'Server',
+            '',
+            [
+                _fact('Version', snap['version']),
+                _fact('Up for', _duration(snap['uptime'])),
+                _fact('Upstream', snap['upstream'] or 'not set'),
+                _fact('Page numbers removed', 'yes' if snap['ocr'] else 'no, OCR is off'),
+                _fact('CPUs', str(snap['cpus'])),
+                _fact(
+                    'Workers',
+                    f'{workers["render"]} streamed renders, {workers["repack"]} repack steps, '
+                    f'{workers["pages"]} pages per download',
+                ),
+            ],
+            '',
+        )
+        + f'<script>{STATUS_SCRIPT}</script>'
+    )
+    return _shell('Status', snap['version'], body, base)
+
+
 GROUPS = (
     ('Black and white', 'Carta and other grey panels. Sixteen levels of grey, dithered.'),
     ('Colour', 'Kaleido panels. Colour pages, and the filter array is corrected for.'),
@@ -471,7 +619,10 @@ def index(base: str, entries) -> str:
     for name, p in entries:
         held[group_of(p)].append((name, p))
 
-    parts = ['<p class="lede">Open a profile to browse and download here, or add its catalog URL to a reader.</p>']
+    parts = [
+        '<p class="lede">Open a profile to browse and download here, or add its catalog URL to a reader. '
+        f'The <a href="{escape(base)}/status">status page</a> shows what the proxy is doing.</p>'
+    ]
     for title, blurb in GROUPS:
         members = held[title]
         if not members:

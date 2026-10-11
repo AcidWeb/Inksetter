@@ -4092,6 +4092,12 @@ def check_repack_streaming() -> None:
     )
 
 
+def _off_board():
+    from inksetter import status
+
+    return status.Download(app_mod.board, 'suite', 'suite', lambda **_: None)
+
+
 async def check_repack_slot() -> None:
     import io as _io
     import zipfile as _zf
@@ -4120,7 +4126,7 @@ async def check_repack_slot() -> None:
         return bool(done())
 
     body = _io.BytesIO(raw)
-    gen = _app._repacking(_cbz.repack_iter(_io.BytesIO(raw), prof), body)
+    gen = _app._repacking(_cbz.repack_iter(_io.BytesIO(raw), prof), body, _off_board())
     first = await gen.__anext__()
     check('streamed response yields before it finishes', len(first) > 0, f'{len(first)} bytes')
     await gen.aclose()
@@ -4132,7 +4138,7 @@ async def check_repack_slot() -> None:
     )
 
     body2 = _io.BytesIO(raw)
-    gen2 = _app._repacking(_cbz.repack_iter(_io.BytesIO(raw), prof), body2)
+    gen2 = _app._repacking(_cbz.repack_iter(_io.BytesIO(raw), prof), body2, _off_board())
     whole = b''.join([blk async for blk in gen2])
     check('fully drained stream is a valid zip', _zf.ZipFile(_io.BytesIO(whole)).testzip() is None)
     check('slot is free after a completed repack', free_slots() == budget, f'{free_slots()} of {budget}')
@@ -4149,7 +4155,7 @@ async def check_repack_slot() -> None:
             wound.set()
 
     body3 = _io.BytesIO()
-    gen3 = _app._repacking(slow_to_close(), body3)
+    gen3 = _app._repacking(slow_to_close(), body3, _off_board())
     await gen3.__anext__()
     gaps = []
 
@@ -4181,7 +4187,7 @@ async def check_repack_slot() -> None:
 
     busy = slow_block()
     body4 = _io.BytesIO()
-    gen4 = _app._repacking(busy, body4)
+    gen4 = _app._repacking(busy, body4, _off_board())
     pending = asyncio.create_task(gen4.__anext__())
     await asyncio.sleep(0.1)
     pending.cancel()
@@ -7819,7 +7825,9 @@ async def check_http_edges(c) -> None:
         release.wait(10.0)
         yield b'x'
 
-    waiting = [asyncio.create_task(_app._repacking(busy_repack(), io.BytesIO()).__anext__()) for _ in range(40)]
+    waiting = [
+        asyncio.create_task(_app._repacking(busy_repack(), io.BytesIO(), _off_board()).__anext__()) for _ in range(40)
+    ]
     try:
         await asyncio.sleep(0.3)
         try:
@@ -8346,6 +8354,212 @@ def check_job_board() -> None:
     check('an entry older than the ttl is swept', stale.get('old') is None)
 
 
+async def _status_json(c) -> dict:
+    return (await c.get('/status', headers={'accept': 'application/json'})).json()
+
+
+def _finished(snap: dict, name: str) -> dict:
+    return next((d for d in snap['downloads'] if d['finished'] and d['name'] == name), {})
+
+
+async def _prefetch_settled() -> None:
+    for _ in range(600):
+        if all(t.done() for t in app_mod.prefetcher._tasks):
+            return
+        await asyncio.sleep(0.05)
+
+
+async def check_status(c) -> None:
+    import logging as _logging
+
+    from inksetter import __version__, kavita
+    from inksetter import status as status_mod
+
+    up = 'http://127.0.0.1:8899'
+    board = app_mod.board
+
+    r = await c.get('/status', headers={'accept': 'text/html'})
+    check(
+        'the status page answers a browser in html',
+        r.status_code == 200 and 'text/html' in r.headers['content-type'] and '<h1>Status</h1>' in r.text,
+        f'status={r.status_code}',
+    )
+    j = await c.get('/status')
+    check(
+        'and anything else in json',
+        j.status_code == 200 and j.headers['content-type'].startswith('application/json'),
+        j.headers.get('content-type', ''),
+    )
+    check('which carries the version', j.json().get('version') == __version__)
+    check('HEAD is answered too', (await c.head('/status')).status_code == 200)
+    check('the landing page links to it', 'href="http://proxy.test/status"' in (await c.get('/')).text)
+    check('the page refreshes itself', f'}},{web.REFRESH_MS});' in r.text)
+
+    tok = encode_token(f'{up}/opds/v1.2/books/7/file')
+    dl = await c.get(f'/kobo-clara-hd-2e-bw/dl/{tok}', params={'job': 'status-1'})
+    snap = await _status_json(c)
+    row = _finished(snap, 'Fake Vol 1.cbz')
+    check('premise: the download went through', dl.content[:4] == b'PK\x03\x04')
+    check(
+        'a finished download is listed under the name the upstream gave it',
+        row.get('profile') == 'kobo-clara-hd-2e-bw' and row.get('stage') == 'done',
+        f'{snap["downloads"][:2]}',
+    )
+    check('the newest finished download comes first', next(d for d in snap['downloads'] if d['finished']) == row)
+    check(
+        'with its pages counted and the bytes it sent',
+        row.get('done') == row.get('total') == 3 and row.get('sent') == len(dl.content),
+        f'{row} against {len(dl.content)} bytes',
+    )
+    check(
+        'and the job board still hears of it',
+        (await c.get('/kobo-clara-hd-2e-bw/dl-status/status-1')).json()['stage'] == 'done',
+    )
+    html = (await c.get('/status', headers={'accept': 'text/html'})).text
+    check('the page shows it as ready', 'Fake Vol 1.cbz' in html and '>Ready</span>' in html)
+    check('no upstream host or path reaches the page', up not in html and '/opds/v1.2/' not in html)
+
+    raw = await c.get(f'/passthrough/dl/{tok}', params={'job': 'status-3'})
+    row = _finished(await _status_json(c), 'Fake Vol 1.cbz')
+    check(
+        'a download passed through untouched is listed too, with what it sent',
+        row.get('profile') == 'passthrough' and row.get('stage') == 'done' and row.get('sent') == len(raw.content),
+        f'{row}',
+    )
+    await c.get(f'/kobo-clara-hd-2e-bw/dl/{encode_token(f"{up}/opds/v1.2/missing")}')
+    row = _finished(await _status_json(c), 'missing')
+    check('a download that fails is listed as failed, named after its URL', row.get('stage') == 'error', f'{row}')
+
+    def blocks():
+        yield b'a' * 10
+        yield b'b' * 10
+
+    track = board.begin('kobo-clara-hd-2e-bw', 'Half Vol.cbz', lambda **f: app_mod.jobs.set('status-2', **f))
+    track.update(stage='repacking', done=1, total=3)
+    gen = app_mod._repacking(blocks(), io.BytesIO(), track)
+    await gen.__anext__()
+    snap = await _status_json(c)
+    row = next((d for d in snap['downloads'] if d['name'] == 'Half Vol.cbz'), {})
+    check(
+        'a download under way is listed as running, with its pages and bytes so far',
+        row.get('finished') is False and row.get('done') == 1 and row.get('sent') == 10,
+        f'{row}',
+    )
+    check('and it heads the list', snap['downloads'][0] == row)
+    html = (await c.get('/status', headers={'accept': 'text/html'})).text
+    check('the page shows its progress', '>Repacking 1 / 3</span>' in html and '<span>1 running</span>' in html)
+    await gen.aclose()
+    row = _finished(await _status_json(c), 'Half Vol.cbz')
+    check('a reader that goes away leaves it stopped, not failed', row.get('stage') == 'stopped', f'{row}')
+    check(
+        'while the job board, which knows no such stage, says failed as it always did',
+        app_mod.jobs.get('status-2')['stage'] == 'error',
+    )
+    track.update(stage='repacking', done=3, total=3)
+    check('a download that has finished takes no more news', _finished(await _status_json(c), 'Half Vol.cbz') == row)
+
+    ghost = board.begin('kobo-clara-hd-2e-bw', 'Ghost.cbz')
+    with mock.patch.object(status_mod, 'STALE', -1.0):
+        row = _finished(board.snapshot(), 'Ghost.cbz')
+    check('a download with no news for too long is let go as lost', row.get('stage') == 'lost', f'{row}')
+    ghost.finish('done')
+    check('and a late word does not bring it back', _finished(board.snapshot(), 'Ghost.cbz').get('stage') == 'lost')
+
+    hostile = board.begin('kobo-clara-hd-2e-bw', '<script>alert(1)</script>.cbz')
+    hostile.finish('done')
+    html = (await c.get('/status', headers={'accept': 'text/html'})).text
+    check('a name from upstream is escaped', '<script>alert' not in html and '&lt;script&gt;alert' in html)
+
+    ptok = encode_token(f'{up}/opds/v1.2/books/7/pages/{{pageNumber}}?zero_based=true&maxWidth={{maxWidth}}')
+    before = await _status_json(c)
+    for _ in range(2):
+        await c.get(f'/kobo-clara-hd-2e-bw/p/{ptok}', params={'page': '41', 'maxWidth': '733'})
+    await _prefetch_settled()
+    after = await _status_json(c)
+    a, b = before['pages'], after['pages']
+    check(
+        'a page fetched twice is served twice, once from the cache',
+        (b['served'] - a['served'], b['hits'] - a['hits']) == (2, 1),
+        f'served +{b["served"] - a["served"]}, hits +{b["hits"] - a["hits"]}',
+    )
+    check(
+        'pages fetched ahead are rendered, but not counted as served',
+        b['ahead'] - a['ahead'] == app_mod.settings.prefetch
+        and b['rendered'] - a['rendered'] == 1 + app_mod.settings.prefetch,
+        f'ahead +{b["ahead"] - a["ahead"]}, rendered +{b["rendered"] - a["rendered"]}',
+    )
+    check(
+        'render and answer times are measured',
+        b['render_ms'] is not None and b['answer_ms'] is not None and b['render_ms']['of'] >= 3,
+        f'{b["render_ms"]} {b["answer_ms"]}',
+    )
+    await asyncio.gather(
+        *(c.get(f'/kobo-clara-hd-2e-bw/p/{ptok}', params={'page': '47', 'maxWidth': '733'}) for _ in range(2))
+    )
+    await _prefetch_settled()
+    after = await _status_json(c)
+    a, b = b, after['pages']
+    check(
+        'two readers asking at once for one page are both counted, the second from the cache it waited for',
+        (b['served'] - a['served'], b['hits'] - a['hits']) == (2, 1),
+        f'served +{b["served"] - a["served"]}, hits +{b["hits"] - a["hits"]}',
+    )
+    await c.get(f'/kobo-clara-hd-2e-bw/img/{encode_token(f"{up}/opds/v1.2/books/7/thumbnail?status={time.time_ns()}")}')
+    later = await _status_json(c)
+    check(
+        'a cover is counted apart from the pages',
+        later['covers']['served'] - after['covers']['served'] == 1
+        and (later['pages']['served'], later['pages']['rendered']) == (b['served'], b['rendered']),
+        f'{later["covers"]} {later["pages"]["served"]}',
+    )
+
+    bad = io.BytesIO()
+    with zipfile.ZipFile(bad, 'w') as z:
+        z.writestr('p000.jpg', fake_page(0))
+        z.writestr('p001.jpg', b'not an image at all')
+    b''.join(cbz.repack_iter(io.BytesIO(bad.getvalue()), profiles.PROFILES['kobo-clara-hd-2e-bw'], 1))
+    problems = (await _status_json(c))['problems']
+    check(
+        'a page that fails inside a download is reported, newest first',
+        problems and 'p001.jpg' in problems[0]['message'] and problems[0]['where'] == 'imaging.cbz',
+        f'{problems[:1]}',
+    )
+
+    keyed = f'{up}/api/opds/{SEAL_KEY}'
+    with _catalog(kavita, keyed), _catalog(app_mod, keyed):
+        _logging.getLogger('inksetter.opds').warning('a fetch of %s/series/1 went wrong', keyed)
+        named = app_mod._download_name(f'{keyed}/series/1/volume/2/chapter/3/download/{SEAL_KEY}', {})
+        html = (await c.get('/status', headers={'accept': 'text/html'})).text
+        snap = await _status_json(c)
+    check('premise: the warning reaches the page', 'went wrong' in html and 'series/1' in html)
+    check(
+        'and the upstream key does not, in html or in json',
+        SEAL_KEY not in html and SEAL_KEY not in json.dumps(snap),
+    )
+    check('the upstream is named by its host alone', snap['upstream'] == '127.0.0.1:8899 (Kavita)', snap['upstream'])
+    check('a download named after its URL does not carry the key either', SEAL_KEY not in named, named)
+
+    for label, header, want in (
+        ('a plain filename', 'attachment; filename="Plain.cbz"', 'Plain.cbz'),
+        ('an RFC 5987 filename', "attachment; filename*=UTF-8''Zo%C3%AB%20v1.cbz", 'Zoë v1.cbz'),
+        ('no header at all', '', 'Volume%201.cbz'),
+    ):
+        got = app_mod._download_name(f'{up}/opds/v1.2/books/Volume%25201.cbz', {'content-disposition': header})
+        check(f'a download is named from {label}', got == want, got)
+
+    small = status_mod.Board(keep=2, problems=2)
+    for i in range(4):
+        small.begin('p', f'v{i}').finish('done')
+        small.problem(time.time(), 'WARNING', 'inksetter.x', f'm{i}')
+    kept = small.snapshot()
+    check(
+        'the board keeps only the latest downloads and problems',
+        [d['name'] for d in kept['downloads']] == ['v3', 'v2']
+        and [p['message'] for p in kept['problems']] == ['m3', 'm2'],
+        f'{[d["name"] for d in kept["downloads"]]} {[p["message"] for p in kept["problems"]]}',
+    )
+
+
 async def check_logo(c) -> None:
     packaged = pathlib.Path(app_mod.__file__).with_name(web.LOGO).read_bytes()
     for path in (f'/{web.LOGO}', '/favicon.ico'):
@@ -8813,7 +9027,7 @@ async def main() -> int:
 
         feed_tok = encode_token('http://127.0.0.1:8899/opds/v1.2/catalog')
         for label, path in (
-            ('healthz', '/healthz'),
+            ('status', '/status'),
             ('index', '/'),
             ('catalog', '/kobo-clara-hd-2e-bw/catalog'),
             ('feed', f'/kobo-clara-hd-2e-bw/f/{feed_tok}'),
@@ -8880,14 +9094,12 @@ async def main() -> int:
         check('unknown profile 404', r.status_code == 404)
         r = await c.get('/kobo-clara-hd-2e-bw/f/' + encode_token('http://169.254.169.254/latest/'))
         check('SSRF blocked', r.status_code == 403)
-        r = await c.get('/healthz')
-        check('healthz', r.status_code == 200)
-        health = r.json()
+        r = await c.get('/status')
         pyproject = (pathlib.Path(entry.__file__).parents[1] / 'pyproject.toml').read_text(encoding='utf-8')
         version = tomllib.loads(pyproject)['project']['version']
-        check('healthz names the app', health.get('name') == 'Inksetter', str(health.get('name')))
-        check('healthz carries the pyproject version', health.get('version') == version, f'{health.get("version")}')
-        for path in ('/openapi.json', '/docs', '/redoc'):
+        shown = r.json().get('version')
+        check('the status page carries the pyproject version', shown == version, f'{shown}')
+        for path in ('/healthz', '/openapi.json', '/docs', '/redoc'):
             r = await c.get(path)
             check(f'{path} is not served', r.status_code == 404, f'status={r.status_code}')
 
@@ -9213,6 +9425,9 @@ async def main() -> int:
         check_cover_on_the_pool()
         check_job_board()
         check_progress_script()
+
+        print('status page')
+        await check_status(c)
 
         print('cache trim')
         await check_trim_aside(c)

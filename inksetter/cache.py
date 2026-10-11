@@ -44,6 +44,10 @@ class DiskCache:
         self._next_trim = 0.0
         self.root.mkdir(parents=True, exist_ok=True)
 
+    @property
+    def size(self) -> int | None:
+        return self._size
+
     def _paths(self, key: str) -> tuple[Path, Path]:
         d = self.root / key[:2]
         return d / f'{key}.blob', d / f'{key}.type'
