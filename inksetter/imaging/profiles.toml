@@ -210,13 +210,15 @@ fmt = "raw"
 width = 480
 height = 640
 fmt = "jpeg"
-jpeg_quality = 78
 autocrop = false
-usm_amount = 0.35
 strip_folio = false
 
 [profiles.cover-colour]
 base = "cover"
 fmt = "jpegc"
-saturation = 1.35
+saturation = 1.45
+black = 14
+white = 242
+gamma = 1.12
+usm_amount = 0.65
 auto_mono = false
