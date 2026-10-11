@@ -443,6 +443,48 @@ def _file():
     )
 
 
+KOSYNC: dict = {'files': {}, 'progress': {}, 'calls': []}
+
+
+@upstream.get('/api/koreader/{key}/users/auth')
+def _ko_auth(key: str):
+    if key != SEAL_KEY:
+        return Response(status_code=401)
+    return {'username': 'reader'}
+
+
+@upstream.put('/api/koreader/{key}/syncs/progress')
+async def _ko_push(key: str, request: Request):
+    if key != SEAL_KEY:
+        return Response(status_code=401)
+    body = await request.json()
+    KOSYNC['calls'].append(('PUT', body))
+    doc = str(body.get('document', '')).upper()
+    if doc not in KOSYNC['files']:
+        return Response('file-missing', status_code=400, media_type='text/plain')
+    KOSYNC['progress'][doc] = int(body['progress'])
+    return {'document': body['document'], 'timestamp': 1700000000}
+
+
+@upstream.get('/api/koreader/{key}/syncs/progress/{doc}')
+def _ko_pull(key: str, doc: str):
+    if key != SEAL_KEY:
+        return Response(status_code=401)
+    KOSYNC['calls'].append(('GET', doc))
+    pages = KOSYNC['files'].get(doc.upper())
+    if pages is None:
+        return Response('file-missing', status_code=400, media_type='text/plain')
+    at = KOSYNC['progress'].get(doc.upper(), 0)
+    return {
+        'document': doc,
+        'progress': str(at),
+        'percentage': max(0, at - 1) / pages,
+        'device': 'Kavita',
+        'device_id': 'ABC123',
+        'timestamp': 1700000000,
+    }
+
+
 CREDS_SEEN: dict[str, str | None] = {}
 
 
@@ -8739,6 +8781,285 @@ async def check_reachable_urls(c) -> None:
     check('the probe asks after a documentation address, which nothing answers', sent == [('192.0.2.1', 9)], f'{sent}')
 
 
+def _koreader_md5(data: bytes) -> str:
+    import hashlib
+
+    h = hashlib.md5()
+    for i in range(-1, 11):
+        at = (1024 << (2 * i) % 32) & 0xFFFFFFFF
+        if at >= len(data):
+            break
+        h.update(data[at : at + 1024])
+    return h.hexdigest()
+
+
+def _page_names(blob: bytes) -> list[str]:
+    z = zipfile.ZipFile(io.BytesIO(blob))
+    return [n for n in z.namelist() if n.lower().endswith(_PAGE_SUFFIXES)]
+
+
+async def check_kosync(c) -> None:
+    from inksetter import kavita, kosync
+
+    up = 'http://127.0.0.1:8899'
+    keyed = f'{up}/api/opds/{SEAL_KEY}'
+    prof = 'kobo-clara-hd-2e-bw'
+    books = app_mod.books
+
+    def held() -> list:
+        return sorted(books.root.glob('*.json')) if books.root.exists() else []
+
+    def answer(r) -> dict:
+        try:
+            got = r.json()
+        except ValueError:
+            return {}
+        return got if isinstance(got, dict) else {}
+
+    rng = np.random.default_rng(11)
+    for size in (0, 1, 1023, 1024, 1025, 5000, 70_000, 300_000, 1_100_000, 4_200_000):
+        data = rng.integers(0, 256, size, dtype=np.uint8).tobytes()
+        streamed = kosync.Digest()
+        at = 0
+        while at < size:
+            step = int(rng.integers(1, 200_000))
+            streamed.feed(data[at : at + step])
+            at += step
+        want = _koreader_md5(data)
+        got = (streamed.hexdigest(), kosync.file_md5(io.BytesIO(data)))
+        check(f'a file of {size} bytes hashes as KOReader hashes it, streamed and read', got == (want, want), f'{got}')
+
+    pages = [0, 1, 2, 3, 4]
+    check(
+        'a page past the prepended cover is the source page before it',
+        [kosync.to_source(pages, k) for k in (1, 2, 3, 5, 9, 0)] == [1, 1, 2, 4, 4, 1],
+        f'{[kosync.to_source(pages, k) for k in (1, 2, 3, 5, 9, 0)]}',
+    )
+    check(
+        'and a source page comes back as the first page made from it, not the cover',
+        [kosync.from_source(pages, s) for s in (1, 2, 4, 7, 0)] == [2, 3, 5, 5, 1],
+        f'{[kosync.from_source(pages, s) for s in (1, 2, 4, 7, 0)]}',
+    )
+    cut = [1, 1, 1, 2, 2, 3]
+    check(
+        'a webtoon page maps to the slice it starts in, and a slice to its first page',
+        [kosync.to_source(cut, k) for k in range(1, 7)] == [1, 1, 1, 2, 2, 3]
+        and [kosync.from_source(cut, s) for s in (1, 2, 3)] == [1, 4, 6],
+    )
+    check(
+        'a page pushed from this file comes back as itself, not the first page of its slice',
+        kosync.page_for({'pages': cut, 'pushed': [5, 2]}, 2) == 5
+        and kosync.page_for({'pages': cut, 'pushed': [5, 2]}, 3) == 6,
+    )
+
+    before = held()
+    sent = _RANGED['bytes']
+    plain = await c.get(f'/{prof}/dl/{encode_token(f"{up}/opds/v1.2/ranged/file.cbz")}')
+    plain_bytes = _RANGED['bytes'] - sent
+    check('premise: a download from a catalog that is not Kavita works', plain.content[:4] == b'PK\x03\x04')
+    check('and records nothing for progress sync', held() == before, f'{len(held()) - len(before)} new')
+    r = await c.get('/kosync/users/auth')
+    check('progress sync without Kavita is a 404', r.status_code == 404, f'status={r.status_code}')
+
+    source = _koreader_md5(_RANGED_BODY)
+    KOSYNC.update(files={source.upper(): 4}, progress={}, calls=[])
+    cover = f'{up}/opds/v1.2/books/7/pages/100'
+    with _catalog(kavita, keyed):
+        sent = _RANGED['bytes']
+        ranged = await c.get(f'/{prof}/dl/{encode_token(f"{up}/opds/v1.2/ranged/file.cbz", cover)}')
+        extra = _RANGED['bytes'] - sent - plain_bytes
+        spooled = await c.get(f'/{prof}/dl/{encode_token(f"{up}/opds/v1.2/norange/file.cbz")}')
+        h1, h2 = _koreader_md5(ranged.content), _koreader_md5(spooled.content)
+        r1, r2 = books.get(h1), books.get(h2)
+        check(
+            'premise: one download carries the prepended cover and the other does not',
+            len(_page_names(ranged.content)) == 5 and len(_page_names(spooled.content)) == 4,
+            f'{len(_page_names(ranged.content))} and {len(_page_names(spooled.content))} pages',
+        )
+        check(
+            'a download is recorded under the hash KOReader will take of the file it got',
+            r1 is not None and r2 is not None and h1 != h2,
+        )
+        check(
+            'against the hash Kavita took of the source, read over ranges and from a spooled body alike',
+            (r1 or {}).get('source') == source and (r2 or {}).get('source') == source,
+            f'{(r1 or {}).get("source")} {(r2 or {}).get("source")} against {source}',
+        )
+        check(
+            'with the source page of every page written, the cover as 0',
+            (r1 or {}).get('pages') == [0, 1, 2, 3, 4] and (r2 or {}).get('pages') == [1, 2, 3, 4],
+            f'{(r1 or {}).get("pages")} {(r2 or {}).get("pages")}',
+        )
+        check(
+            'hashing the source over ranges fetches its samples alone, not whole blocks',
+            0 <= extra <= 12 * 1024,
+            f'{extra} bytes past the {plain_bytes} a download without Kavita read',
+        )
+
+        r = await c.get('/kosync/users/auth')
+        check('login is passed on to Kavita', r.status_code == 200 and answer(r) == {'username': 'reader'})
+
+        push = {'document': h1, 'progress': '3', 'percentage': 0.6, 'device': 'Kobo', 'device_id': 'dev1'}
+        r = await c.put('/kosync/syncs/progress', json=push)
+        _, told = KOSYNC['calls'][-1]
+        check('a push about a download answers as Kavita did', r.status_code == 200, f'status={r.status_code}')
+        check("under the download's own hash", answer(r).get('document') == h1, f'{answer(r)}')
+        check(
+            "while Kavita is told the source's hash and the source page: page 3 after the cover is page 2",
+            told.get('document') == source and told.get('progress') == '2',
+            f'{told}',
+        )
+        check(
+            'and everything else KOReader sent goes with it',
+            {k: told.get(k) for k in ('percentage', 'device', 'device_id')}
+            == {'percentage': 0.6, 'device': 'Kobo', 'device_id': 'dev1'},
+        )
+        r = await c.get(f'/kosync/syncs/progress/{h1}')
+        back = answer(r)
+        check(
+            'pulled again, it comes back as the page pushed, with the percentage of this file',
+            r.status_code == 200 and back.get('progress') == '3' and back.get('percentage') == 3 / 5,
+            f'{back}',
+        )
+        check("under the download's own hash, from Kavita as the device", back.get('document') == h1)
+        check('and Kavita was asked about the source', KOSYNC['calls'][-1] == ('GET', source))
+        back = answer(await c.get(f'/kosync/syncs/progress/{h2}'))
+        check(
+            'another download of the same book, without the cover, opens on the same source page',
+            back.get('progress') == '2' and back.get('percentage') == 2 / 4,
+            f'{back}',
+        )
+        KOSYNC['progress'][source.upper()] = 4
+        back = answer(await c.get(f'/kosync/syncs/progress/{h1}'))
+        check(
+            "a position set elsewhere, in Kavita's own reader, comes back as the first page made from it",
+            back.get('progress') == '5' and back.get('percentage') == 1.0,
+            f'{back}',
+        )
+        KOSYNC['progress'].pop(source.upper())
+        back = answer(await c.get(f'/kosync/syncs/progress/{h1}'))
+        check('no position at all opens on the first page', back.get('progress') == '1', f'{back}')
+
+        stranger = '0123456789abcdef0123456789abcdef'
+        r = await c.put('/kosync/syncs/progress', json={**push, 'document': stranger})
+        check(
+            'a book that did not come through Inksetter is passed on untouched',
+            KOSYNC['calls'][-1][1].get('document') == stranger and KOSYNC['calls'][-1][1].get('progress') == '3',
+            f'{KOSYNC["calls"][-1]}',
+        )
+        check("and Kavita's refusal reaches KOReader as it was", r.status_code == 400 and r.text == 'file-missing')
+        r = await c.get(f'/kosync/syncs/progress/{stranger}')
+        check('a pull about one is passed on too', r.status_code == 400 and KOSYNC['calls'][-1] == ('GET', stranger))
+
+        calls = len(KOSYNC['calls'])
+        for label, attempt in (
+            ('a document that is no hash', c.get('/kosync/syncs/progress/not-a-hash')),
+            ('a push with no document', c.put('/kosync/syncs/progress', json={'progress': '3'})),
+            ('a push that is no JSON', c.put('/kosync/syncs/progress', content=b'{not json')),
+            ('a push that is a list', c.put('/kosync/syncs/progress', json=[h1])),
+        ):
+            try:
+                status = (await attempt).status_code
+            except Exception as exc:
+                status = f'escaped: {type(exc).__name__}'
+            check(f'{label} is a 400', status == 400, f'status={status}')
+        check('and none of them reaches Kavita', len(KOSYNC['calls']) == calls)
+        r = await c.put('/kosync/syncs/progress', json={**push, 'progress': '/body/DocFragment[3].0'})
+        check(
+            'a position that is no page number is passed on as it came',
+            KOSYNC['calls'][-1][1].get('progress') == '/body/DocFragment[3].0'
+            and KOSYNC['calls'][-1][1].get('document') == h1,
+        )
+
+        sliced = 'feedfacefeedfacefeedfacefeedface'
+        books.put(sliced, {'source': source, 'pages': [1, 1, 1, 2, 2]})
+        await c.put('/kosync/syncs/progress', json={**push, 'document': sliced, 'progress': '2'})
+        back = answer(await c.get(f'/kosync/syncs/progress/{sliced}'))
+        check(
+            'a page in the middle of a slice comes back as itself, not as the first page of the slice',
+            KOSYNC['calls'][-2][1].get('progress') == '1' and back.get('progress') == '2',
+            f'pushed {KOSYNC["calls"][-2][1].get("progress")}, pulled {back.get("progress")}',
+        )
+        books.put('../escaped', {'source': source, 'pages': [1]})
+        check('a record is never written outside its directory', not (books.root.parent / 'escaped.json').exists())
+        fresh = kosync.Books(books.root)
+        check('a record outlives the process that wrote it', fresh.get(h1) == books.get(h1) and fresh.get(h1))
+        check('a record is only ever looked up by a hash', books.get('../../etc/passwd') is None)
+
+    dead = 'http://127.0.0.1:9/api/opds/' + SEAL_KEY
+    with _catalog(kavita, dead):
+        r = await c.get(f'/kosync/syncs/progress/{h1}')
+    check('Kavita out of reach is a 502', r.status_code == 502, f'status={r.status_code}')
+    check('and the answer carries neither its address nor the key', SEAL_KEY not in r.text and ':9/' not in r.text)
+
+    def blocks():
+        yield b'a' * 4000
+        yield b'b' * 4000
+
+    pending = kosync.Pending(books, source)
+    pending.pages.extend([1, 2])
+    before = held()
+    gen = app_mod._repacking(blocks(), io.BytesIO(), _off_board(), pending)
+    await gen.__anext__()
+    await gen.aclose()
+    check('a download the reader gave up on records nothing', held() == before)
+    whole = kosync.Pending(books, source)
+    whole.pages.extend([1, 2])
+    gen = app_mod._repacking(blocks(), io.BytesIO(), _off_board(), whole)
+    async for _ in gen:
+        pass
+    check(
+        'one that finishes is recorded under the hash of every byte it sent',
+        books.get(_koreader_md5(b'a' * 4000 + b'b' * 4000)) is not None,
+    )
+
+    small = kosync.Books(pathlib.Path(TMP) / 'kosync-prune', kept=2)
+    for n in range(4):
+        small.put(f'{n:032x}', {'source': source, 'pages': [1]})
+        os.utime(small.root / f'{n:032x}.json', (1_000_000 + n, 1_000_000 + n))
+    small.prune()
+    check(
+        'the records are capped, and it is the oldest that go',
+        sorted(p.stem for p in small.root.glob('*.json')) == [f'{2:032x}', f'{3:032x}'],
+    )
+
+    rng = np.random.default_rng(5)
+    slices = []
+    for i in range(36):
+        a = np.full((300, 800, 3), 236, np.uint8)
+        a[:, 160:] = rng.integers(60, 200, (300, 640, 3), dtype=np.uint8)
+        a[:, :160] = (10 + 6 * i, 128, 128)
+        if i % 9 == 4:
+            a[120:180] = 255
+        slices.append(a)
+    blob = _archive_of(*slices)
+    strip = _strip_profile()
+    consumed: dict[int, int] = {}
+    origins: dict[int, int] = {}
+    tiles = [t for t in webtoon.strip_tiles(_strip_entries(blob), strip, consumed, origins) if t[0] == 'tile']
+    told_apart = mismatched = 0
+    bands = {10 + 6 * i: i + 1 for i in range(36)}
+    for t in tiles:
+        shown = {bands.get(int(v)) for row in t[3][:4] for v in row[10:240, 0]}
+        if len(shown) != 1 or None in shown:
+            continue
+        told_apart += 1
+        mismatched += shown.pop() != origins.get(t[1])
+    check(
+        'premise: most webtoon pages open clear of a slice boundary, and the reader runs ahead of them',
+        told_apart >= 5 and any(origins[k] != consumed[k] for k in origins),
+        f'{told_apart} of {len(tiles)} pages',
+    )
+    check('a webtoon page is mapped to the slice its first row came from', mismatched == 0, f'{mismatched} wrong')
+    sources: list[int] = []
+    out = b''.join(cbz.repack_iter(io.BytesIO(blob), strip, 2, sources=sources))
+    check(
+        'and a repack reports one source page per page written, in order',
+        len(sources) == len(_page_names(out)) and sources == sorted(sources) and 1 <= sources[0] <= sources[-1] <= 36,
+        f'{sources}',
+    )
+
+
 def check_progress_script() -> None:
     p = profiles.PROFILES['kobo-clara-hd-2e-bw']
     item = web.Item(title='V1', href='/kobo-clara-hd-2e-bw/dl/tok', cover=None, note='', download=True)
@@ -9516,6 +9837,9 @@ async def main() -> int:
 
         print('status page')
         await check_status(c)
+
+        print('progress sync')
+        await check_kosync(c)
 
         print('cache trim')
         await check_trim_aside(c)

@@ -5,6 +5,7 @@ Webtoon re-slicing.
 import numpy as np
 import pyvips
 import math
+import bisect
 import logging
 import functools
 import collections
@@ -400,6 +401,7 @@ class _Held:
         self.headroom = headroom
         self.pixels = self.lohi = None
         self.start = self.stop = 0
+        self.dropped = 0
 
     def __len__(self) -> int:
         return self.stop - self.start
@@ -418,6 +420,7 @@ class _Held:
 
     def drop(self, n: int) -> None:
         self.start += n
+        self.dropped += n
 
     def rows(self) -> np.ndarray:
         return self.pixels[self.start : self.stop]
@@ -426,7 +429,7 @@ class _Held:
         return self.lohi[self.start : self.stop]
 
 
-def strip_tiles(entries, p: Profile, consumed: dict[int, int]):
+def strip_tiles(entries, p: Profile, consumed: dict[int, int], origins: dict[int, int] | None = None):
     limit = p.height
     reach = round(limit * STRIP_OVERSHOOT)
     margin = round(limit * STRIP_TOP_MARGIN)
@@ -438,6 +441,8 @@ def strip_tiles(entries, p: Profile, consumed: dict[int, int]):
     opening = True
     resumed = False
     chain = None
+    firsts: list[int] = []
+    slices: list[int] = []
 
     def rows() -> int:
         return 0 if opening else len(held)
@@ -449,10 +454,12 @@ def strip_tiles(entries, p: Profile, consumed: dict[int, int]):
             held.drop(max(start, end - margin))
             opening = not art
 
-    def tile(name: str, piece: np.ndarray, edges, anchor: str):
+    def tile(name: str, piece: np.ndarray, edges, anchor: str, offset: int = 0):
         nonlocal index
         index += 1
         consumed[index] = seen
+        if origins is not None and firsts:
+            origins[index] = slices[max(0, bisect.bisect_right(firsts, held.dropped + offset) - 1)]
         return ('tile', index, name, piece.copy(), edges, anchor)
 
     def carry_on(nxt: int, again: bool) -> None:
@@ -497,7 +504,7 @@ def strip_tiles(entries, p: Profile, consumed: dict[int, int]):
         level = _gutter_at(lohi, 0, minrun)
         level = below if level is None else level
         stops = [a + h for a in starts[:-1]] + [end]
-        out = [tile(name, block[a:stop], (level, level), 'top') for a, stop in zip(starts, stops, strict=True)]
+        out = [tile(name, block[a:stop], (level, level), 'top', a) for a, stop in zip(starts, stops, strict=True)]
         carry_on(after, False)
         return out
 
@@ -511,6 +518,9 @@ def strip_tiles(entries, p: Profile, consumed: dict[int, int]):
             _, seen, name, _ = entry
             last = name
             if a is not None:
+                if origins is not None:
+                    firsts.append(held.dropped + len(held))
+                    slices.append(seen)
                 held.add(a)
                 settle()
                 while rows() > ahead:

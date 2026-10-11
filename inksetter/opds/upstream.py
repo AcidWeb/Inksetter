@@ -211,6 +211,17 @@ class RangeReader:
         self._pos += len(out)
         return out
 
+    def sample(self, offset: int, size: int) -> bytes:
+        size = min(size, self._size - offset)
+        if offset < 0 or size <= 0:
+            return b''
+        index = offset // _RANGE_BLOCK
+        start = offset - index * _RANGE_BLOCK
+        cached = self._blocks.get(index)
+        if cached is not None and start + size <= len(cached):
+            return cached[start : start + size]
+        return self._fetch(offset, offset + size - 1)
+
     def close(self) -> None:
         if not self.closed:
             self.closed = True

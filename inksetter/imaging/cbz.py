@@ -194,6 +194,7 @@ def repack_iter(
     cover: bytes | None = None,
     comicinfo=None,
     progress=None,
+    sources: list[int] | None = None,
 ):
     zin = zipfile.ZipFile(src)
     infos = sorted((i for i in zin.infolist() if not i.is_dir()), key=lambda i: natural_key(i.filename))
@@ -244,13 +245,16 @@ def repack_iter(
             zout = zipfile.ZipFile(sink, 'w', zipfile.ZIP_STORED)
             try:
                 consumed: dict[int, int] = {}
-                jobs = webtoon.strip_tiles(entries, profile, consumed) if strip else entries
+                origins = {} if sources is not None else None
+                jobs = webtoon.strip_tiles(entries, profile, consumed, origins) if strip else entries
                 if lead is not None:
                     jobs = itertools.chain([('cover', lead)], jobs)
                 for job, size in _run(jobs, zout, profile, workers, pad):
                     if job[0] == 'cover':
                         if size is not _UNWRITTEN:
                             sizes.append(size)
+                            if sources is not None:
+                                sources.append(0)
                         pages += 1
                         tell(pages)
                         block = sink.drain()
@@ -260,6 +264,8 @@ def repack_iter(
                     written += 1
                     if job[0] != 'copy':
                         sizes.append(size)
+                        if sources is not None:
+                            sources.append(job[1] if job[0] == 'page' else origins.pop(job[1], 0))
                     if job[0] == 'page':
                         pages += 1
                         tell(pages)

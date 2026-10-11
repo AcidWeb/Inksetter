@@ -1,16 +1,17 @@
 """
 Kavita specific features.
-ComicInfo.xml generator and cover parser.
+ComicInfo.xml generator, cover parser and the KOReader progress sync relay.
 """
 
 import re
 import time
+import httpx
 import asyncio
 from urllib.parse import urlsplit
 from xml.sax.saxutils import escape
 
 from .settings import settings
-from .opds.upstream import client
+from .opds.upstream import UpstreamError, client
 
 _UNSET = '-100000'
 _UNSET_DATE = '0001-01-01T00:00:00'
@@ -318,3 +319,15 @@ async def for_download(url: str):
         return render(data, number, sizes)
 
     return build
+
+
+async def sync(method: str, path: str, body: dict | None = None) -> httpx.Response:
+    key, base = api_key(), _kavita.base()
+    if not key or not base:
+        raise UpstreamError(404, 'progress sync needs a Kavita upstream')
+    try:
+        return await client.raw.request(
+            method, f'{base}/api/koreader/{key}/{path}', json=body, headers={'accept': 'application/json'}
+        )
+    except httpx.HTTPError, httpx.InvalidURL:
+        raise UpstreamError(502, 'Kavita did not answer the progress sync') from None

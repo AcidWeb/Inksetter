@@ -24,7 +24,7 @@ from fastapi.responses import (
     StreamingResponse,
 )
 
-from . import __version__, cores, kavita, logs, status, web
+from . import __version__, cores, kavita, kosync, logs, status, web
 from .cache import DiskCache, Prefetcher, render_key
 from .imaging import cbz, profiles
 from .imaging.pipeline import RenderFailed, UnreadableImage, render_page
@@ -32,6 +32,8 @@ from .imaging.profiles import Profile, cover_for
 from .opds import rewrite
 from .opds.upstream import CREDENTIAL_REQUEST, FORWARD_RESPONSE, UpstreamError, client, open_range, request_headers
 from .settings import settings
+
+log = logging.getLogger(__name__)
 
 logs.configure()
 profiles.use_folio(settings.ocr_enabled)
@@ -46,6 +48,7 @@ board = status.Board(_redact)
 logging.getLogger('inksetter').addHandler(status.Problems(board))
 
 cache = DiskCache(settings.cache_dir, settings.cache_max_bytes)
+books = kosync.Books(settings.cache_dir / 'kosync')
 prefetcher = Prefetcher()
 render_sem = asyncio.Semaphore(settings.render_workers)
 repack_slots = asyncio.Semaphore(settings.repack_workers)
@@ -461,7 +464,14 @@ def _wind_down(chunks, body, turn: threading.Lock) -> None:
             body.close()
 
 
-async def _repacking(chunks, body, track: status.Download):
+def _record(sync: kosync.Pending) -> None:
+    try:
+        sync.finish()
+    except Exception:
+        log.warning('progress sync: the download could not be recorded, so it will not sync', exc_info=True)
+
+
+async def _repacking(chunks, body, track: status.Download, sync: kosync.Pending | None = None):
     turn = threading.Lock()
     outcome = 'error'
     try:
@@ -470,8 +480,12 @@ async def _repacking(chunks, body, track: status.Download):
                 block = await asyncio.to_thread(_next_block, chunks, turn)
             if block is None:
                 outcome = 'done'
+                if sync is not None:
+                    await asyncio.to_thread(_record, sync)
                 return
             track.update(sent=track.sent + len(block))
+            if sync is not None:
+                sync.feed(block)
             yield block
     except GeneratorExit, asyncio.CancelledError:
         outcome = 'stopped'
@@ -580,10 +594,22 @@ def _download_name(url: str, headers) -> str:
     return _redact(name or 'download')
 
 
+async def _sync_for(src) -> kosync.Pending | None:
+    if not kavita.api_key():
+        return None
+    try:
+        source = await asyncio.to_thread(kosync.file_md5, src)
+    except Exception:
+        log.warning('progress sync: the source archive could not be hashed, so this download will not sync')
+        return None
+    return kosync.Pending(books, source)
+
+
 async def _repack(src, url: str, cover_url: str | None, p: Profile, request: Request, track, upstream):
     track.update(name=_download_name(url, upstream))
     cover = await _pick_cover(url, cover_url, request)
     meta = await kavita.for_download(url)
+    sync = await _sync_for(src)
     chunks = await asyncio.to_thread(
         cbz.repack_iter,
         src,
@@ -592,9 +618,10 @@ async def _repack(src, url: str, cover_url: str | None, p: Profile, request: Req
         cover=cover,
         comicinfo=meta,
         progress=_reporter(track),
+        sources=sync.pages if sync else None,
     )
     return StreamingResponse(
-        _repacking(chunks, src, track),
+        _repacking(chunks, src, track, sync),
         media_type='application/vnd.comicbook+zip',
         headers=_stale(upstream),
     )
@@ -668,3 +695,75 @@ async def _deliver(p: Profile, url: str, cover_url: str | None, request: Request
     track.update(name=_download_name(url, out_headers), sent=int(out_headers['content-length']))
     track.finish('done')
     return StreamingResponse(_drain(body), media_type=ctype, headers=out_headers)
+
+
+# --------------------------------------------------------------------------
+# KOReader progress sync
+# --------------------------------------------------------------------------
+
+
+def _page_number(value) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdecimal():
+        return int(value)
+    return None
+
+
+def _relay(resp) -> Response:
+    return Response(resp.content, status_code=resp.status_code, media_type=resp.headers.get('content-type'))
+
+
+def _json_of(resp) -> dict | None:
+    try:
+        answer = resp.json()
+    except ValueError:
+        return None
+    return answer if isinstance(answer, dict) else None
+
+
+def _document(value) -> str:
+    if not kosync.is_digest(value):
+        raise UpstreamError(400, 'progress sync expects a document hash')
+    return value
+
+
+@app.get('/kosync/users/auth')
+async def kosync_auth():
+    return _relay(await kavita.sync('GET', 'users/auth'))
+
+
+@app.put('/kosync/syncs/progress')
+async def kosync_push(request: Request):
+    try:
+        body = await request.json()
+    except ValueError:
+        raise UpstreamError(400, 'progress sync expects a JSON body') from None
+    document = _document(body.get('document') if isinstance(body, dict) else None)
+    record = await asyncio.to_thread(books.get, document)
+    page = _page_number(body.get('progress'))
+    if record is None or page is None:
+        return _relay(await kavita.sync('PUT', 'syncs/progress', body))
+    source = kosync.to_source(record['pages'], page)
+    resp = await kavita.sync('PUT', 'syncs/progress', {**body, 'document': record['source'], 'progress': str(source)})
+    answer = _json_of(resp)
+    if resp.status_code != 200 or answer is None:
+        return _relay(resp)
+    await asyncio.to_thread(books.remember, document, page, source)
+    return JSONResponse({**answer, 'document': document})
+
+
+@app.get('/kosync/syncs/progress/{document}')
+async def kosync_pull(document: str):
+    record = await asyncio.to_thread(books.get, _document(document))
+    resp = await kavita.sync('GET', f'syncs/progress/{record["source"] if record else document}')
+    answer = _json_of(resp)
+    source = _page_number(answer.get('progress')) if answer else None
+    if record is None or resp.status_code != 200 or source is None:
+        return _relay(resp)
+    page = kosync.page_for(record, source)
+    return JSONResponse(
+        {**answer, 'document': document, 'progress': str(page), 'percentage': page / len(record['pages'])}
+    )

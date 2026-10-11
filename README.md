@@ -44,10 +44,11 @@ If KOReader is used as client to read downloaded CBZ files it **MUST BE** config
 
 ### Kavita specific features
 
-Currently, if the proxy uses Kavita as the OPDS source, two additional features are available:
+Currently, if the proxy uses Kavita as the OPDS source, three additional features are available:
 
 * When client download the CBZ file book cover defined at the Kavita level takes priority and will be added to file if it isn’t there already.
 * If archive is missing `ComicInfo.xml` file it will be generated using Kavita metadata and injected to output.
+* Reading progress of downloaded CBZ files can be synced with Kavita through KOReader [progress sync](https://wiki.kavitareader.com/guides/3rdparty/koreader/#setting-up-progress-synchronization). Point KOReader to the Inksetter endpoint `/kosync` instead of `<kavita>/api/koreader/<your-api-token>`.
 
 ## Current limitations
 
