@@ -37,7 +37,7 @@ jobs:
   windows:
     runs-on: windows-2022
     permissions:
-      contents: write
+      contents: read
 
     steps:
       - name: Checkout

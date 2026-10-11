@@ -3135,6 +3135,35 @@ def check_cover_delivery() -> None:
         z.read(got[0]) == as_cover,
     )
 
+    class Counted(_io.BytesIO):
+        taken = 0
+
+        def read(self, size=-1):
+            out = super().read(size)
+            self.taken += len(out)
+            return out
+
+    noise = np.random.default_rng(3).integers(0, 256, (1400, 1000), dtype=np.uint8)
+    heavy = pyvips.Image.new_from_memory(noise.tobytes(), 1000, 1400, 1, 'uchar').pngsave_buffer()
+    held = _io.BytesIO()
+    with _zf.ZipFile(held, 'w') as zz:
+        zz.writestr('p001.png', heavy)
+        zz.writestr('p002.png', art)
+    whole = len(held.getvalue())
+    counted = Counted(held.getvalue())
+    got_heavy, _ = pages(b''.join(_cbz.repack_iter(counted, prof, 1, cover=art)))
+    check('premise: page 1 is most of the archive', len(heavy) > whole * 0.9, f'{len(heavy)} of {whole} bytes')
+    check(
+        'premise: the cover is prepended ahead of both its pages',
+        len(got_heavy) == 3 and got_heavy[0].startswith('0000.'),
+        f'{got_heavy}',
+    )
+    check(
+        'and page 1 is read from the archive once, though it was compared with the cover first',
+        counted.taken < whole + len(heavy) // 2,
+        f'{counted.taken} bytes read of a {whole} byte archive',
+    )
+
     same, _ = pages(b''.join(_cbz.repack_iter(_io.BytesIO(raw), prof, cover=thumb)))
     check(
         'a cover that is already page 1 is not prepended',
@@ -6629,6 +6658,7 @@ def check_profile_config() -> None:
         ('inverted levels', 'black = 250\nwhite = 10', 'black < white'),
         ('bad png level', 'png_compression = 11', 'png_compression=11'),
         ('defringe without a CFA', 'defringe = "diagonal"', 'filter array'),
+        ('defringe typo', 'panel = "kaleido"\ndefringe = "diagnal"', "defringe='diagnal' is not one of"),
         ('palette needing 3 bits', 'palette_colours = 8', 'palette_colours=8'),
         ('palette needing 5 bits', 'palette_colours = 17', 'palette_colours=17'),
         ('palette needing 6 bits', 'palette_colours = 64', 'palette_colours=64'),
@@ -6642,14 +6672,22 @@ def check_profile_config() -> None:
         ('negative ink threshold', 'autocrop_threshold = -20', 'autocrop_threshold=-20'),
         ('auto_mono that can never fire', 'mono_chroma_threshold = -1.0', 'mono_chroma_threshold=-1.0'),
         ('a descreen ceiling no box can hold', 'descreen_max_megapixels = 320', 'descreen_max_megapixels=320'),
+        ('a quoted size', 'width = "1072"', "width='1072' must be a whole number"),
+        ('a quoted number', 'upscale_max = "2.5"', "upscale_max='2.5' must be a number"),
+        ('a fraction for a count', 'png_effort = 6.5', 'png_effort=6.5 must be a whole number'),
+        ('a quoted switch, which would read as on', 'autocrop = "no"', "autocrop='no' must be true or false"),
+        ('a number for a switch', 'autocrop = 0', 'autocrop=0 must be true or false'),
+        ('a switch for a number', 'gamma = true', 'gamma=True must be a number'),
+        ('a number for a name', 'fmt = 4', 'fmt=4 must be text'),
     ):
         size = ''.join(f'{k} = {v}\n' for k, v in (('width', 1072), ('height', 1448)) if f'{k} =' not in body)
         body = f'[profiles.x]\n{size}{body}\n'
         try:
             profiles._build(body, 'test.toml')
             check(f'profiles.toml {label} rejected', False, 'no error raised')
-        except ValueError as exc:
-            check(f'profiles.toml {label} rejected', needle in str(exc), str(exc)[:64])
+        except Exception as exc:
+            said = f'{type(exc).__name__}: {exc}'
+            check(f'profiles.toml {label} rejected', isinstance(exc, ValueError) and needle in str(exc), said[:72])
 
     body = '\n'.join(('[profiles.x]', 'width = 1072', 'height = 1448', 'usm_amount = 0.0', ''))
     for good in (2, 4, 16, 129, 256):
@@ -6659,6 +6697,13 @@ def check_profile_config() -> None:
             check(f'palette_colours = {good} is accepted', True)
         except ValueError as exc:
             check(f'palette_colours = {good} is accepted', False, str(exc)[:56])
+
+    whole = f'[profiles.x]{LF}width = 1072{LF}height = 1448{LF}upscale_max = 2{LF}'
+    try:
+        got = profiles._build(whole, 'test.toml')['x'].upscale_max
+        check('a whole number is taken where a fraction may go', got == 2, f'{got!r}')
+    except ValueError as exc:
+        check('a whole number is taken where a fraction may go', False, str(exc)[:56])
 
     try:
         off = profiles._build(body, 'test.toml')
@@ -8146,8 +8191,8 @@ def check_cover_on_the_pool() -> None:
     taken = [0]
     real_entries = cbz._entries
 
-    def slow_entries(zin, infos):
-        for item in real_entries(zin, infos):
+    def slow_entries(zin, infos, first=None):
+        for item in real_entries(zin, infos, first):
             time.sleep(0.15)
             taken[0] += 1
             yield item
@@ -8791,6 +8836,15 @@ async def main() -> int:
                     f'...and says so rather than blaming the proxy ({label})',
                     'unreachable' in r.text,
                     r.text[:60],
+                )
+
+        with _catalog(app_mod, ''), _catalog(_upmod, ''):
+            for route in ('catalog', 'browse'):
+                r = await _get(c, f'/kobo-clara-hd-2e-bw/{route}')
+                check(
+                    f'with no catalog set, /{route} says so in a 500',
+                    r.status_code == 500 and 'UPSTREAM_CATALOG' in r.text,
+                    f'status={r.status_code} {r.text[:70]}',
                 )
 
         for label, tok in (('not base64', '!!!not-base64!!!'), ('bad utf-8', '_w==')):

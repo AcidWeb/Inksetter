@@ -179,8 +179,6 @@ async def _serve_feed(request: Request, profile_name: str, url: str) -> Response
 
 @app.api_route('/{profile}/catalog', methods=['GET', 'HEAD'])
 async def catalog(profile: str, request: Request):
-    if not settings.upstream_catalog:
-        raise UpstreamError(500, 'UPSTREAM_CATALOG is not configured')
     return await _serve_feed(request, profile, settings.upstream_catalog)
 
 
@@ -236,8 +234,6 @@ async def _serve_html(request: Request, profile_name: str, url: str, term: str =
 
 @app.api_route('/{profile}/browse', methods=['GET', 'HEAD'], response_class=HTMLResponse)
 async def browse_root(profile: str, request: Request):
-    if not settings.upstream_catalog:
-        raise UpstreamError(500, 'UPSTREAM_CATALOG is not configured')
     return await _serve_html(request, profile, settings.upstream_catalog)
 
 
@@ -522,9 +518,6 @@ async def download_status(profile: str, job: str):
 async def download(profile: str, token: str, request: Request, job: str = ''):
     p = _profile_or_404(profile)
     url, cover_url = rewrite.decode_parts(token)
-    if request.method == 'GET':
-        jobs.set(job, stage='fetching', done=0, total=0)
-
     if request.method == 'HEAD':
         resp = await client.stream(url, request_headers(request.headers))
         ctype = resp.headers.get('content-type', 'application/octet-stream')
@@ -536,6 +529,7 @@ async def download(profile: str, token: str, request: Request, job: str = ''):
         del head.headers['content-length']
         return head
 
+    jobs.set(job, stage='fetching', done=0, total=0)
     try:
         return await _deliver(p, url, cover_url, request, job)
     except BaseException:

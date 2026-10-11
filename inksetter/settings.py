@@ -59,7 +59,7 @@ class Settings:
     spool_max_bytes: int = _int('SPOOL_MAX_BYTES', 32 * 1024**2)
 
     # Where a spilled spool file lands.
-    spool_dir: str = os.environ.get('SPOOL_DIR', '') or str(Path(os.environ.get('CACHE_DIR') or _cache_dir()))
+    spool_dir: str = os.environ.get('SPOOL_DIR', '') or str(cache_dir)
 
     # OCR finds page numbers in the bottom margin and erases them.
     ocr_enabled: bool = os.environ.get('OCR_ENABLED', '').strip().lower() not in ('false', '0', 'no', 'off')

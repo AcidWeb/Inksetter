@@ -8,6 +8,6 @@ sample/
 .env
 .idea
 *.py[cod]
-Build.sh
+Build.ps1
 CLAUDE.md
 docker-compose.override.yml

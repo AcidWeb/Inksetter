@@ -48,14 +48,18 @@ def _suffix_for(blob: bytes, fallback_name: str) -> str:
     return fallback_name[fallback_name.rfind('.') :]
 
 
-def _entries(zin, infos):
+def _entries(zin, infos, first=None):
     index = 0
     for info in infos:
+        if first is not None and info is first[0]:
+            data, first = first[1], None
+        else:
+            data = zin.read(info)
         if not is_image(info.filename):
-            yield ('copy', info.filename, zin.read(info))
+            yield ('copy', info.filename, data)
             continue
         index += 1
-        yield ('page', index, info.filename, zin.read(info))
+        yield ('page', index, info.filename, data)
 
 
 def _render(job, profile: Profile):
@@ -198,10 +202,12 @@ def repack_iter(
         workers,
     )
 
-    lead = None
+    lead = first = None
     if cover:
-        first = next((i for i in infos if is_image(i.filename)), None)
-        if first is not None and not same_picture(cover, zin.read(first)):
+        page_one = next((i for i in infos if is_image(i.filename)), None)
+        if page_one is not None:
+            first = page_one, zin.read(page_one)
+        if first is not None and not same_picture(cover, first[1]):
             lead = cover
             log.info('repack: prepending the server cover, %d kB', len(cover) // 1024)
         else:
@@ -216,6 +222,7 @@ def repack_iter(
         log.info('repack: re-cutting the strip into %d px pages', profile.height)
 
     total_pages = images + (lead is not None)
+    entries = _entries(zin, infos, first)
 
     def tell(done: int) -> None:
         if progress is not None:
@@ -232,7 +239,7 @@ def repack_iter(
             zout = zipfile.ZipFile(sink, 'w', zipfile.ZIP_STORED)
             try:
                 consumed: dict[int, int] = {}
-                jobs = webtoon.strip_tiles(_entries(zin, infos), profile, consumed) if strip else _entries(zin, infos)
+                jobs = webtoon.strip_tiles(entries, profile, consumed) if strip else entries
                 if lead is not None:
                     jobs = itertools.chain([('cover', lead)], jobs)
                 for job, size in _run(jobs, zout, profile, workers, pad):

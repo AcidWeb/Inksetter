@@ -255,8 +255,7 @@ def descreen(im: pyvips.Image, p: Profile, scale: float) -> pyvips.Image:
                 out = filtered.astype(np.uint8)
                 return pyvips.Image.new_from_memory(out.tobytes(), im.width, im.height, 1, 'uchar')
             np.subtract(filtered, plane, out=filtered)
-            delta = filtered.astype(np.float32, copy=False)
-            correction = pyvips.Image.new_from_memory(delta.tobytes(), im.width, im.height, 1, 'float')
+            correction = pyvips.Image.new_from_memory(filtered.tobytes(), im.width, im.height, 1, 'float')
             return (im.cast('float') + correction).rint().cast('uchar')
     except pyvips.Error, MemoryError, ValueError:
         return im
@@ -787,7 +786,7 @@ def _render_colour(
     L = _unsharp(_tone(L, p, 100.0), p, geom.upscale)
     L = defringe(L, p)
 
-    out = L.bandjoin([a, b]).copy(interpretation='lab').colourspace('srgb').cast('uchar')
+    out = L.bandjoin([a, b]).copy(interpretation='lab').colourspace('srgb')
 
     cx, cy, cw, ch = geom.content
     if (cw, ch) != (out.width, out.height):

@@ -22,6 +22,7 @@ UPSCALE_MAX_CEILING = 8.0
 _SHIPPED = 'profiles.toml'
 _INTERNAL = frozenset({'cover', 'cover-colour'})
 _MIMES = {'jpeg': 'image/jpeg', 'jpegc': 'image/jpeg', 'webpc': 'image/webp'}
+_KINDS = {bool: 'true or false', int: 'a whole number', float: 'a number', str: 'text'}
 
 
 @dataclass(frozen=True)
@@ -189,14 +190,25 @@ class Profile:
         return self.height / self.width
 
 
+_CHOICES = {
+    'fmt': FORMATS,
+    'dither': DITHERS,
+    'descreen': DESCREENS,
+    'panel': PANELS,
+    'defringe': DEFRINGES,
+    'fit': FITS,
+    'colour_pad': COLOUR_PADS,
+    'upscale': UPSCALES,
+    'upscale_kernel': UPSCALE_KERNELS,
+}
+
+
 def validate(p: Profile, where: str = 'profile') -> Profile:
-    problems = []
-    if p.fmt not in FORMATS:
-        problems.append(f'fmt={p.fmt!r} is not one of {", ".join(sorted(FORMATS))}')
-    if p.dither not in DITHERS:
-        problems.append(f'dither={p.dither!r} is not one of {", ".join(sorted(DITHERS))}')
-    if p.descreen not in DESCREENS:
-        problems.append(f'descreen={p.descreen!r} is not one of {", ".join(sorted(DESCREENS))}')
+    problems = [
+        f'{field}={getattr(p, field)!r} is not one of {", ".join(sorted(choices))}'
+        for field, choices in _CHOICES.items()
+        if getattr(p, field) not in choices
+    ]
     if not 0.0 <= p.descreen_strength <= 1.0:
         problems.append(f'descreen_strength={p.descreen_strength} must be 0..1')
     if not 0.0 < p.descreen_width < 0.5:
@@ -211,10 +223,6 @@ def validate(p: Profile, where: str = 'profile') -> Profile:
         problems.append(f'descreen_min_amplitude={p.descreen_min_amplitude} must be >= 0')
     if p.descreen_deadband < 0:
         problems.append(f'descreen_deadband={p.descreen_deadband} must be >= 0')
-    if p.panel not in PANELS:
-        problems.append(f'panel={p.panel!r} is not one of {", ".join(sorted(PANELS))}')
-    if p.defringe not in DEFRINGES:
-        problems.append(f'defringe={p.defringe!r} is not one of {", ".join(sorted(DEFRINGES))}')
     if not 0.0 < p.defringe_min_freq < 0.5:
         problems.append(f'defringe_min_freq={p.defringe_min_freq} must be >0 and <0.5')
     if not 0.0 <= p.defringe_angle < 360.0:
@@ -225,14 +233,6 @@ def validate(p: Profile, where: str = 'profile') -> Profile:
         problems.append(f'defringe_strength={p.defringe_strength} must be 0..1')
     if p.defringe_deadband < 0:
         problems.append(f'defringe_deadband={p.defringe_deadband} must be >= 0')
-    if p.fit not in FITS:
-        problems.append(f'fit={p.fit!r} is not one of {", ".join(sorted(FITS))}')
-    if p.colour_pad not in COLOUR_PADS:
-        problems.append(f'colour_pad={p.colour_pad!r} is not one of {", ".join(sorted(COLOUR_PADS))}')
-    if p.upscale not in UPSCALES:
-        problems.append(f'upscale={p.upscale!r} is not one of {", ".join(sorted(UPSCALES))}')
-    if p.upscale_kernel not in UPSCALE_KERNELS:
-        problems.append(f'upscale_kernel={p.upscale_kernel!r} is not one of {", ".join(sorted(UPSCALE_KERNELS))}')
     if not 1.0 <= p.upscale_max <= UPSCALE_MAX_CEILING:
         problems.append(f'upscale_max={p.upscale_max} must be 1.0..{UPSCALE_MAX_CEILING}')
     if not 1.0 <= p.strip_scale_max <= UPSCALE_MAX_CEILING:
@@ -340,6 +340,18 @@ def _flatten(name: str, profs: dict, mixins: dict, where: str, chain: tuple[str,
     return {**_flatten(base, profs, mixins, where, (*chain, name)), **cfg}
 
 
+def _mistyped(cfg: dict) -> list[str]:
+    out = []
+    for f in fields(Profile):
+        value = cfg.get(f.name)
+        if value is None:
+            continue
+        kind = (int, float) if f.type is float else f.type
+        if isinstance(value, bool) != (f.type is bool) or not isinstance(value, kind):
+            out.append(f'{f.name}={value!r} must be {_KINDS[f.type]}')
+    return out
+
+
 def _build(text: str, where: str) -> dict[str, Profile]:
     mixins, profs = _read_tables(text, where)
     known = {f.name for f in fields(Profile)} - {'name'}
@@ -355,6 +367,9 @@ def _build(text: str, where: str) -> dict[str, Profile]:
         missing = sorted({'width', 'height'} - set(cfg))
         if missing:
             raise ValueError(f'{where}: profile {name!r} is missing {", ".join(missing)}')
+        mistyped = _mistyped(cfg)
+        if mistyped:
+            raise ValueError(f'{where}: profile {name!r}: ' + '; '.join(mistyped))
         out[name] = validate(Profile(name=name, **cfg), f'{where}: profile')
     return out
 
