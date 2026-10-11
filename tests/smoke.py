@@ -1481,6 +1481,77 @@ def _ink_shape(blob: bytes) -> tuple[int, int]:
     return int(cols[-1] - cols[0] + 1), int(rows[-1] - rows[0] + 1)
 
 
+def check_slow_head() -> None:
+    workers = 2
+    prof = profiles.PROFILES['kobo-clara-hd-2e-bw']
+    tiny = pyvips.Image.black(4, 4).pngsave_buffer()
+    src = io.BytesIO()
+    with zipfile.ZipFile(src, 'w') as z:
+        for i in range(60):
+            z.writestr(f'{i:03d}.png', tiny)
+    raw = src.getvalue()
+    real_entries = cbz._entries
+    lock = threading.Lock()
+    count = {'pulled': 0, 'done': 0, 'gap': 0}
+
+    def counted(zin, infos, first=None):
+        for item in real_entries(zin, infos, first):
+            with lock:
+                count['pulled'] += 1
+                count['gap'] = max(count['gap'], count['pulled'] - count['done'])
+            yield item
+
+    def run(render) -> list[str]:
+        count.update(pulled=0, done=0, gap=0)
+        with mock.patch.object(cbz, '_entries', counted), mock.patch.object(cbz, '_render', render):
+            return zipfile.ZipFile(io.BytesIO(b''.join(cbz.repack_iter(io.BytesIO(raw), prof, workers)))).namelist()
+
+    behind = threading.Event()
+    seen = {}
+
+    def slow_head(job, _profile):
+        if job[1] == 1:
+            behind.wait(timeout=5)
+            time.sleep(0.3)
+            with lock:
+                seen.update(count)
+        else:
+            with lock:
+                count['done'] += 1
+                if count['done'] >= 3 * workers:
+                    behind.set()
+        return tiny, 'image/png'
+
+    names = run(slow_head)
+    check(
+        'premise: a pool behind a slow first page still writes every page, in order',
+        names == sorted(names) and len(names) == 60,
+    )
+    check(
+        'pages go on rendering behind a slow page at the head of the pool',
+        seen.get('done', 0) >= 3 * workers,
+        f'{seen.get("done")} finished behind it, {workers} workers',
+    )
+    check(
+        'but no more than 8 x workers are held behind it',
+        2 * workers < seen.get('pulled', 0) <= 8 * workers,
+        f'{seen.get("pulled")} pulled from the archive while it rendered',
+    )
+
+    def uniform(_job, _profile):
+        time.sleep(0.02)
+        with lock:
+            count['done'] += 1
+        return tiny, 'image/png'
+
+    names = run(uniform)
+    check(
+        'with every page as slow as the next, no more than 2 x workers renders are queued at once',
+        len(names) == 60 and count['gap'] <= 2 * workers,
+        f'{count["gap"]} pulled ahead of the renders finished, {workers} workers',
+    )
+
+
 def check_repack_parallel() -> None:
     import io as _io
     import zipfile as _zf
@@ -9262,6 +9333,7 @@ async def main() -> int:
     check_settings_file()
     print('parallel repack')
     check_repack_parallel()
+    check_slow_head()
     print('range repack')
     check_range_repack()
     print('streamed repack')

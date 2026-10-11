@@ -131,7 +131,7 @@ def _run_serial(jobs, zout, profile: Profile, pad: int):
 
 
 def _run_pooled(jobs, zout, profile: Profile, workers: int, pad: int):
-    window = workers * 2
+    window, most = workers * 2, workers * 8
     pending: collections.deque = collections.deque()
 
     def flush_one() -> tuple[tuple, tuple[int, int] | None]:
@@ -142,17 +142,22 @@ def _run_pooled(jobs, zout, profile: Profile, workers: int, pad: int):
             return job, _emit_cover(zout, pad, fut.result)
         return job, _emit_rendered(zout, job, pad, fut.result)
 
-    def ready() -> bool:
-        fut = pending[0][1]
-        return len(pending) >= window or fut is None or fut.done()
+    def rendering() -> list:
+        return [fut for _, fut in pending if fut is not None and not fut.done()]
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers, thread_name_prefix='repack') as pool:
         try:
             for job in jobs:
                 fut = None if job[0] == 'copy' else pool.submit(_render, job, profile)
                 pending.append((job, fut))
-                while pending and ready():
-                    yield flush_one()
+                while pending:
+                    head = pending[0][1]
+                    if head is None or head.done() or len(pending) >= most:
+                        yield flush_one()
+                    elif len(busy := rendering()) >= window:
+                        concurrent.futures.wait(busy, return_when=concurrent.futures.FIRST_COMPLETED)
+                    else:
+                        break
             while pending:
                 yield flush_one()
         except BaseException:
