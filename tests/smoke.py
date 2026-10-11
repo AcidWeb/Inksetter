@@ -5115,8 +5115,20 @@ def check_reslice_edges() -> None:
     )
 
 
+def _text(text: str, dpi: int = 300, bold: bool = False) -> pyvips.Image:
+    from PIL import Image, ImageDraw, ImageFont
+
+    size = round(12 * dpi / 72)
+    font = ImageFont.load_default(size=size)
+    stroke = round(size / 40) if bold else 0
+    left, top, right, bottom = font.getbbox(text, stroke_width=stroke)
+    canvas = Image.new('L', (right - left, bottom - top), 0)
+    ImageDraw.Draw(canvas).text((-left, -top), text, fill=255, font=font, stroke_width=stroke, stroke_fill=255)
+    return pyvips.Image.new_from_memory(canvas.tobytes(), canvas.width, canvas.height, 1, 'uchar')
+
+
 def _lettering(text: str, width: int = 1272, x: int | None = None) -> np.ndarray:
-    t = pyvips.Image.text(text, dpi=300, font='DejaVu Sans Bold')
+    t = _text(text, bold=True)
     ink = np.ndarray(buffer=t.cast('uchar').write_to_memory(), dtype=np.uint8, shape=(t.height, t.width)) > 128
     used = np.flatnonzero(ink.any(axis=1))
     ink = ink[used[0] : used[-1] + 1]
@@ -6796,7 +6808,7 @@ def _folio_page(number: str = '123', attached: bool = False, w: int = 900, rule:
         y0, y1, x0, x1 = sc(y0, y1, x0, x1)
         a[y0:y1, x0:x1] = 20
     a[sc(300)[0] : sc(700)[0], sc(200)[0] : sc(640)[0]] = 90
-    t = pyvips.Image.text(number or '123', dpi=300, font='DejaVu Sans')
+    t = _text(number or '123')
     g = 255 - np.ndarray(buffer=t.cast('uchar').write_to_memory(), dtype=np.uint8, shape=(t.height, t.width))
     top = int(h * (1.0 - folio.BAND))
     y = top + 2 if attached else top + int(h * folio.BAND * 0.45)
@@ -7143,7 +7155,7 @@ def check_strip_folio() -> None:
         if white:
             a_[bh_ - 120 :, :] = 0
         if number:
-            t = pyvips.Image.text(number, dpi=480, font='DejaVu Sans Bold')
+            t = _text(number, dpi=480, bold=True)
             g_ = np.ndarray(buffer=t.cast('uchar').write_to_memory(), dtype=np.uint8, shape=(t.height, t.width))
             y_, x_ = bh_ - 10 - t.height, (bw_ - t.width) // 2
             region = a_[y_ : y_ + t.height, x_ : x_ + t.width]
@@ -7185,7 +7197,7 @@ def check_strip_folio() -> None:
         a_[wh - 110 :, :] = ground
         if stripes is not None:
             a_[wh - 110 :: 2, :] = stripes
-        t = pyvips.Image.text('123', dpi=300, font='DejaVu Sans')
+        t = _text('123')
         g_ = np.ndarray(buffer=t.cast('uchar').write_to_memory(), dtype=np.uint8, shape=(t.height, t.width))
         y_, x_ = wh - 70, (ww - t.width) // 2
         if number:
