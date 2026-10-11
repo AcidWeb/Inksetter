@@ -5,6 +5,7 @@ HTTP surface.
 import os
 import re
 import time
+import socket
 import asyncio
 import logging
 import tempfile
@@ -14,7 +15,7 @@ import collections
 import contextlib
 import importlib.resources
 from email.message import Message
-from urllib.parse import unquote, urljoin, urlsplit
+from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
 from fastapi import FastAPI, Request
 from fastapi.responses import (
     HTMLResponse,
@@ -162,9 +163,41 @@ async def logo():
     )
 
 
+LOOPBACK = frozenset({'localhost', '127.0.0.1', '::1'})
+CONTAINER_MARKS = ('/.dockerenv', '/run/.containerenv')
+ROUTE_PROBE = ('192.0.2.1', 9)
+
+
+def _lan_address() -> str:
+    if any(os.path.exists(mark) for mark in CONTAINER_MARKS):
+        return ''
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(ROUTE_PROBE)
+            address = probe.getsockname()[0]
+    except OSError:
+        return ''
+    return '' if address.startswith('127.') or address == '0.0.0.0' else address
+
+
+def _for_readers(base: str) -> str:
+    if settings.public_base:
+        return base
+    parts = urlsplit(base)
+    host = parts.hostname or ''
+    if host not in LOOPBACK and not host.endswith('.localhost'):
+        return base
+    lan = _lan_address()
+    if not lan:
+        return base
+    netloc = f'{lan}:{parts.port}' if parts.port else lan
+    return urlunsplit(parts._replace(netloc=netloc)).rstrip('/')
+
+
 @app.api_route('/', methods=['GET', 'HEAD'], response_class=HTMLResponse)
 async def index(request: Request):
-    return web.index(_public_base(request), sorted(profiles.PROFILES.items()))
+    base = _public_base(request)
+    return web.index(base, sorted(profiles.PROFILES.items()), _for_readers(base))
 
 
 def _upstream_host() -> str:

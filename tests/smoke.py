@@ -8652,6 +8652,93 @@ async def check_landing_groups(c) -> None:
     )
 
 
+def _catalog_urls(html: str) -> list[str]:
+    return re.findall(r'<code>([^<]*)/catalog</code>', html)
+
+
+async def check_reachable_urls(c) -> None:
+    lan = '192.168.1.20'
+    unset = dataclasses.replace(app_mod.settings, public_base='')
+
+    async def landing(host: str, address: str = lan, settings=unset) -> str:
+        with (
+            mock.patch.object(app_mod, 'settings', settings),
+            mock.patch.object(app_mod, '_lan_address', lambda: address),
+        ):
+            return (await c.get('/', headers={'host': host})).text
+
+    for host in ('localhost:8080', '127.0.0.1:8080', '[::1]:8080', 'inksetter.localhost:8080'):
+        home = await landing(host)
+        urls = _catalog_urls(home)
+        check(
+            f'opened as {host}, the catalog URLs carry the network address instead',
+            urls and all(u.startswith(f'http://{lan}:8080/') for u in urls),
+            urls[0] if urls else 'no catalog URLs',
+        )
+        check(
+            f'while the links on the page stay on {host}, which this browser reaches',
+            f'href="http://{host}/kobo-clara-hd-2e-bw/browse"' in home and f'href="http://{host}/status"' in home,
+        )
+
+    home = await landing('localhost')
+    check(
+        'a default port stays left out',
+        _catalog_urls(home) and all(u.startswith(f'http://{lan}/') for u in _catalog_urls(home)),
+        f'{_catalog_urls(home)[:1]}',
+    )
+    for host in ('192.168.1.5:8080', 'nas.lan:8080'):
+        home = await landing(host)
+        check(
+            f'opened as {host}, the URLs are left as they came',
+            all(u.startswith(f'http://{host}/') for u in _catalog_urls(home)),
+            f'{_catalog_urls(home)[:1]}',
+        )
+    home = await landing('localhost:8080', settings=dataclasses.replace(unset, public_base='http://localhost:9000'))
+    check(
+        'PUBLIC_BASE wins over the network address, even when it names localhost',
+        all(u.startswith('http://localhost:9000/') for u in _catalog_urls(home)),
+        f'{_catalog_urls(home)[:1]}',
+    )
+    home = await landing('localhost:8080', address='')
+    check(
+        'with no network address to offer, the URLs stay on localhost',
+        all(u.startswith('http://localhost:8080/') for u in _catalog_urls(home)),
+    )
+
+    found = app_mod._lan_address()
+    check(
+        'the address found on this machine is a dotted IPv4 one that is not loopback, or none',
+        found == '' or (re.fullmatch(r'\d{1,3}(\.\d{1,3}){3}', found) and not found.startswith('127.')),
+        found,
+    )
+    mark = pathlib.Path(TMP) / 'dockerenv'
+    mark.write_text('')
+    with mock.patch.object(app_mod, 'CONTAINER_MARKS', (str(mark),)):
+        check('inside a container, which cannot know the host address, there is none', app_mod._lan_address() == '')
+    sent: list = []
+
+    class Probe:
+        def __init__(self, *_a):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+        def connect(self, target):
+            sent.append(target)
+
+        def getsockname(self):
+            return ('127.0.1.1', 5)
+
+    fake = mock.Mock(socket=Probe, AF_INET=socket.AF_INET, SOCK_DGRAM=socket.SOCK_DGRAM)
+    with mock.patch.object(app_mod, 'socket', fake), mock.patch.object(app_mod, 'CONTAINER_MARKS', ()):
+        check('a loopback answer is no address', app_mod._lan_address() == '')
+    check('the probe asks after a documentation address, which nothing answers', sent == [('192.0.2.1', 9)], f'{sent}')
+
+
 def check_progress_script() -> None:
     p = profiles.PROFILES['kobo-clara-hd-2e-bw']
     item = web.Item(title='V1', href='/kobo-clara-hd-2e-bw/dl/tok', cover=None, note='', download=True)
@@ -9419,6 +9506,7 @@ async def main() -> int:
         await check_logo(c)
         check_grid_columns()
         await check_landing_groups(c)
+        await check_reachable_urls(c)
 
         print('download progress')
         check_repack_progress()
