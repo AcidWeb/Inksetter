@@ -8939,6 +8939,14 @@ async def main() -> int:
         check('SSRF blocked', r.status_code == 403)
         r = await c.get('/healthz')
         check('healthz', r.status_code == 200)
+        health = r.json()
+        pyproject = (pathlib.Path(entry.__file__).parents[1] / 'pyproject.toml').read_text(encoding='utf-8')
+        version = tomllib.loads(pyproject)['project']['version']
+        check('healthz names the app', health.get('name') == 'Inksetter', str(health.get('name')))
+        check('healthz carries the pyproject version', health.get('version') == version, f'{health.get("version")}')
+        for path in ('/openapi.json', '/docs', '/redoc'):
+            r = await c.get(path)
+            check(f'{path} is not served', r.status_code == 404, f'status={r.status_code}')
 
         print('regressions')
 

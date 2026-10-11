@@ -20,7 +20,7 @@ from fastapi.responses import (
     StreamingResponse,
 )
 
-from . import kavita, logs, web
+from . import __version__, kavita, logs, web
 from .cache import DiskCache, Prefetcher, render_key
 from .imaging import cbz, profiles
 from .imaging.pipeline import RenderFailed, UnreadableImage, render_page
@@ -88,7 +88,7 @@ async def lifespan(app: FastAPI):  # noqa: ARG001 - signature fixed by FastAPI
         await client.stop()
 
 
-app = FastAPI(title='Inksetter', lifespan=lifespan, docs_url=None, redoc_url=None)
+app = FastAPI(lifespan=lifespan, openapi_url=None)
 
 
 def _profile_or_404(name: str) -> Profile:
@@ -139,7 +139,7 @@ async def _feed_error(request: Request, exc: rewrite.FeedError):
 
 @app.api_route('/healthz', methods=['GET', 'HEAD'])
 async def healthz():
-    return {'ok': True, 'profiles': sorted(profiles.PROFILES)}
+    return {'name': 'Inksetter', 'version': __version__, 'ok': True, 'profiles': sorted(profiles.PROFILES)}
 
 
 LOGO_BYTES = importlib.resources.files(__package__).joinpath(web.LOGO).read_bytes()
