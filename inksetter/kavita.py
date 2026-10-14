@@ -8,7 +8,7 @@ import time
 import httpx
 import asyncio
 import logging
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 from xml.sax.saxutils import escape
 
 from .settings import settings
@@ -23,6 +23,8 @@ _OPDS_KEY = re.compile(r'/api/opds/([^/?#]+)', re.I)
 _STREAM = re.compile(r'/api/opds/[^/?#]+/image$', re.I)
 # Kavita saves every streamed page as reading progress, except to an agent starting with "Panels".
 UNREAD_AGENT = 'Panels (Inksetter read-ahead)'
+LOOKUP_PATH = '/api/opds/inksetter/image'
+LOOKUP_TOKEN = 'inksetter'
 _AGE = {
     1: 'Rating Pending',
     2: 'Early Childhood',
@@ -157,6 +159,18 @@ class _Kavita:
             self._token = resp.json().get('token')
             self._token_at = time.monotonic()
             return self._token
+
+    async def ask(self, path: str, params: dict) -> httpx.Response | None:
+        token, resp = await self._auth(), None
+        for _ in range(2):
+            if not token:
+                break
+            head = {'Authorization': f'Bearer {token}'}
+            resp = await client.request('GET', f'{self.base()}{path}', params=params, headers=head)
+            if resp.status_code != 401:
+                break
+            token = await self._auth(stale=token)
+        return resp
 
     async def _fetch(self, sid: int, token: str) -> dict | None:
         head = {'Authorization': f'Bearer {token}'}
@@ -339,6 +353,27 @@ def streams(url: str) -> bool:
 
 def unread(headers: dict[str, str]) -> dict[str, str]:
     return {**headers, 'user-agent': UNREAD_AGENT}
+
+
+def chapter_of(url: str) -> int | None:
+    if not streams(url):
+        return None
+    found = parse_qs(urlsplit(url).query).get('chapterId', [''])[0]
+    return int(found) if found.isdecimal() and len(found) < 10 else None
+
+
+def lookup_shape(url: str) -> tuple[str, str]:
+    chapter = chapter_of(url)
+    return ('', '') if chapter is None else (LOOKUP_PATH, f'chapterId={chapter}&')
+
+
+async def progress(chapter: int) -> httpx.Response | None:
+    if not _kavita.base():
+        raise UpstreamError(404, 'progress lookup needs a Kavita upstream')
+    try:
+        return await _kavita.ask('/api/Reader/get-progress', {'chapterId': chapter})
+    except Exception:
+        raise UpstreamError(502, 'Kavita did not answer the progress lookup') from None
 
 
 class _Reading:

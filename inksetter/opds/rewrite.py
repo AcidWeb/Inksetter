@@ -75,6 +75,12 @@ def _secret() -> str:
     return kavita.api_key()
 
 
+def _lookup_shape(url: str) -> tuple[str, str]:
+    from .. import kavita
+
+    return kavita.lookup_shape(url)
+
+
 def encode_token(url: str, cover: str | None = None) -> str:
     raw = f'{url}\n{cover}' if cover else url
     secret = _secret()
@@ -210,7 +216,8 @@ def map_href(
 
     if kind == 'p':
         pages = f'&count={count}' if count > 0 else ''
-        return f'{prefix}/p/{token}?page={{pageNumber}}&maxWidth={{maxWidth}}{pages}'
+        path, lead = _lookup_shape(target)
+        return f'{prefix}/p/{token}{path}?{lead}page={{pageNumber}}&maxWidth={{maxWidth}}{pages}'
     if kind == 's':
         if search_style == 'opds2':
             return f'{prefix}/s/{token}?query={{query}}'

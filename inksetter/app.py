@@ -388,6 +388,7 @@ def _query_int(raw: str) -> int:
 
 
 @app.api_route('/{profile}/p/{token}', methods=['GET', 'HEAD'])
+@app.api_route(f'/{{profile}}/p/{{token}}{kavita.LOOKUP_PATH}', methods=['GET', 'HEAD'])
 async def page(profile: str, token: str, request: Request, page: str = '0', maxWidth: str = '0', count: str = '0'):
     p = _profile_or_404(profile)
     _refuse_stream(p)
@@ -425,6 +426,28 @@ async def _prefetch(url: str, p: Profile, max_width: int | None, headers: dict[s
     with contextlib.suppress(Exception):
         if not await asyncio.to_thread(cache.has, key):
             await _render_cached(url, p, max_width, headers, 'ahead')
+
+
+def _stream_chapter(profile: str, token: str) -> int:
+    _refuse_stream(_profile_or_404(profile))
+    chapter = kavita.chapter_of(rewrite.decode_token(token))
+    if chapter is None:
+        raise UpstreamError(404, 'not a Kavita page stream')
+    return chapter
+
+
+@app.post('/{profile}/p/{token}/api/Plugin/authenticate')
+async def stream_sign_in(profile: str, token: str):
+    _stream_chapter(profile, token)
+    return JSONResponse({'token': kavita.LOOKUP_TOKEN, 'refreshToken': kavita.LOOKUP_TOKEN})
+
+
+@app.get('/{profile}/p/{token}/api/Reader/get-progress')
+async def stream_progress(profile: str, token: str):
+    resp = await kavita.progress(_stream_chapter(profile, token))
+    if resp is None:
+        raise UpstreamError(502, 'Kavita refused the progress lookup')
+    return _relay(resp)
 
 
 @app.api_route('/{profile}/pf/{token}', methods=['GET', 'HEAD'])

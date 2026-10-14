@@ -527,6 +527,18 @@ def _kv_library(libraryId: int, authorization: str = Header(default='')):
     return 0
 
 
+@upstream.get('/api/Reader/get-progress')
+def _kv_progress(chapterId: int, authorization: str = Header(default='')):
+    KAVITA_API['asked'].append(('progress', chapterId))
+    if authorization != _KAVITA_JWT:
+        return Response(status_code=401)
+    held = [n for ch, n in KAVITA_STREAM['saved'] if ch == chapterId]
+    ids = {'volumeId': 3, 'chapterId': chapterId, 'pageNum': held[-1], 'seriesId': 2, 'libraryId': 1} if held else {}
+    body = ids or {'volumeId': 0, 'chapterId': chapterId, 'pageNum': 0, 'seriesId': 0, 'libraryId': 0}
+    shown = {**body, 'bookScrollId': None, 'lastModifiedUtc': '2026-10-14T10:00:00Z'}
+    return Response(json.dumps(shown, separators=(',', ':')), media_type='application/json')
+
+
 @upstream.get('/api/Series/{sid:int}')
 def _kv_series(sid: int, authorization: str = Header(default='')):
     KAVITA_API['asked'].append(('series', sid))
@@ -9027,6 +9039,90 @@ async def check_kavita_stream(c) -> None:
     )
 
 
+async def _koreader_last_page(c, link: str) -> int | None:
+    try:
+        chapter = re.search(r'chapterId=([0-9A-Za-z]+)', link).group(1)
+        key = re.search(r'opds/(.+)/image', link).group(1)
+        base = re.search(r'(.+)/api', link).group(1)
+        auth = await c.post(f'{base}/api/Plugin/authenticate?apiKey={key}&pluginName=KOReader-OPDS')
+        if auth.status_code != 200:
+            return 0
+        bearer = re.search(r'"token":"(.+)","refresh', auth.text[:2048]).group(1)
+        asked = f'{base}/api/Reader/get-progress?chapterId={chapter}'
+        progress = await c.get(asked, headers={'Authorization': f'Bearer {bearer}'})
+    except AttributeError:
+        return 0
+    if progress.status_code != 200:
+        return 0
+    found = re.search(r'"pageNum":(.+),"seriesId', progress.text[:2048])
+    return int(found.group(1)) if found and found.group(1).isdecimal() else None
+
+
+async def check_kavita_resume(c) -> None:
+    from inksetter import kavita
+
+    up = 'http://127.0.0.1:8899'
+    prof = 'kobo-clara-hd-2e-bw'
+    keyed = f'{up}/api/opds/{SEAL_KEY}'
+    reader = 'KOReader/2025.10 (https://koreader.rocks/) LuaSocket/3.1.0'
+
+    def stream_link() -> str:
+        body = (
+            '<feed xmlns="http://www.w3.org/2005/Atom" xmlns:pse="http://vaemendis.net/opds-pse/ns"><entry>'
+            f'<link rel="{PSE_REL}" type="image/jpeg" pse:count="6" href="/api/opds/{SEAL_KEY}/image?libraryId=1'
+            '&amp;seriesId=2&amp;volumeId=3&amp;chapterId=41&amp;pageNumber={pageNumber}"/></entry></feed>'
+        )
+        out = rewrite.rewrite_atom(body.encode(), rewrite.Ctx(prof, 'http://proxy.test', f'{keyed}/series/2'), None)
+        return re.search(rb'href="([^"]*)"', out).group(1).decode().replace('&amp;', '&')
+
+    KAVITA_STREAM.update(fetched=[], saved=[], lag=0.0)
+    plain = stream_link()
+    check(
+        'without a Kavita catalog a stream link keeps its plain shape',
+        '/api/' not in plain.partition('?')[0] and 'chapterId' not in plain,
+        plain,
+    )
+    with _catalog(kavita, keyed), mock.patch.object(kavita, '_kavita', kavita._Kavita()):
+        link = stream_link()
+        check('premise: the stream link carries no key', SEAL_KEY not in link, link)
+        first = await _koreader_last_page(c, link)
+        check(
+            "KOReader's lookup of a chapter never opened finds page 0, so a Page stream opens on the first page",
+            first == 0,
+            f'{first}',
+        )
+        r = await c.get(link.replace('{pageNumber}', '3').replace('{maxWidth}', '1072'), headers={'user-agent': reader})
+        await _prefetch_settled()
+        check(
+            'the stream link serves its pages, and Kavita hears of the one read',
+            r.status_code == 200
+            and r.headers.get('content-type') == 'image/png'
+            and KAVITA_STREAM['saved'] == [(41, 3)],
+            f'status={r.status_code} {KAVITA_STREAM["saved"]}',
+        )
+        found = await _koreader_last_page(c, link)
+        check(
+            "KOReader's own lookup through the link finds the page read last, so a plain Page stream opens on it",
+            found == 3,
+            f'{found}',
+        )
+        kavita._kavita._token, kavita._kavita._token_at = 'lapsed', time.monotonic()
+        again = await _koreader_last_page(c, link)
+        check('a sign-in Kavita has let lapse is renewed for the lookup', again == 3, f'{again}')
+        other = encode_token(f'{up}/opds/v1.2/books/7/pages/{{pageNumber}}')
+        r = await c.post(f'/{prof}/p/{other}/api/Plugin/authenticate?apiKey=x&pluginName=KOReader-OPDS')
+        check('a stream that is not a Kavita one has no lookup', r.status_code == 404, f'status={r.status_code}')
+    with _catalog(kavita, f'{up}/api/opds/WrongKey'), mock.patch.object(kavita, '_kavita', kavita._Kavita()):
+        refused = await _koreader_last_page(c, link)
+    check(
+        'a Kavita that refuses Inksetter leaves KOReader on the first page, not with an answer it cannot read',
+        refused == 0,
+        f'{refused}',
+    )
+    found = await _koreader_last_page(c, plain)
+    check("and KOReader's lookup finds nothing in a plain link, as before", found == 0, f'{found}')
+
+
 def _koreader_md5(data: bytes) -> str:
     import hashlib
 
@@ -10162,6 +10258,7 @@ async def main() -> int:
         await check_kosync(c)
         await check_kavita_redirect()
         await check_kavita_stream(c)
+        await check_kavita_resume(c)
 
         print('cache trim')
         await check_trim_aside(c)
