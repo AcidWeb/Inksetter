@@ -15,6 +15,7 @@ ATOM = 'http://www.w3.org/2005/Atom'
 OSD_NS = 'http://a9.com/-/spec/opensearch/1.1/'
 
 PSE_REL = 'http://vaemendis.net/opds-pse/stream'
+PSE_COUNT = '{http://vaemendis.net/opds-pse/ns}count'
 IMAGE_RELS = {
     'http://opds-spec.org/image',
     'http://opds-spec.org/image/thumbnail',
@@ -186,6 +187,7 @@ def map_href(
     ctx: Ctx,
     search_style: str = 'opensearch',
     cover: str | None = None,
+    count: int = 0,
 ) -> str:
     if not href:
         return href
@@ -207,7 +209,8 @@ def map_href(
     prefix = f'{ctx.public_base}/{quote(ctx.profile)}'
 
     if kind == 'p':
-        return f'{prefix}/p/{token}?page={{pageNumber}}&maxWidth={{maxWidth}}'
+        pages = f'&count={count}' if count > 0 else ''
+        return f'{prefix}/p/{token}?page={{pageNumber}}&maxWidth={{maxWidth}}{pages}'
     if kind == 's':
         if search_style == 'opds2':
             return f'{prefix}/s/{token}?query={{query}}'
@@ -251,7 +254,9 @@ def _rewrite_link(link, ctx: Ctx, page_mime: str | None, cover: str | None) -> N
     if not href:
         return
     kind = classify(link.get('rel'), link.get('type'), href)
-    link.set('href', map_href(href, kind, ctx, cover=cover))
+    count = (link.get(PSE_COUNT) or '').strip()
+    pages = int(count) if count.isdecimal() and len(count) < 10 else 0
+    link.set('href', map_href(href, kind, ctx, cover=cover, count=pages))
     if kind == 'p' and page_mime:
         link.set('type', page_mime)
 

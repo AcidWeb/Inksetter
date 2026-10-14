@@ -388,23 +388,31 @@ def _query_int(raw: str) -> int:
 
 
 @app.api_route('/{profile}/p/{token}', methods=['GET', 'HEAD'])
-async def page(profile: str, token: str, request: Request, page: str = '0', maxWidth: str = '0'):
+async def page(profile: str, token: str, request: Request, page: str = '0', maxWidth: str = '0', count: str = '0'):
     p = _profile_or_404(profile)
     _refuse_stream(p)
     template = rewrite.decode_token(token)
     headers = request_headers(request.headers)
     page_no = _query_int(page)
     max_width = _query_int(maxWidth)
+    pages = _query_int(count)
+    told = kavita.streams(template)
+    fetch = kavita.unread(headers) if told else headers
 
     def build(n: int) -> str:
         return template.replace('{pageNumber}', str(n)).replace('{maxWidth}', str(max(p.width, max_width) or ''))
 
-    blob, ctype = await _render_cached(build(page_no), p, max_width or None, headers)
+    blob, ctype = await _render_cached(build(page_no), p, max_width or None, fetch)
+    if told and request.method == 'GET':
+        lane = kavita.reading.note(template, build(page_no), headers)
+        if lane is not None:
+            prefetcher.spawn(lane)
 
-    for n in range(page_no + 1, page_no + 1 + settings.prefetch):
+    ahead = page_no + 1 + settings.prefetch
+    for n in range(page_no + 1, min(ahead, pages) if pages else ahead):
         url = build(n)
         key = render_key(url, p, max_width or None, _credentials(headers))
-        prefetcher.spawn(_prefetch(url, p, max_width or None, headers, key), key)
+        prefetcher.spawn(_prefetch(url, p, max_width or None, fetch, key), key)
 
     return Response(
         blob,

@@ -1,22 +1,28 @@
 """
 Kavita specific features.
-ComicInfo.xml generator, cover parser and the KOReader progress sync relay.
+ComicInfo.xml generator, cover parser, the KOReader progress sync relay and reading progress of streamed pages.
 """
 
 import re
 import time
 import httpx
 import asyncio
+import logging
 from urllib.parse import urlsplit
 from xml.sax.saxutils import escape
 
 from .settings import settings
 from .opds.upstream import UpstreamError, client
 
+log = logging.getLogger(__name__)
+
 _UNSET = '-100000'
 _UNSET_DATE = '0001-01-01T00:00:00'
 _IDS = re.compile(r'/series/(\d+)(?:/volume/(\d+))?(?:/chapter/(\d+))?', re.I)
 _OPDS_KEY = re.compile(r'/api/opds/([^/?#]+)', re.I)
+_STREAM = re.compile(r'/api/opds/[^/?#]+/image$', re.I)
+# Kavita saves every streamed page as reading progress, except to an agent starting with "Panels".
+UNREAD_AGENT = 'Panels (Inksetter read-ahead)'
 _AGE = {
     1: 'Rating Pending',
     2: 'Early Childhood',
@@ -320,6 +326,45 @@ async def for_download(url: str):
         return render(data, number, sizes)
 
     return build
+
+
+def streams(url: str) -> bool:
+    if not api_key():
+        return False
+    try:
+        return bool(_STREAM.search(urlsplit(url).path))
+    except ValueError:
+        return False
+
+
+def unread(headers: dict[str, str]) -> dict[str, str]:
+    return {**headers, 'user-agent': UNREAD_AGENT}
+
+
+class _Reading:
+    def __init__(self) -> None:
+        self._next: dict[str, tuple[str, dict[str, str]]] = {}
+        self._busy: set[str] = set()
+
+    def note(self, stream: str, url: str, headers: dict[str, str]):
+        self._next[stream] = (url, headers)
+        if stream in self._busy:
+            return None
+        self._busy.add(stream)
+        return self._tell(stream)
+
+    async def _tell(self, stream: str) -> None:
+        try:
+            while (job := self._next.pop(stream, None)) is not None:
+                try:
+                    await client.get(*job)
+                except Exception as exc:
+                    log.debug('Kavita did not take the page read as progress: %s', exc)
+        finally:
+            self._busy.discard(stream)
+
+
+reading = _Reading()
 
 
 async def sync(method: str, path: str, body: dict | None = None) -> httpx.Response:

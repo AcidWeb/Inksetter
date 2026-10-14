@@ -158,15 +158,17 @@ class Prefetcher:
         self._seen: set[str] = set()
         self._tasks: set[asyncio.Task] = set()
 
-    def spawn(self, coro, dedup_key: str) -> None:
-        if dedup_key in self._seen:
-            coro.close()
-            return
-        self._seen.add(dedup_key)
+    def spawn(self, coro, dedup_key: str | None = None) -> None:
+        if dedup_key is not None:
+            if dedup_key in self._seen:
+                coro.close()
+                return
+            self._seen.add(dedup_key)
         task = asyncio.create_task(coro)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
-        task.add_done_callback(lambda _: self._seen.discard(dedup_key))
+        if dedup_key is not None:
+            task.add_done_callback(lambda _: self._seen.discard(dedup_key))
 
     async def drain(self) -> None:
         tasks = [t for t in self._tasks if not t.done()]

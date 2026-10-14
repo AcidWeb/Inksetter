@@ -681,6 +681,28 @@ def _kavita_like_feed(key: str):
     return Response(body, media_type='application/atom+xml;profile=opds-catalog')
 
 
+KAVITA_STREAM: dict = {'pages': 6, 'fetched': [], 'saved': [], 'lag': 0.0}
+
+
+@upstream.get('/api/opds/{key}/image')
+async def _kavita_stream(
+    key: str, request: Request, chapterId: int = 0, pageNumber: int = 0, saveProgress: bool = True
+):
+    if key != SEAL_KEY:
+        return Response('unknown key', status_code=401)
+    if pageNumber < 0:
+        return Response('negative page', status_code=400)
+    agent = request.headers.get('user-agent', '')
+    KAVITA_STREAM['fetched'].append((chapterId, pageNumber, agent))
+    total = KAVITA_STREAM['pages']
+    blob = fake_page(min(pageNumber, total - 1))
+    if not agent.lower().startswith('panels') or not saveProgress:
+        offset = 1 if agent.lower().startswith('koreader') and total - pageNumber < 2 else 0
+        await asyncio.sleep(KAVITA_STREAM['lag'] * max(0, total - pageNumber))
+        KAVITA_STREAM['saved'].append((chapterId, pageNumber + offset))
+    return Response(blob, media_type='image/jpeg')
+
+
 @upstream.get('/api/opds/{key}/odd/{shape}')
 def _kavita_odd(key: str, shape: str):
     feed = _kavita_like_feed(key).body.decode()
@@ -8876,6 +8898,135 @@ async def check_kavita_redirect() -> None:
     check('so the download takes its cover from Kavita', bool(cover) and 'volumeId=265' in cover, f'{cover}')
 
 
+async def check_kavita_stream(c) -> None:
+    from inksetter import kavita
+
+    up = 'http://127.0.0.1:8899'
+    prof = 'kobo-clara-hd-2e-bw'
+    reader = 'KOReader/2025.10 (https://koreader.rocks/) LuaSocket/3.1.0'
+    total = KAVITA_STREAM['pages']
+
+    def linked(attrs: str) -> str:
+        body = (
+            '<feed xmlns="http://www.w3.org/2005/Atom" xmlns:pse="http://vaemendis.net/opds-pse/ns"><entry>'
+            f'<link rel="{PSE_REL}" type="image/jpeg" href="/b/{{pageNumber}}" {attrs}/></entry></feed>'
+        )
+        try:
+            out = rewrite.rewrite_atom(body.encode(), rewrite.Ctx(prof, 'http://proxy.test', f'{up}/x'), None)
+        except Exception as exc:
+            return f'escaped: {type(exc).__name__}'
+        found = re.search(rb'href="([^"]*)"', out)
+        return found.group(1).decode().replace('&amp;', '&') if found else ''
+
+    check(
+        "a stream link carries the book's page count",
+        linked('pse:count="7"').endswith('?page={pageNumber}&maxWidth={maxWidth}&count=7'),
+        linked('pse:count="7"'),
+    )
+    for label, attrs in (
+        ('none', ''),
+        ('no number', 'pse:count="seven"'),
+        ('nought', 'pse:count="0"'),
+        ('thousands of digits long', f'pse:count="{"9" * 5000}"'),
+    ):
+        got = linked(attrs)
+        check(f'and none when the count is {label}', got.endswith('&maxWidth={maxWidth}'), got)
+    feed = (await c.get(f'/{prof}/catalog')).text
+    check('the catalog passes its count on', re.search(r'/p/[\w-]+\?page=[^"]*&amp;count=3"', feed) is not None)
+
+    def stream(chapter: int) -> str:
+        return encode_token(
+            f'{up}/api/opds/{SEAL_KEY}/image?libraryId=1&seriesId=2&volumeId=3'
+            f'&chapterId={chapter}&pageNumber={{pageNumber}}'
+        )
+
+    async def read(tok: str, page: int, method: str = 'GET') -> int | str:
+        params = {'page': str(page), 'maxWidth': '1072', 'count': str(total)}
+        try:
+            r = await c.request(method, f'/{prof}/p/{tok}', params=params, headers={'user-agent': reader})
+        except Exception as exc:
+            return f'escaped: {type(exc).__name__}'
+        await _prefetch_settled()
+        return r.status_code
+
+    def fetched(chapter: int) -> list:
+        return sorted((n, agent) for ch, n, agent in KAVITA_STREAM['fetched'] if ch == chapter)
+
+    def saved(chapter: int) -> list:
+        return [n for ch, n in KAVITA_STREAM['saved'] if ch == chapter]
+
+    KAVITA_STREAM.update(fetched=[], saved=[], lag=0.0)
+    first = await read(stream(1), total - 3)
+    check(
+        "premise: without a Kavita catalog the pages read ahead go with the reader's own agent, as they always did",
+        first == 200 and fetched(1) == [(n, reader) for n in range(total - 3, total)],
+        f'{fetched(1)}',
+    )
+    await read(stream(1), total - 1)
+    check(
+        'nothing past the last page is read ahead',
+        max(n for n, _ in fetched(1)) == total - 1,
+        f'{sorted({n for n, _ in fetched(1)})}',
+    )
+
+    with _catalog(kavita, f'{up}/api/opds/{SEAL_KEY}'):
+        KAVITA_STREAM.update(fetched=[], saved=[])
+        tok = stream(2)
+        status = await read(tok, 0)
+        unread = kavita.UNREAD_AGENT
+        check(
+            'from Kavita, Inksetter fetches every page as an agent Kavita does not count,'
+            " and tells it of the page read with the reader's own",
+            status == 200 and fetched(2) == sorted([(0, unread), (0, reader), (1, unread), (2, unread)]),
+            f'{fetched(2)}',
+        )
+        check('so Kavita saves the page read and nothing read ahead', saved(2) == [0], f'{saved(2)}')
+        await read(tok, 1)
+        check(
+            'a page read ahead is served from the cache, and Kavita still hears of it',
+            saved(2) == [0, 1] and fetched(2).count((1, unread)) == 1,
+            f'{saved(2)}, {fetched(2)}',
+        )
+        await read(tok, 0)
+        check('turning back is heard too', saved(2) == [0, 1, 0], f'{saved(2)}')
+        await read(tok, total - 1)
+        check(
+            "the last page goes with the reader's agent, so Kavita marks the chapter read as it would",
+            saved(2)[-1:] == [total],
+            f'{saved(2)}',
+        )
+        check('and nothing past it is fetched', max(n for n, _ in fetched(2)) == total - 1)
+        heard = len(saved(2))
+        await read(tok, 2, 'HEAD')
+        check('a HEAD is not reading', len(saved(2)) == heard, f'{saved(2)}')
+
+    tok = stream(3)
+    for n in range(5):
+        await read(tok, n)
+    with _catalog(kavita, f'{up}/api/opds/{SEAL_KEY}'):
+        lag = 0.15
+        KAVITA_STREAM.update(fetched=[], saved=[], lag=lag)
+        turns = []
+        for n in range(5):
+            params = {'page': str(n), 'maxWidth': '1072', 'count': str(total)}
+            await c.get(f'/{prof}/p/{tok}', params=params, headers={'user-agent': reader})
+            turns.append(time.monotonic())
+        await _prefetch_settled()
+        KAVITA_STREAM['lag'] = 0.0
+    gaps = [b - a for a, b in itertools.pairwise(turns)]
+    check(
+        'premise: every page turned was in the cache, and came sooner after the last than Kavita answers one more page',
+        fetched(3) and all(agent == reader for _, agent in fetched(3)) and max(gaps) < lag,
+        f'{[round(g * 1000) for g in gaps]} ms',
+    )
+    order = saved(3)
+    check(
+        'pages turned faster than Kavita answers reach it in the order they were read, the last one last',
+        order and order == sorted(order) and order[-1] == 4,
+        f'{order}',
+    )
+
+
 def _koreader_md5(data: bytes) -> str:
     import hashlib
 
@@ -10010,6 +10161,7 @@ async def main() -> int:
         print('progress sync')
         await check_kosync(c)
         await check_kavita_redirect()
+        await check_kavita_stream(c)
 
         print('cache trim')
         await check_trim_aside(c)
