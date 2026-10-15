@@ -48,7 +48,7 @@ Currently, if the proxy uses Kavita as the OPDS source, three additional feature
 
 * When client download the CBZ file book cover defined at the Kavita level takes priority and will be added to file if it isn’t there already.
 * If archive is missing `ComicInfo.xml` file it will be generated using Kavita metadata and injected to output.
-* Reading progress of downloaded CBZ files can be synced with Kavita through KOReader [progress sync](https://wiki.kavitareader.com/guides/3rdparty/koreader/#setting-up-progress-synchronization). Point KOReader to the Inksetter endpoint `/kosync` instead of `<kavita>/api/koreader/<your-api-token>`.
+* Reading progress of downloaded CBZ files can be synced with Kavita through KOReader [progress sync](https://wiki.kavitareader.com/guides/3rdparty/koreader/#setting-up-progress-synchronization). Point KOReader to the Inksetter endpoint `/kosync` instead of `<kavita>/api/koreader/<your-api-token>`. To translate progress between the processed file and the original, the proxy remembers every downloaded file in its cache directory. Keep it: books downloaded before it is wiped will no longer sync.
 
 ## Current limitations
 
@@ -74,6 +74,10 @@ Potential solutions to the above problems:
 * Using smaller CBZ files as input.
 * Setting environment variable `OCR_ENABLED` to `0`. This will disable part of the pipeline responsible for removing the page number from the bottom of the page and will speed up the process considerably.
 * Moving to OPDS server that support HTTP range requests that allow to stream CBZ file from source and process bigger files **way more** efficiently.
+
+## Feature requests
+
+I'm very open to potential feature requests. In particular, improvements for OPDS servers other than Kavita. Please feel free to open tickets about this.
 
 ## Security
 

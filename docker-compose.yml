@@ -4,6 +4,7 @@ services:
     ports:
       - "8080:8080"
     volumes:
+      # Rendered pages, and the records KOReader progress sync needs for files already downloaded.
       - cache:/cache
     environment:
       # URL of source OPDS server.
