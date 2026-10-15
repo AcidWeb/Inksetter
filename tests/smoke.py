@@ -5623,12 +5623,13 @@ def check_strip_decode_ahead() -> None:
         f'{len(serial)} pages one at a time, {len(ahead)} ahead, same: {ahead == serial}',
     )
 
-    lock, now, most, where = threading.Lock(), [0], [0], set()
+    lock, now, most, where, begun = threading.Lock(), [0], [0], set(), [0]
     real_rows = webtoon._strip_rows
 
     def slow(blob, q, width=None):
         with lock:
             now[0] += 1
+            begun[0] += 1
             most[0] = max(most[0], now[0])
             where.add(threading.current_thread().name)
         time.sleep(0.05)
@@ -5638,7 +5639,7 @@ def check_strip_decode_ahead() -> None:
             with lock:
                 now[0] -= 1
 
-    pulled, added, gap = [0], [0], [0]
+    pulled, added, gap, decoding = [0], [0], [0], [0]
     real_add = webtoon._Held.add
 
     def counted(entries):
@@ -5649,6 +5650,8 @@ def check_strip_decode_ahead() -> None:
     def add(self, a):
         added[0] += 1
         gap[0] = max(gap[0], pulled[0] - added[0])
+        time.sleep(0.1)
+        decoding[0] = max(decoding[0], begun[0] - added[0])
         return real_add(self, a)
 
     with mock.patch.object(webtoon, '_strip_rows', slow), mock.patch.object(webtoon._Held, 'add', add):
@@ -5660,8 +5663,13 @@ def check_strip_decode_ahead() -> None:
         f'at most {most[0]} at once, on {sorted(where)}',
     )
     check(
-        'and never more than four entries ahead of the cutter',
-        0 < gap[0] <= 4,
+        'and, with the cutter the slower, never more than four slices decoded ahead of it',
+        2 <= decoding[0] <= 4,
+        f'at most {decoding[0]} slices decoded ahead of the rows the cutter took',
+    )
+    check(
+        'while the archive is read at most seven entries ahead, the eight read for the strip width bar the first',
+        0 < gap[0] <= 7,
         f'at most {gap[0]} entries read ahead of the rows the cutter took',
     )
 
@@ -6205,9 +6213,31 @@ def check_strip_scale_max() -> None:
     except Exception as exc:
         mixed, err = [], repr(exc)
     check(
-        'slices of another width are fitted to the strip the first slice set',
+        'slices of another width are fitted to the strip the most common slice width sets',
         bool(mixed) and all(abs(artwork(a)[1] - 800) <= 4 for a in mixed),
         err or f'{sorted({artwork(a) for a in mixed})}',
+    )
+
+    def opened_by(head: np.ndarray, width: int) -> list[tuple[int, int]]:
+        body = [rng.integers(0, 256, (600, width, 3), np.uint8) for _ in range(4)]
+        try:
+            return sorted({artwork(a) for a in cut(_archive_of(head, *body), p)})
+        except Exception as exc:
+            return [(-1, repr(exc))]
+
+    logo = rng.integers(0, 256, (200, 300, 3), np.uint8)
+    spans = opened_by(logo, 800)
+    check(
+        'a narrow logo ahead of the slices does not narrow the strip: every page still fills the panel',
+        bool(spans) and all(w >= p.width - 4 for _, w in spans),
+        f'(left, width) {spans}',
+    )
+    jacket = rng.integers(0, 256, (300, 1000, 3), np.uint8)
+    spans = opened_by(jacket, 400)
+    check(
+        'nor does a wide cover ahead of them lift the cap: the strip stays at the slices enlarged by the cap',
+        bool(spans) and all(abs(w - 800) <= 4 for _, w in spans),
+        f'(left, width) {spans}',
     )
 
     key = cache_mod.render_key('http://x/p/1', p, None)

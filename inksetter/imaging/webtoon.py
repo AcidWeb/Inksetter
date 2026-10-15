@@ -8,6 +8,7 @@ import math
 import bisect
 import logging
 import functools
+import itertools
 import collections
 import dataclasses
 import concurrent.futures
@@ -42,17 +43,24 @@ STRIP_PLAN_REACH = 8.00
 STRIP_LETTERING = 0.025
 STRIP_READ_ROWS = 736
 STRIP_DECODE_THREADS = 2
+STRIP_WIDTH_SAMPLE = 8
 STRIP_FILL_BLANK = 0.40
 STRIP_FILL_FLOOR = 0.90
 STRIP_FILL_READ = 0.08
 
 
-def _strip_width(blob: bytes, p: Profile) -> int | None:
+def _slice_width(blob: bytes) -> int | None:
     try:
-        width = pipeline.open_image(blob).autorot().width
+        return pipeline.open_image(blob).autorot().width
     except Exception:
         return None
-    return min(p.width, round(width * p.strip_scale_max))
+
+
+def _strip_width(blobs: list[bytes], p: Profile) -> int | None:
+    widths = collections.Counter(w for w in map(_slice_width, blobs) if w)
+    if not widths:
+        return None
+    return min(p.width, round(widths.most_common(1)[0][0] * p.strip_scale_max))
 
 
 def _strip_rows(blob: bytes, p: Profile, width: int | None = None) -> np.ndarray | None:
@@ -73,28 +81,26 @@ def _strip_rows(blob: bytes, p: Profile, width: int | None = None) -> np.ndarray
 
 
 def _decoded(entries, p: Profile):
-    width = None
-
-    def strip_width(blob: bytes) -> int:
-        nonlocal width
-        if width is None:
-            width = _strip_width(blob, p)
-        return width or p.width
+    source, sample, pages = iter(entries), [], 0
+    while pages < STRIP_WIDTH_SAMPLE and (entry := next(source, None)) is not None:
+        sample.append(entry)
+        pages += entry[0] == 'page'
+    width = _strip_width([entry[3] for entry in sample if entry[0] == 'page'], p) or p.width
+    source = itertools.chain(sample, source)
 
     if STRIP_DECODE_THREADS <= 0:
-        for entry in entries:
-            yield entry, _strip_rows(entry[3], p, strip_width(entry[3])) if entry[0] == 'page' else None
+        for entry in source:
+            yield entry, _strip_rows(entry[3], p, width) if entry[0] == 'page' else None
         return
     pool = concurrent.futures.ThreadPoolExecutor(STRIP_DECODE_THREADS, thread_name_prefix='strip-decode')
     ahead = collections.deque()
-    source = iter(entries)
     try:
         while True:
             while len(ahead) < 2 * STRIP_DECODE_THREADS:
                 entry = next(source, None)
                 if entry is None:
                     break
-                rows = pool.submit(_strip_rows, entry[3], p, strip_width(entry[3])) if entry[0] == 'page' else None
+                rows = pool.submit(_strip_rows, entry[3], p, width) if entry[0] == 'page' else None
                 ahead.append((entry, rows))
             if not ahead:
                 return
