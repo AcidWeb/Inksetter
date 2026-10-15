@@ -41,7 +41,7 @@ profiles.use_folio(settings.ocr_enabled)
 
 def _redact(text: str) -> str:
     key = kavita.api_key()
-    return text.replace(key, '\u2026') if key else text
+    return re.sub(re.escape(key), '\u2026', text, flags=re.I) if key else text
 
 
 board = status.Board(_redact)
@@ -133,6 +133,7 @@ def _ctx(request: Request, profile: str, upstream_url: str) -> rewrite.Ctx:
 
 
 def _error(request: Request, status: int, detail: str, headers: dict[str, str] | None = None) -> Response:
+    detail = _redact(detail)
     if 'text/html' in request.headers.get('accept', ''):
         body = web.error(status, detail, _public_base(request))
         return HTMLResponse(body, status_code=status, headers=headers)
@@ -745,6 +746,8 @@ def _page_number(value) -> int | None:
 
 
 def _relay(resp) -> Response:
+    if resp.status_code >= 500:
+        raise UpstreamError(502, f'Kavita is failing: status {resp.status_code}')
     return Response(resp.content, status_code=resp.status_code, media_type=resp.headers.get('content-type'))
 
 

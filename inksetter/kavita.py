@@ -392,7 +392,7 @@ class _Reading:
         try:
             while (job := self._next.pop(stream, None)) is not None:
                 try:
-                    await client.get(*job)
+                    await client.drain(*job)
                 except Exception as exc:
                     log.debug('Kavita did not take the page read as progress: %s', exc)
         finally:

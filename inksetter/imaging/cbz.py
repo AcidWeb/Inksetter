@@ -19,7 +19,33 @@ from .. import cores
 log = logging.getLogger(__name__)
 
 DEFAULT_PAGE_WORKERS = cores.page_workers()
-IMAGE_SUFFIXES = ('.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.avif', '.jxl')
+MUPDF_SUFFIXES = (
+    '.bmp',
+    '.gif',
+    '.hdp',
+    '.j2k',
+    '.jb2',
+    '.jbig2',
+    '.jp2',
+    '.jpeg',
+    '.jpg',
+    '.jpx',
+    '.jxr',
+    '.pam',
+    '.pbm',
+    '.pgm',
+    '.pkm',
+    '.png',
+    '.pnm',
+    '.ppm',
+    '.psd',
+    '.tif',
+    '.tiff',
+    '.wdp',
+    '.webp',
+)
+IMAGE_SUFFIXES = (*MUPDF_SUFFIXES, '.avif', '.jxl')
+JUNK_NAMES = frozenset({'__macosx', 'thumbs.db', 'ehthumbs.db', 'desktop.ini'})
 
 
 _NUM = re.compile(r'(\d+)')
@@ -36,6 +62,11 @@ def natural_key(name: str):
 def is_image(name: str) -> bool:
     lower = name.lower()
     return lower.endswith(IMAGE_SUFFIXES) and not lower.split('/')[-1].startswith('.')
+
+
+def is_junk(name: str) -> bool:
+    parts = [part for part in re.split(r'[\\/]', name.lower()) if part not in ('', '.', '..')]
+    return any(part.startswith('.') or part in JUNK_NAMES for part in parts)
 
 
 def _suffix_for(blob: bytes, fallback_name: str) -> str:
@@ -197,13 +228,15 @@ def repack_iter(
     sources: list[int] | None = None,
 ):
     zin = zipfile.ZipFile(src)
-    infos = sorted((i for i in zin.infolist() if not i.is_dir()), key=lambda i: natural_key(i.filename))
+    files = [i for i in zin.infolist() if not i.is_dir()]
+    infos = sorted((i for i in files if not is_junk(i.filename)), key=lambda i: natural_key(i.filename))
     declared = sum(i.file_size for i in infos)
     images = sum(1 for i in infos if is_image(i.filename))
     log.info(
-        'repack: %d entries, %d image(s), %.0f MB declared, %d worker(s)',
+        'repack: %d entries, %d image(s), %d system file(s) left out, %.0f MB declared, %d worker(s)',
         len(infos),
         images,
+        len(files) - len(infos),
         declared / 1e6,
         workers,
     )

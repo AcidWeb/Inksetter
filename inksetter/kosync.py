@@ -76,7 +76,10 @@ def to_source(pages: list[int], page: int) -> int:
 def from_source(pages: list[int], page: int) -> int:
     if not pages:
         return page
-    return min(bisect.bisect_left(pages, page) + 1, len(pages))
+    at = bisect.bisect_left(pages, page)
+    if at < len(pages) and pages[at] == page:
+        return at + 1
+    return max(at, 1)
 
 
 def page_for(record: dict, source: int) -> int:

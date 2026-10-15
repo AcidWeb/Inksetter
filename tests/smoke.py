@@ -12,6 +12,7 @@ import base64
 import contextlib
 import asyncio
 import gzip
+import functools
 import inspect
 import io
 import itertools
@@ -443,13 +444,15 @@ def _file():
     )
 
 
-KOSYNC: dict = {'files': {}, 'progress': {}, 'calls': []}
+KOSYNC: dict = {'files': {}, 'progress': {}, 'calls': [], 'failing': 0}
 
 
 @upstream.get('/api/koreader/{key}/users/auth')
 def _ko_auth(key: str):
     if key != SEAL_KEY:
         return Response(status_code=401)
+    if KOSYNC['failing']:
+        return Response('Kavita is restarting', status_code=KOSYNC['failing'], media_type='text/plain')
     return {'username': 'reader'}
 
 
@@ -457,6 +460,8 @@ def _ko_auth(key: str):
 async def _ko_push(key: str, request: Request):
     if key != SEAL_KEY:
         return Response(status_code=401)
+    if KOSYNC['failing']:
+        return Response('Kavita is restarting', status_code=KOSYNC['failing'], media_type='text/plain')
     body = await request.json()
     KOSYNC['calls'].append(('PUT', body))
     doc = str(body.get('document', '')).upper()
@@ -470,6 +475,8 @@ async def _ko_push(key: str, request: Request):
 def _ko_pull(key: str, doc: str):
     if key != SEAL_KEY:
         return Response(status_code=401)
+    if KOSYNC['failing']:
+        return Response('Kavita is restarting', status_code=KOSYNC['failing'], media_type='text/plain')
     KOSYNC['calls'].append(('GET', doc))
     pages = KOSYNC['files'].get(doc.upper())
     if pages is None:
@@ -532,6 +539,8 @@ def _kv_progress(chapterId: int, authorization: str = Header(default='')):
     KAVITA_API['asked'].append(('progress', chapterId))
     if authorization != _KAVITA_JWT:
         return Response(status_code=401)
+    if chapterId == 503:
+        return Response('Kavita is starting up', status_code=503)
     held = [n for ch, n in KAVITA_STREAM['saved'] if ch == chapterId]
     ids = {'volumeId': 3, 'chapterId': chapterId, 'pageNum': held[-1], 'seriesId': 2, 'libraryId': 1} if held else {}
     body = ids or {'volumeId': 0, 'chapterId': chapterId, 'pageNum': 0, 'seriesId': 0, 'libraryId': 0}
@@ -693,7 +702,8 @@ def _kavita_like_feed(key: str):
     return Response(body, media_type='application/atom+xml;profile=opds-catalog')
 
 
-KAVITA_STREAM: dict = {'pages': 6, 'fetched': [], 'saved': [], 'lag': 0.0}
+KAVITA_STREAM: dict = {'pages': 6, 'fetched': [], 'saved': [], 'lag': 0.0, 'gate': threading.Event()}
+KAVITA_STREAM['gate'].set()
 
 
 @upstream.get('/api/opds/{key}/image')
@@ -710,7 +720,9 @@ async def _kavita_stream(
     blob = fake_page(min(pageNumber, total - 1))
     if not agent.lower().startswith('panels') or not saveProgress:
         offset = 1 if agent.lower().startswith('koreader') and total - pageNumber < 2 else 0
-        await asyncio.sleep(KAVITA_STREAM['lag'] * max(0, total - pageNumber))
+        delay = KAVITA_STREAM['lag'] * max(0, total - pageNumber)
+        await asyncio.to_thread(KAVITA_STREAM['gate'].wait, 30)
+        await asyncio.sleep(delay)
         KAVITA_STREAM['saved'].append((chapterId, pageNumber + offset))
     return Response(blob, media_type='image/jpeg')
 
@@ -7825,6 +7837,62 @@ async def check_security(c) -> None:
         r = await c.get(f'/kobo-clara-hd-2e-bw/f/{old}')
         check('a token issued before sealing still works', r.status_code == 200, f'status={r.status_code}')
 
+        cover = f'{up}/api/opds/{SEAL_KEY}/image?seriesId=1&apiKey={SEAL_KEY}'
+        try:
+            back = rewrite.decode_token(encode_token(cover))
+        except rewrite.TokenError as exc:
+            back = f'refused: {exc}'
+        check(
+            'the key goes back into a path after /api/opds/ and into an apiKey parameter, where Kavita puts it',
+            back == cover,
+            back,
+        )
+
+        def crafted(raw: str) -> str:
+            return base64.urlsafe_b64encode(raw.encode()).decode().rstrip('=')
+
+        def shows_key(r) -> bool:
+            seen = f'{r.text} {dict(r.headers)}'.lower()
+            return SEAL_KEY.lower() in seen
+
+        r = await c.get(f'/kobo-clara-hd-2e-bw/f/{encode_token(f"{up}/opds/v1.2/series?search=echo-me")}')
+        check('premise: the upstream echoes a search term into its feed', 'hits:echo-me' in r.text)
+        bait = {
+            'as the host': crafted('http://~key~/'),
+            'in the user part': crafted('http://~key~@127.0.0.1:8899/api/opds/~key~/feed'),
+            'in a search the upstream echoes': crafted(f'{up}/opds/v1.2/series?search=~key~'),
+            'in a path of its own': crafted(f'{up}/opds/~key~/feed'),
+            'glued to a host-like tail': crafted(f'{up}/api/opds/~key~.example/feed'),
+            'after a host named like the API path': crafted('http://api/opds/~key~/feed'),
+        }
+        routes = ('f', 's', 'osd', 'b', 'bs', 'p', 'pf', 'img', 'dl')
+        for where, tok in bait.items():
+            got = []
+            for route in routes:
+                r = await _get(c, f'/kobo-clara-hd-2e-bw/{route}/{tok}', params={'q': 'x'})
+                got.append((route, r.status_code, shows_key(r)))
+            r = await _get(c, f'/kobo-clara-hd-2e-bw/p/{tok}/api/Reader/get-progress')
+            got.append(('lookup', r.status_code, shows_key(r)))
+            check(
+                f'a token with the key marker {where} is refused on every route, and none shows the key',
+                all(status == 400 and not shown for _, status, shown in got),
+                f'{[g for g in got if g[1] != 400 or g[2]]}',
+            )
+
+        with mock.patch.object(rewrite, '_unseal', lambda url, secret: url.replace('~key~', secret)):
+            r = await _get(c, f'/kobo-clara-hd-2e-bw/f/{bait["as the host"]}')
+            page = await _get(c, f'/kobo-clara-hd-2e-bw/f/{bait["as the host"]}', headers={'accept': 'text/html'})
+        check(
+            'premise: with the key put back anywhere, the host error would name it, lower-cased',
+            r.status_code == 403 and 'host not allowed: …' in r.text,
+            f'status={r.status_code} {r.text[:60]}',
+        )
+        check(
+            'even then no error answer carries the key, in JSON or as a page, in any case',
+            not shows_key(r) and not shows_key(page),
+            f'{r.text[:80]} / {page.status_code}',
+        )
+
         b = await c.get(f'/kobo-clara-hd-2e-bw/b/{start}')
         crumbs = re.findall(r'[?&](?:amp;)?t=([\w-]+)', b.text)
         inside = [_raw_token(t) for t in re.findall(r'/kobo-clara-hd-2e-bw/\w+/([\w-]+)', b.text)]
@@ -8993,11 +9061,56 @@ async def check_kavita_stream(c) -> None:
             f'{fetched(2)}',
         )
         check('so Kavita saves the page read and nothing read ahead', saved(2) == [0], f'{saved(2)}')
-        await read(tok, 1)
+        whole, aread, hops, hop = [], httpx.Response.aread, [], asyncio.to_thread
+
+        async def spy(resp):
+            whole.append(str(resp.url))
+            return await aread(resp)
+
+        def hopped(func, /, *args, **kwargs):
+            frame, lane = sys._getframe(1), False
+            while frame is not None:
+                lane = lane or frame.f_globals.get('__name__') == kavita.__name__
+                frame = frame.f_back
+            hops.append((getattr(func, '__name__', ''), lane))
+            return hop(func, *args, **kwargs)
+
+        gathered, chunker = [], httpx._models.ByteChunker
+
+        class Gathering(chunker):
+            def __init__(self, chunk_size=None):
+                frame = sys._getframe(1)
+                while frame is not None and frame.f_globals.get('__name__') != kavita.__name__:
+                    frame = frame.f_back
+                if frame is not None:
+                    gathered.append(chunk_size)
+                super().__init__(chunk_size=chunk_size)
+
+        with (
+            mock.patch.object(httpx.Response, 'aread', spy),
+            mock.patch.object(asyncio, 'to_thread', hopped),
+            mock.patch.object(httpx._models, 'ByteChunker', Gathering),
+        ):
+            await read(tok, 1)
         check(
             'a page read ahead is served from the cache, and Kavita still hears of it',
             saved(2) == [0, 1] and fetched(2).count((1, unread)) == 1,
             f'{saved(2)}, {fetched(2)}',
+        )
+        check(
+            'without Inksetter holding the page it tells Kavita of in memory',
+            not [u for u in whole if 'chapterId=2&' in u and u.endswith('pageNumber=1')],
+            f'{whole}',
+        )
+        check(
+            'or a thread for each piece of it',
+            ('get', False) in hops and not [name for name, lane in hops if lane],
+            f'{hops}',
+        )
+        check(
+            'nor gathers it into pieces bigger than the network handed over',
+            gathered and not any(gathered),
+            f'chunk sizes {gathered}',
         )
         await read(tok, 0)
         check('turning back is heard too', saved(2) == [0, 1, 0], f'{saved(2)}')
@@ -9016,20 +9129,25 @@ async def check_kavita_stream(c) -> None:
     for n in range(5):
         await read(tok, n)
     with _catalog(kavita, f'{up}/api/opds/{SEAL_KEY}'):
-        lag = 0.15
-        KAVITA_STREAM.update(fetched=[], saved=[], lag=lag)
-        turns = []
-        for n in range(5):
-            params = {'page': str(n), 'maxWidth': '1072', 'count': str(total)}
-            await c.get(f'/{prof}/p/{tok}', params=params, headers={'user-agent': reader})
-            turns.append(time.monotonic())
-        await _prefetch_settled()
-        KAVITA_STREAM['lag'] = 0.0
-    gaps = [b - a for a, b in itertools.pairwise(turns)]
+        KAVITA_STREAM.update(fetched=[], saved=[], lag=0.15)
+        KAVITA_STREAM['gate'].clear()
+        waiting = None
+        try:
+            for n in range(5):
+                params = {'page': str(n), 'maxWidth': '1072', 'count': str(total)}
+                await c.get(f'/{prof}/p/{tok}', params=params, headers={'user-agent': reader})
+                asked = time.monotonic() + 10
+                while n == 0 and not fetched(3) and time.monotonic() < asked:
+                    await asyncio.sleep(0.02)
+            waiting = fetched(3)
+        finally:
+            KAVITA_STREAM['gate'].set()
+            await _prefetch_settled()
+            KAVITA_STREAM['lag'] = 0.0
     check(
-        'premise: every page turned was in the cache, and came sooner after the last than Kavita answers one more page',
-        fetched(3) and all(agent == reader for _, agent in fetched(3)) and max(gaps) < lag,
-        f'{[round(g * 1000) for g in gaps]} ms',
+        'premise: every page turned was in the cache, and the rest were turned while Kavita still held the first',
+        fetched(3) and all(agent == reader for _, agent in fetched(3)) and waiting and waiting[0] == (0, reader),
+        f'{waiting}',
     )
     order = saved(3)
     check(
@@ -9066,11 +9184,11 @@ async def check_kavita_resume(c) -> None:
     keyed = f'{up}/api/opds/{SEAL_KEY}'
     reader = 'KOReader/2025.10 (https://koreader.rocks/) LuaSocket/3.1.0'
 
-    def stream_link() -> str:
+    def stream_link(chapter: int = 41) -> str:
         body = (
             '<feed xmlns="http://www.w3.org/2005/Atom" xmlns:pse="http://vaemendis.net/opds-pse/ns"><entry>'
             f'<link rel="{PSE_REL}" type="image/jpeg" pse:count="6" href="/api/opds/{SEAL_KEY}/image?libraryId=1'
-            '&amp;seriesId=2&amp;volumeId=3&amp;chapterId=41&amp;pageNumber={pageNumber}"/></entry></feed>'
+            f'&amp;seriesId=2&amp;volumeId=3&amp;chapterId={chapter}&amp;pageNumber={{pageNumber}}"/></entry></feed>'
         )
         out = rewrite.rewrite_atom(body.encode(), rewrite.Ctx(prof, 'http://proxy.test', f'{keyed}/series/2'), None)
         return re.search(rb'href="([^"]*)"', out).group(1).decode().replace('&amp;', '&')
@@ -9109,6 +9227,13 @@ async def check_kavita_resume(c) -> None:
         kavita._kavita._token, kavita._kavita._token_at = 'lapsed', time.monotonic()
         again = await _koreader_last_page(c, link)
         check('a sign-in Kavita has let lapse is renewed for the lookup', again == 3, f'{again}')
+        failing = re.search(r'(.+)/api', stream_link(503)).group(1)
+        try:
+            r = await c.get(f'{failing}/api/Reader/get-progress?chapterId=503', headers={'Authorization': 'Bearer x'})
+            status = r.status_code
+        except Exception as exc:
+            status = f'escaped: {type(exc).__name__}'
+        check("a Kavita failing the lookup is Inksetter's 502, not its own 5xx", status == 502, f'status={status}')
         other = encode_token(f'{up}/opds/v1.2/books/7/pages/{{pageNumber}}')
         r = await c.post(f'/{prof}/p/{other}/api/Plugin/authenticate?apiKey=x&pluginName=KOReader-OPDS')
         check('a stream that is not a Kavita one has no lookup', r.status_code == 404, f'status={r.status_code}')
@@ -9138,6 +9263,89 @@ def _koreader_md5(data: bytes) -> str:
 def _page_names(blob: bytes) -> list[str]:
     z = zipfile.ZipFile(io.BytesIO(blob))
     return [n for n in z.namelist() if n.lower().endswith(_PAGE_SUFFIXES)]
+
+
+_MUPDF_PAGES = frozenset(
+    '.bmp .gif .hdp .j2k .jb2 .jbig2 .jp2 .jpeg .jpg .jpx .jxr .pam .pbm .pgm .pkm .png .pnm .ppm .psd .tif .tiff .wdp'
+    ' .webp'.split()
+)
+
+
+def _mupdf_order(a: str, b: str) -> int:
+    s, t = a.encode(), b.encode()
+    i = j = 0
+    while i < len(s) or j < len(t):
+        c, d = (s[i] if i < len(s) else 0), (t[j] if j < len(t) else 0)
+        if 48 <= c <= 57 and 48 <= d <= 57:
+            x = y = 0
+            while i < len(s) and 48 <= s[i] <= 57:
+                x, i = x * 10 + s[i] - 48, i + 1
+            while j < len(t) and 48 <= t[j] <= 57:
+                y, j = y * 10 + t[j] - 48, j + 1
+        else:
+            x, y = (c - 32 if 97 <= c <= 122 else c), (d - 32 if 97 <= d <= 122 else d)
+            i, j = i + 1, j + 1
+        if x != y:
+            return -1 if x < y else 1
+    return 0
+
+
+def _reader_pages(blob: bytes) -> list[str]:
+    names = zipfile.ZipFile(io.BytesIO(blob)).namelist()
+    pages = [n for n in names if '.' in n and n[n.rfind('.') :].lower() in _MUPDF_PAGES]
+    return sorted(pages, key=functools.cmp_to_key(_mupdf_order))
+
+
+def check_junk_entries() -> None:
+    p = profiles.PROFILES['kobo-clara-hd-2e-bw']
+    apple = b'\x00\x05\x16\x07\x00\x02\x00\x00Mac OS X        ' + bytes(64)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w') as z:
+        z.writestr('001.jpg', fake_page(0))
+        z.writestr('002.tif', pyvips.Image.new_from_buffer(fake_page(1), '').tiffsave_buffer())
+        z.writestr('./003.jpg', fake_page(2))
+        z.writestr('._001.jpg', apple)
+        z.writestr('__MACOSX/._002.tif', apple)
+        z.writestr('__MACOSX/Vol/._003.jpg', apple)
+        z.writestr('.thumbs/001.jpg', fake_page(0))
+        z.writestr('.DS_Store', b'\x00\x00\x00\x01Bud1')
+        z.writestr('Thumbs.db', b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1')
+        z.writestr('Vol/desktop.ini', b'[.ShellClassInfo]\r\n')
+        z.writestr('notes.txt', b'scanned by someone')
+    src = buf.getvalue()
+    shown = _reader_pages(src)
+    check(
+        'premise: as the archive came, MuPDF counts its junk among the pages, some of it ahead of page 1',
+        len(shown) == 7 and shown.index('._001.jpg') < shown.index('001.jpg'),
+        f'{shown}',
+    )
+    sources: list[int] = []
+    out = b''.join(cbz.repack_iter(io.BytesIO(src), p, 2, sources=sources))
+    names = sorted(zipfile.ZipFile(io.BytesIO(out)).namelist())
+    check(
+        'macOS and Windows system files are left out of a download',
+        names == ['0001.png', '0002.png', '0003.png', 'notes.txt'],
+        f'{names}',
+    )
+    check(
+        'so the pages KOReader shows are the pages written, the TIFF one rendered among them, in order',
+        _reader_pages(out) == ['0001.png', '0002.png', '0003.png'],
+        f'{_reader_pages(out)}',
+    )
+    check('and progress sync counts the same pages', sources == [1, 2, 3], f'{sources}')
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w') as z:
+        z.writestr('001.jpg', fake_page(0))
+        z.writestr('002.psd', b'8BPS\x00\x01' + bytes(40))
+        z.writestr('003.jpg', fake_page(2))
+    kept: list[int] = []
+    out = b''.join(cbz.repack_iter(io.BytesIO(buf.getvalue()), p, 2, sources=kept))
+    check(
+        'a page in a format only the reader opens keeps its place and its number',
+        _reader_pages(out) == ['0001.png', '0002.psd', '0003.png'] and kept == [1, 2, 3],
+        f'{_reader_pages(out)} {kept}',
+    )
 
 
 async def check_kosync(c) -> None:
@@ -9188,6 +9396,13 @@ async def check_kosync(c) -> None:
         'a webtoon page maps to the slice it starts in, and a slice to its first page',
         [kosync.to_source(cut, k) for k in range(1, 7)] == [1, 1, 1, 2, 2, 3]
         and [kosync.from_source(cut, s) for s in (1, 2, 3)] == [1, 4, 6],
+    )
+    gappy = [0, 1, 1, 3, 3, 5]
+    landed = [kosync.from_source(gappy, s) for s in (2, 4)], kosync.from_source([1, 2, 3], 0)
+    check(
+        'a slice that starts no page of its own comes back as the page it lies on, not the one after it',
+        landed == ([3, 5], 1),
+        f'{landed}',
     )
     check(
         'a page pushed from this file comes back as itself, not the first page of its slice',
@@ -9293,6 +9508,31 @@ async def check_kosync(c) -> None:
         check("and Kavita's refusal reaches KOReader as it was", r.status_code == 400 and r.text == 'file-missing')
         r = await c.get(f'/kosync/syncs/progress/{stranger}')
         check('a pull about one is passed on too', r.status_code == 400 and KOSYNC['calls'][-1] == ('GET', stranger))
+
+        failing = []
+        KOSYNC['failing'] = 503
+        try:
+            for label, attempt in (
+                ('login', lambda: c.get('/kosync/users/auth')),
+                ('a push about a download', lambda: c.put('/kosync/syncs/progress', json=push)),
+                (
+                    'a push about another book',
+                    lambda: c.put('/kosync/syncs/progress', json={**push, 'document': stranger}),
+                ),
+                ('a pull', lambda: c.get(f'/kosync/syncs/progress/{h1}')),
+            ):
+                try:
+                    status = (await attempt()).status_code
+                except Exception as exc:
+                    status = f'escaped: {type(exc).__name__}'
+                failing.append((label, status))
+        finally:
+            KOSYNC['failing'] = 0
+        check(
+            "a Kavita failing the sync is Inksetter's 502, not its own 5xx, on every route",
+            all(status == 502 for _, status in failing),
+            f'{failing}',
+        )
 
         with _catalog(kavita, f'{up}/moved/api/opds/{SEAL_KEY}'):
             r = await c.get('/kosync/users/auth')
@@ -10273,6 +10513,7 @@ async def main() -> int:
         io.BytesIO(b''.join(cbz.repack_iter(io.BytesIO(_cbz_bytes(2)), profiles.PROFILES['kobo-clara-hd-2e-bw'])))
     )
     check('png4 repack still names pages .png', all(n.endswith('.png') for n in zf4.namelist() if n[0].isdigit()))
+    check_junk_entries()
 
     bomb = io.BytesIO()
     with zipfile.ZipFile(bomb, 'w', zipfile.ZIP_DEFLATED) as z:

@@ -58,6 +58,7 @@ SAME_RESOURCE_KEYS = ('alternate',)
 SEARCH_VARIABLES = frozenset({'searchTerms', 'query', 'search'})
 GENERIC_TYPES = frozenset({'', 'text/plain', 'application/octet-stream', 'binary/octet-stream'})
 _SEAL = '~key~'
+_KEY_SPOTS = re.compile(r'(?<=/api/opds/)~key~(?=[/?#]|$)|(?<=[?&]apikey=)~key~(?=[&#]|$)', re.I)
 EXPRESSION = re.compile(r'\{([?&]?)([^{}]*)\}')
 
 
@@ -105,12 +106,25 @@ def decode_parts(token: str) -> tuple[str, str | None]:
     except ValueError as exc:
         raise TokenError(f'malformed token: {token[:24]}') from exc
     secret = _secret()
-    if secret:
-        raw = raw.replace(_SEAL, secret)
     url, _, cover = raw.partition('\n')
-    if not _fetchable(url):
+    url, cover = _unseal(url, secret), _unseal(cover, secret)
+    if url is None or not _fetchable(url):
         raise TokenError(f'malformed token: {token[:24]}')
     return url, cover if cover and _fetchable(cover) else None
+
+
+def _unseal(url: str, secret: str) -> str | None:
+    if _SEAL not in url or not secret:
+        return url
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return None
+    head = f'{parts.scheme}://{parts.netloc}'
+    if url[: len(head)].lower() != head.lower():
+        return None
+    out = url[: len(head)] + _KEY_SPOTS.sub(secret, url[len(head) :])
+    return None if _SEAL in out else out
 
 
 def decode_token(token: str) -> str:

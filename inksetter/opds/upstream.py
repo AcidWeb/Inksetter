@@ -168,6 +168,11 @@ class Client:
                     await asyncio.to_thread(sink.write, chunk)
         return resp
 
+    async def drain(self, url: str, headers: dict[str, str]) -> None:
+        async with self._answer(url, headers) as resp:
+            async for _ in resp.aiter_raw():
+                pass
+
     async def request(self, method: str, url: str, **kwargs) -> httpx.Response:
         for _ in range(MAX_REDIRECTS + 1):
             check_host(url)
