@@ -1,6 +1,7 @@
 """
 Kavita specific features.
-ComicInfo.xml generator, cover parser, the KOReader progress sync relay and reading progress of streamed pages.
+ComicInfo.xml generator, cover parser, the KOReader progress sync relay, reading progress of streamed pages
+and the mirror of Kavita's own layout under each profile.
 """
 
 import re
@@ -8,11 +9,11 @@ import time
 import httpx
 import asyncio
 import logging
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import quote, urlsplit
 from xml.sax.saxutils import escape
 
 from .settings import settings
-from .opds.upstream import UpstreamError, client
+from .opds.upstream import UpstreamError, client, host_key
 
 log = logging.getLogger(__name__)
 
@@ -23,8 +24,11 @@ _OPDS_KEY = re.compile(r'/api/opds/([^/?#]+)', re.I)
 _STREAM = re.compile(r'/api/opds/[^/?#]+/image$', re.I)
 # Kavita saves every streamed page as reading progress, except to an agent starting with "Panels".
 UNREAD_AGENT = 'Panels (Inksetter read-ahead)'
-LOOKUP_PATH = '/api/opds/inksetter/image'
+MIRROR_KEY = 'inksetter'
 LOOKUP_TOKEN = 'inksetter'
+_PAGE = 'pageNumber={pageNumber}'
+_ADDED = ('maxWidth', 'count')
+_PATH_SAFE = "/!$&'()*+,;=:@"
 _AGE = {
     1: 'Rating Pending',
     2: 'Early Childhood',
@@ -87,6 +91,19 @@ def api_key() -> str:
     return m.group(1) if m else ''
 
 
+def opds_root() -> str:
+    catalog = settings.upstream_catalog or ''
+    cut = _OPDS_KEY.search(catalog)
+    return catalog[: cut.end()] if cut and urlsplit(catalog).netloc else ''
+
+
+def mirror_root() -> str:
+    root = opds_root()
+    if not root:
+        raise UpstreamError(404, 'not a Kavita catalog')
+    return root
+
+
 def series_id(url: str) -> int | None:
     m = _IDS.search(urlsplit(url).path)
     return int(m.group(1)) if m else None
@@ -140,9 +157,8 @@ class _Kavita:
         return lock
 
     def base(self) -> str:
-        catalog = settings.upstream_catalog or ''
-        cut = _OPDS_KEY.search(catalog)
-        return catalog[: cut.start()] if cut and urlsplit(catalog).netloc else ''
+        root = opds_root()
+        return root[: _OPDS_KEY.search(root).start()] if root else ''
 
     async def _auth(self, *, stale: str | None = None) -> str | None:
         async with self._auth_lock:
@@ -355,23 +371,50 @@ def unread(headers: dict[str, str]) -> dict[str, str]:
     return {**headers, 'user-agent': UNREAD_AGENT}
 
 
-def chapter_of(url: str) -> int | None:
-    if not streams(url):
+def mirror_link(url: str) -> str | None:
+    root = opds_root()
+    try:
+        parts = urlsplit(url)
+        here = bool(root) and parts.path == f'{urlsplit(root).path}/image' and host_key(url) == host_key(root)
+    except ValueError:
         return None
-    found = parse_qs(urlsplit(url).query).get('chapterId', [''])[0]
-    return int(found) if found.isdecimal() and len(found) < 10 else None
+    pairs = parts.query.split('&')
+    names = [pair.partition('=')[0] for pair in pairs]
+    whole = _PAGE in pairs and names.count('pageNumber') == 1 and parts.query.count('{') == parts.query.count('}') == 1
+    if not here or not whole or set(names) & set(_ADDED):
+        return None
+    return f'/api/opds/{MIRROR_KEY}/image?{parts.query}'
 
 
-def lookup_shape(url: str) -> tuple[str, str]:
-    chapter = chapter_of(url)
-    return ('', '') if chapter is None else (LOOKUP_PATH, f'chapterId={chapter}&')
+def unmirror(query: str) -> tuple[str, str]:
+    root = mirror_root()
+    kept, page = [], []
+    for pair in query.split('&'):
+        name, _, value = pair.partition('=')
+        if name == 'pageNumber':
+            page.append(value)
+            pair = _PAGE
+        if name not in _ADDED:
+            kept.append(pair)
+    if len(page) != 1:
+        raise UpstreamError(400, 'a page stream names its pageNumber once')
+    return f'{root}/image?{"&".join(kept)}', page[0]
 
 
-async def progress(chapter: int) -> httpx.Response | None:
+def mirror_feed(rest: str) -> str:
+    root = mirror_root()
+    if any(step in ('.', '..') or step.lower() == 'download' for step in rest.split('/')):
+        raise UpstreamError(404, f'not a feed: {rest[:40]}')
+    return f'{root}/{quote(rest, safe=_PATH_SAFE)}'
+
+
+async def progress(chapter: str) -> httpx.Response | None:
     if not _kavita.base():
         raise UpstreamError(404, 'progress lookup needs a Kavita upstream')
+    if not (chapter.isdecimal() and len(chapter) < 10):
+        raise UpstreamError(400, f'malformed chapterId: {chapter[:24]}')
     try:
-        return await _kavita.ask('/api/Reader/get-progress', {'chapterId': chapter})
+        return await _kavita.ask('/api/Reader/get-progress', {'chapterId': int(chapter)})
     except Exception:
         raise UpstreamError(502, 'Kavita did not answer the progress lookup') from None
 

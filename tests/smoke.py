@@ -727,6 +727,38 @@ async def _kavita_stream(
     return Response(blob, media_type='image/jpeg')
 
 
+@upstream.get('/api/opds/{key}/series/{sid}')
+def _kavita_series(key: str, sid: int, pageNumber: int = 1):
+    if key != SEAL_KEY:
+        return Response('unknown key', status_code=401)
+    entries = ''.join(
+        f'<entry><title>Chapter {ch}</title>'
+        f'<link rel="http://opds-spec.org/image" type="image/png" href="/api/image/chapter-cover?chapterId={ch}'
+        f'&amp;apiKey={key}"/>'
+        f'<link rel="{PSE_REL}" type="image/jpeg" p5:count="{KAVITA_STREAM["pages"]}" '
+        f'p5:lastRead="{([n for c, n in KAVITA_STREAM["saved"] if c == ch] or [0])[-1]}" '
+        f'href="/api/opds/{key}/image?libraryId=1&amp;seriesId={sid}&amp;volumeId=3&amp;chapterId={ch}'
+        '&amp;pageNumber={pageNumber}"/></entry>'
+        for ch in (41, 42)
+    )
+    body = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<feed xmlns="http://www.w3.org/2005/Atom" xmlns:p5="http://vaemendis.net/opds-pse/ns">'
+        f'<title>Series {sid}, page {pageNumber}</title>'
+        '<author><name>Kavita</name><uri>https://kavitareader.com</uri></author>'
+        f'<link rel="self" type="application/atom+xml;profile=opds-catalog" href="/api/opds/{key}/series/{sid}"/>'
+        f'{entries}</feed>'
+    )
+    return Response(body, media_type='application/atom+xml;profile=opds-catalog')
+
+
+@upstream.get('/api/opds/{key}/series/{sid}/volume/{vid}/chapter/{cid}/download/{name}')
+def _kavita_download(key: str):
+    if key != SEAL_KEY:
+        return Response('unknown key', status_code=401)
+    return Response(_cbz_bytes(1), media_type='application/zip')
+
+
 @upstream.get('/api/opds/{key}/odd/{shape}')
 def _kavita_odd(key: str, shape: str):
     feed = _kavita_like_feed(key).body.decode()
@@ -893,8 +925,12 @@ class _Escaped:
 
 
 async def _get(c, url: str, **kw):
+    return await _send(c, 'GET', url, **kw)
+
+
+async def _send(c, method: str, url: str, **kw):
     try:
-        return await c.get(url, **kw)
+        return await c.request(method, url, **kw)
     except Exception as exc:
         return _Escaped(exc)
 
@@ -7901,8 +7937,8 @@ async def check_security(c) -> None:
             for route in routes:
                 r = await _get(c, f'/kobo-clara-hd-2e-bw/{route}/{tok}', params={'q': 'x'})
                 got.append((route, r.status_code, shows_key(r)))
-            r = await _get(c, f'/kobo-clara-hd-2e-bw/p/{tok}/api/Reader/get-progress')
-            got.append(('lookup', r.status_code, shows_key(r)))
+            r = await _get(c, f'/kobo-clara-hd-2e-bw/p/{tok}/api/opds/inksetter/image', params={'page': '1'})
+            got.append(('p, Kavita-shaped', r.status_code, shows_key(r)))
             check(
                 f'a token with the key marker {where} is refused on every route, and none shows the key',
                 all(status == 400 and not shown for _, status, shown in got),
@@ -9211,8 +9247,9 @@ async def check_kavita_resume(c) -> None:
 
     up = 'http://127.0.0.1:8899'
     prof = 'kobo-clara-hd-2e-bw'
-    keyed = f'{up}/api/opds/{SEAL_KEY}'
+    keyed = f'{up}/api/opds/{SEAL_KEY}/feed'
     reader = 'KOReader/2025.10 (https://koreader.rocks/) LuaSocket/3.1.0'
+    query = 'libraryId=1&seriesId=2&volumeId=3&chapterId=41&pageNumber={pageNumber}'
 
     def stream_link(chapter: int = 41) -> str:
         body = (
@@ -9220,8 +9257,12 @@ async def check_kavita_resume(c) -> None:
             f'<link rel="{PSE_REL}" type="image/jpeg" pse:count="6" href="/api/opds/{SEAL_KEY}/image?libraryId=1'
             f'&amp;seriesId=2&amp;volumeId=3&amp;chapterId={chapter}&amp;pageNumber={{pageNumber}}"/></entry></feed>'
         )
-        out = rewrite.rewrite_atom(body.encode(), rewrite.Ctx(prof, 'http://proxy.test', f'{keyed}/series/2'), None)
+        ctx = rewrite.Ctx(prof, 'http://proxy.test', f'{up}/api/opds/{SEAL_KEY}/series/2')
+        out = rewrite.rewrite_atom(body.encode(), ctx, None)
         return re.search(rb'href="([^"]*)"', out).group(1).decode().replace('&amp;', '&')
+
+    def read_ahead() -> list:
+        return sorted(n for ch, n, agent in KAVITA_STREAM['fetched'] if ch == 41 and agent == kavita.UNREAD_AGENT)
 
     KAVITA_STREAM.update(fetched=[], saved=[], lag=0.0)
     plain = stream_link()
@@ -9230,9 +9271,16 @@ async def check_kavita_resume(c) -> None:
         '/api/' not in plain.partition('?')[0] and 'chapterId' not in plain,
         plain,
     )
-    with _catalog(kavita, keyed), mock.patch.object(kavita, '_kavita', kavita._Kavita()):
+    for method, route in (('POST', 'api/Plugin/authenticate'), ('GET', 'api/Reader/get-progress?chapterId=41')):
+        r = await _send(c, method, f'/{prof}/{route}')
+        check(f'and no {route.partition("?")[0]} answers for it', r.status_code == 404, f'status={r.status_code}')
+    with _catalog(kavita, keyed), _catalog(app_mod, keyed), mock.patch.object(kavita, '_kavita', kavita._Kavita()):
         link = stream_link()
-        check('premise: the stream link carries no key', SEAL_KEY not in link, link)
+        check(
+            "from Kavita a stream link is Kavita's own, its query whole, under the profile, with no key or token",
+            link == f'http://proxy.test/{prof}/api/opds/inksetter/image?{query}&maxWidth={{maxWidth}}&count=6',
+            link,
+        )
         first = await _koreader_last_page(c, link)
         check(
             "KOReader's lookup of a chapter never opened finds page 0, so a Page stream opens on the first page",
@@ -9248,6 +9296,15 @@ async def check_kavita_resume(c) -> None:
             and KAVITA_STREAM['saved'] == [(41, 3)],
             f'status={r.status_code} {KAVITA_STREAM["saved"]}',
         )
+        check('and it reads the pages after it ahead, up to the last', read_ahead() == [3, 4, 5], f'{read_ahead()}')
+        tok = encode_token(f'{up}/api/opds/{SEAL_KEY}/image?{query}')
+        r = await c.get(f'/{prof}/p/{tok}', params={'page': '3', 'maxWidth': '1072', 'count': '6'})
+        await _prefetch_settled()
+        check(
+            'it asks Kavita for exactly the URL the feed linked, so a token link to those pages finds them cached',
+            r.status_code == 200 and read_ahead() == [3, 4, 5],
+            f'status={r.status_code} {read_ahead()}',
+        )
         found = await _koreader_last_page(c, link)
         check(
             "KOReader's own lookup through the link finds the page read last, so a plain Page stream opens on it",
@@ -9257,16 +9314,22 @@ async def check_kavita_resume(c) -> None:
         kavita._kavita._token, kavita._kavita._token_at = 'lapsed', time.monotonic()
         again = await _koreader_last_page(c, link)
         check('a sign-in Kavita has let lapse is renewed for the lookup', again == 3, f'{again}')
-        failing = re.search(r'(.+)/api', stream_link(503)).group(1)
+        server = re.search(r'(.+)/api', stream_link(503))
+        failing = server.group(1) if server else f'http://proxy.test/{prof}'
         try:
             r = await c.get(f'{failing}/api/Reader/get-progress?chapterId=503', headers={'Authorization': 'Bearer x'})
             status = r.status_code
         except Exception as exc:
             status = f'escaped: {type(exc).__name__}'
         check("a Kavita failing the lookup is Inksetter's 502, not its own 5xx", status == 502, f'status={status}')
-        other = encode_token(f'{up}/opds/v1.2/books/7/pages/{{pageNumber}}')
-        r = await c.post(f'/{prof}/p/{other}/api/Plugin/authenticate?apiKey=x&pluginName=KOReader-OPDS')
-        check('a stream that is not a Kavita one has no lookup', r.status_code == 404, f'status={r.status_code}')
+        asked = len(KAVITA_API['asked'])
+        for chapter in ('4x1', '12345678901'):
+            r = await _get(c, f'{failing}/api/Reader/get-progress', params={'chapterId': chapter})
+            check(
+                f'a lookup of chapter {chapter!r} is refused without asking Kavita',
+                r.status_code == 400 and len(KAVITA_API['asked']) == asked,
+                f'status={r.status_code} {KAVITA_API["asked"][asked:]}',
+            )
     with _catalog(kavita, f'{up}/api/opds/WrongKey'), mock.patch.object(kavita, '_kavita', kavita._Kavita()):
         refused = await _koreader_last_page(c, link)
     check(
@@ -9276,6 +9339,275 @@ async def check_kavita_resume(c) -> None:
     )
     found = await _koreader_last_page(c, plain)
     check("and KOReader's lookup finds nothing in a plain link, as before", found == 0, f'{found}')
+
+
+def _meguru_redacted(url: str) -> str:
+    out = re.sub(r'(/opds/)[^/?]+', r'\1<redacted>', url)
+    return re.sub(r'([?&]apiKey=)[^&#]*', r'\1<redacted>', out)
+
+
+def _meguru_restored(template: str, root: str) -> str:
+    at, found = template.find('<redacted>'), root.find('/opds/')
+    key = re.match(r'[^/?]+', root[found + len('/opds/') :]) if found >= 0 else None
+    origin = re.match(r'[A-Za-z][A-Za-z0-9+.-]*://[^/]+', root)
+    if at < 0 or not key or key.group(0) == '<redacted>' or not origin:
+        return template
+    return template.replace('<redacted>', key.group(0)) if template[:at].startswith(origin.group(0)) else template
+
+
+def _meguru_param(url: str, name: str) -> str | None:
+    found = re.search(f'&{name}=([^&]*)', '&' + url.partition('#')[0].partition('?')[2])
+    return (found.group(1) or None) if found else None
+
+
+def _meguru_series(body: bytes) -> tuple[str | None, list[dict]]:
+    from lxml import etree
+
+    atom = '{http://www.w3.org/2005/Atom}'
+    feed = etree.fromstring(body)
+    author = feed.find(f'{atom}author')
+    signed = ' '.join(author.findtext(f'{atom}{tag}') or '' for tag in ('name', 'uri')) if author is not None else ''
+    items = []
+    for chapter in feed.iter(f'{atom}entry'):
+        for link in chapter.iter(f'{atom}link'):
+            attrs = {k.rpartition('}')[2]: v for k, v in link.attrib.items()}
+            if link.get('rel') == PSE_REL and '{pageNumber}' in link.get('href', '') and 'count' in attrs:
+                template = link.get('href')
+                items.append(
+                    {
+                        'template': template,
+                        'item_key': _meguru_param(template, 'chapterId'),
+                        'series': _meguru_param(template, 'seriesId'),
+                        'last_read': attrs.get('lastRead'),
+                    }
+                )
+    return ('kavita' if 'kavita' in signed.lower() else None), items
+
+
+async def check_kavita_mirror(c) -> None:
+    from inksetter import kavita
+
+    up = 'http://127.0.0.1:8899'
+    prof = 'kobo-clara-hd-2e-bw'
+    keyed = f'{up}/api/opds/{SEAL_KEY}/feed'
+    reader = 'KOReader/2025.10 (https://koreader.rocks/) LuaSocket/3.1.0'
+    mirror = f'http://proxy.test/{prof}/api/opds/inksetter'
+    catalog = f'http://proxy.test/{prof}/catalog'
+    stream = f'{up}/api/opds/{SEAL_KEY}/image?libraryId=1&seriesId=2&volumeId=3&chapterId=41&pageNumber={{pageNumber}}'
+    strip = _strip_profile()
+    KAVITA_STREAM.update(fetched=[], saved=[], lag=0.0)
+
+    async def landing() -> str:
+        return (await c.get('/', headers={'accept': 'text/html'})).text
+
+    check(
+        'without a Kavita catalog the root page shows the plain catalog URL',
+        f'/{prof}/catalog</code>' in await landing(),
+    )
+    r = await _get(c, f'{catalog}/series/2')
+    check('and the catalog has no Kavita paths under it', r.status_code == 404, f'status={r.status_code}')
+    r = await _get(c, f'{catalog}/')
+    plain = (await c.get(catalog)).text
+    check(
+        'but a catalog URL ending in a slash still opens the catalog',
+        r.status_code == 200 and r.text == plain,
+        f'status={r.status_code}',
+    )
+    r = await _get(c, f'{mirror}/image', params={'seriesId': '2', 'chapterId': '41', 'pageNumber': '1'})
+    check('nor does a Kavita-shaped stream link serve a page', r.status_code == 404, f'status={r.status_code}')
+
+    with _catalog(kavita, keyed), _catalog(app_mod, keyed), mock.patch.object(kavita, '_kavita', kavita._Kavita()):
+        shown = await landing()
+        check(
+            'from Kavita the root page shows the Kavita-shaped root as the catalog URL',
+            f'/{prof}/api/opds/inksetter</code>' in shown and f'/{prof}/catalog</code>' not in shown,
+        )
+        root = await _get(c, mirror)
+        same = (await c.get(catalog)).text
+        check(
+            'and that root serves the catalog itself, with no key in it',
+            root.status_code == 200 and root.text == same and SEAL_KEY not in root.text,
+            f'status={root.status_code}',
+        )
+        marker, items = '', []
+        for where, conn in (('the Kavita-shaped root', mirror), ('the plain catalog URL', catalog)):
+            r = await _get(c, f'{conn}/series/2')
+            kind, items = _meguru_series(r.content) if r.status_code == 200 else (None, [])
+            check(
+                f"from {where}, Meguru's series URL serves Kavita's series feed, signed by Kavita, with no key in it",
+                r.status_code == 200 and kind == 'kavita' and SEAL_KEY not in r.text,
+                f'status={r.status_code} kind={kind}',
+            )
+            check(
+                'and Meguru keys each chapter by its chapterId and finds the series in its stream link',
+                [(i['item_key'], i['series']) for i in items] == [('41', '2'), ('42', '2')]
+                and all(i['template'].startswith(f'{mirror}/image?') for i in items),
+                f'{items}',
+            )
+            if not items:
+                continue
+            marker = _meguru_redacted(items[0]['template'])
+            restored = _meguru_restored(marker, conn)
+            page = restored.replace('{pageNumber}', '2').replace('{maxWidth}', '1072')
+            r = await _get(c, page, headers={'user-agent': reader})
+            await _prefetch_settled()
+            check(
+                f'a marker Meguru saved, redacted, reads its pages again from {where}',
+                '<redacted>' in marker and r.status_code == 200 and r.headers.get('content-type') == 'image/png',
+                f'status={r.status_code} {restored}',
+            )
+            _, after = _meguru_series((await c.get(f'{conn}/series/2')).content)
+            check(
+                "and Meguru finds the page read as the chapter's lastRead in the series feed",
+                bool(after) and after[0]['last_read'] == '2',
+                f'{after[:1]}',
+            )
+        r = await _get(c, f'{mirror}/series/2', params={'pageNumber': '2'})
+        check(
+            'a query on a Kavita-shaped path goes on to Kavita with it',
+            r.status_code == 200 and '<title>Series 2, page 2</title>' in r.text,
+            f'status={r.status_code} {r.text[:120]}',
+        )
+        check(
+            'Meguru restores the marker from the Kavita-shaped root, and cannot from the plain one',
+            bool(items)
+            and _meguru_restored(marker, mirror) == items[0]['template']
+            and '<redacted>' in _meguru_restored(marker, catalog),
+            marker,
+        )
+        old = f'http://proxy.test/{prof}/p/{encode_token(stream)}/api/opds/<redacted>/image'
+        r = await _get(c, old, params={'chapterId': '41', 'page': '1', 'maxWidth': '1072', 'count': '6'})
+        check(
+            "a marker Meguru saved from 0.3.1's stream link, redacted, reads its pages too",
+            r.status_code == 200 and r.headers.get('content-type') == 'image/png',
+            f'status={r.status_code}',
+        )
+
+        odd = {
+            'a second placeholder': stream.replace('chapterId=41', 'width={maxWidth}&chapterId=41'),
+            'a count of its own': f'{stream}&count=9',
+            'a second page number': f'{stream}&pageNumber=1',
+            'another path': stream.replace('/image?', '/series/2/image?'),
+            'another port': stream.replace(':8899', ':8898'),
+        }
+        ctx = rewrite.Ctx(prof, 'http://proxy.test', f'{up}/api/opds/{SEAL_KEY}/series/2')
+        mapped = {label: rewrite.map_href(href, 'p', ctx, count=6) for label, href in odd.items()}
+        check(
+            'premise: the plain stream takes the Kavita-shaped link',
+            rewrite.map_href(stream, 'p', ctx, count=6).startswith(f'{mirror}/image?'),
+        )
+        check(
+            'a stream the mirror could not rebuild exactly keeps its token link: ' + ', '.join(odd),
+            all(f'/{prof}/p/' in m and '/api/' not in m for m in mapped.values()),
+            f'{mapped}',
+        )
+        for label, params in (
+            ('no page number', {'seriesId': '2', 'chapterId': '41'}),
+            ('two page numbers', [('chapterId', '41'), ('pageNumber', '1'), ('pageNumber', '2')]),
+        ):
+            r = await _get(c, f'{mirror}/image', params=params)
+            check(
+                f'a Kavita-shaped stream link with {label} is refused', r.status_code == 400, f'status={r.status_code}'
+            )
+        for label, path in (
+            ('climbs out of the catalog', '/%2e%2e/%2e%2e/%2e%2e/opds/v1.2/catalog'),
+            ('is a download', '/series/2/volume/3/chapter/41/download/x.cbz'),
+        ):
+            for base in (mirror, catalog):
+                r = await _get(c, f'{base}{path}')
+                check(
+                    f'a path under {base.rpartition("/")[2]} that {label} is not served',
+                    r.status_code == 404,
+                    f'status={r.status_code}',
+                )
+        r = await _get(c, f'http://proxy.test/{strip.name}/api/opds/inksetter/image?chapterId=41&pageNumber=1')
+        said = r.json().get('error', '') if r.status_code == 404 else ''
+        check(
+            'a re-cut profile refuses the Kavita-shaped stream link, and says to download the book',
+            r.status_code == 404 and 'download' in said,
+            f'status={r.status_code} {said!r}',
+        )
+        for method, route in (('POST', 'api/Plugin/authenticate'), ('GET', 'api/Reader/get-progress?chapterId=41')):
+            r = await _send(c, method, f'/{strip.name}/{route}')
+            check(f'and its {route.partition("?")[0]} as well', r.status_code == 404, f'status={r.status_code}')
+
+
+def _raw_get(port: int, target: str) -> tuple[int, str, bytes]:
+    request = (
+        f'GET {target} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUser-Agent: KOReader/2025.10\r\nConnection: close\r\n\r\n'
+    )
+    with socket.create_connection(('127.0.0.1', port), timeout=60) as s:
+        s.sendall(request.encode('latin-1'))
+        out = b''
+        while chunk := s.recv(1 << 16):
+            out += chunk
+    head, _, body = out.partition(b'\r\n\r\n')
+    lines = head.decode('latin-1').split('\r\n')
+    status = int(lines[0].split()[1]) if lines[0].startswith('HTTP/') else 0
+    ctype = next((h.partition(':')[2].strip() for h in lines[1:] if h.lower().startswith('content-type:')), '')
+    return status, ctype, body
+
+
+def check_raw_redacted() -> None:
+    from inksetter import kavita
+
+    up = 'http://127.0.0.1:8899'
+    prof = 'kobo-clara-hd-2e-bw'
+    keyed = f'{up}/api/opds/{SEAL_KEY}/feed'
+    stream = f'{up}/api/opds/{SEAL_KEY}/image?libraryId=1&seriesId=2&volumeId=3&chapterId=41&pageNumber={{pageNumber}}'
+    with _catalog(kavita, keyed):
+        token = encode_token(stream)
+    targets = {
+        'a Kavita-shaped link': f'/{prof}/api/opds/<redacted>/image?libraryId=1&seriesId=2&volumeId=3&chapterId=41'
+        '&pageNumber=1&maxWidth=1072&count=6',
+        "0.3.1's link": f'/{prof}/p/{token}/api/opds/<redacted>/image?chapterId=41&page=1&maxWidth=1072&count=6',
+    }
+    code = (
+        'import sys, uvicorn\n'
+        'from inksetter.app import app\n'
+        'uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), http=sys.argv[2], log_level="warning")\n'
+    )
+    for http in ('httptools', 'h11'):
+        with socket.socket() as probe:
+            probe.bind(('127.0.0.1', 0))
+            port = probe.getsockname()[1]
+        env = os.environ | {
+            'UPSTREAM_CATALOG': keyed,
+            'CACHE_DIR': tempfile.mkdtemp(dir=TMP),
+            'PREFETCH': '0',
+            'OCR_ENABLED': '0',
+        }
+        errors = pathlib.Path(tempfile.mkdtemp(dir=TMP)) / 'stderr.txt'
+        with errors.open('wb') as sink:
+            proc = subprocess.Popen(
+                [sys.executable, '-c', code, str(port), http], cwd=os.getcwd(), env=env, stderr=sink
+            )
+            try:
+                ready, by = False, time.monotonic() + 90
+                while not ready and proc.poll() is None and time.monotonic() < by:
+                    try:
+                        socket.create_connection(('127.0.0.1', port), timeout=1).close()
+                        ready = True
+                    except OSError:
+                        time.sleep(0.2)
+                check(
+                    f'premise: the app comes up under uvicorn with {http}',
+                    ready,
+                    errors.read_text(errors='replace')[-200:],
+                )
+                for label, target in targets.items() if ready else ():
+                    try:
+                        status, ctype, body = _raw_get(port, target)
+                    except OSError as exc:
+                        status, ctype, body = 0, f'{type(exc).__name__}', b''
+                    check(
+                        f'under {http}, {label} with a raw <redacted> in its path, as Meguru sends it, serves its page',
+                        status == 200 and ctype == 'image/png' and body.startswith(b'\x89PNG\r\n\x1a\n'),
+                        f'status={status} {ctype}',
+                    )
+            finally:
+                proc.terminate()
+                proc.wait(15)
 
 
 def _koreader_md5(data: bytes) -> str:
@@ -10529,6 +10861,8 @@ async def main() -> int:
         await check_kavita_redirect()
         await check_kavita_stream(c)
         await check_kavita_resume(c)
+        await check_kavita_mirror(c)
+        check_raw_redacted()
 
         print('cache trim')
         await check_trim_aside(c)

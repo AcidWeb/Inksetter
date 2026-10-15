@@ -76,10 +76,10 @@ def _secret() -> str:
     return kavita.api_key()
 
 
-def _lookup_shape(url: str) -> tuple[str, str]:
+def _mirrored(url: str) -> str | None:
     from .. import kavita
 
-    return kavita.lookup_shape(url)
+    return kavita.mirror_link(url)
 
 
 def encode_token(url: str, cover: str | None = None) -> str:
@@ -230,8 +230,8 @@ def map_href(
 
     if kind == 'p':
         pages = f'&count={count}' if count > 0 else ''
-        path, lead = _lookup_shape(target)
-        return f'{prefix}/p/{token}{path}?{lead}page={{pageNumber}}&maxWidth={{maxWidth}}{pages}'
+        stream = _mirrored(target) or f'/p/{token}?page={{pageNumber}}'
+        return f'{prefix}{stream}&maxWidth={{maxWidth}}{pages}'
     if kind == 's':
         if search_style == 'opds2':
             return f'{prefix}/s/{token}?query={{query}}'

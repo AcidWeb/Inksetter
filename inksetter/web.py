@@ -614,7 +614,7 @@ def group_of(p: Profile) -> str:
     return 'Colour' if p.panel == 'kaleido' else 'Black and white'
 
 
-def index(base: str, entries, shown: str = '') -> str:
+def index(base: str, entries, shown: str = '', root: str = 'catalog') -> str:
     shown = shown or base
     held: dict[str, list] = {title: [] for title, _ in GROUPS}
     for name, p in entries:
@@ -632,7 +632,7 @@ def index(base: str, entries, shown: str = '') -> str:
             f'<li><div class="m">'
             f'<a class="t" href="{escape(base)}/{quote(n)}/browse">{escape(n)}</a>'
             f'<div class="s">{escape(_specs(p))}</div></div>'
-            f'<code>{escape(shown)}/{quote(n)}/catalog</code></li>'
+            f'<code>{escape(shown)}/{quote(n)}/{escape(root)}</code></li>'
             for n, p in members
         )
         parts.append(

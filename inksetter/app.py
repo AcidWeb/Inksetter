@@ -202,7 +202,8 @@ def _for_readers(base: str) -> str:
 @app.api_route('/', methods=['GET', 'HEAD'], response_class=HTMLResponse)
 async def index(request: Request):
     base = _public_base(request)
-    return web.index(base, sorted(profiles.PROFILES.items()), _for_readers(base))
+    root = f'api/opds/{kavita.MIRROR_KEY}' if kavita.opds_root() else 'catalog'
+    return web.index(base, sorted(profiles.PROFILES.items()), _for_readers(base), root)
 
 
 def _upstream_host() -> str:
@@ -259,13 +260,16 @@ async def catalog(profile: str, request: Request):
     return await _serve_feed(request, profile, settings.upstream_catalog)
 
 
+def _with_query(url: str, request: Request) -> str:
+    if not request.url.query:
+        return url
+    joiner = '&' if '?' in url else '?'
+    return f'{url}{joiner}{request.url.query}'
+
+
 @app.api_route('/{profile}/f/{token}', methods=['GET', 'HEAD'])
 async def feed(profile: str, token: str, request: Request):
-    url = rewrite.decode_token(token)
-    if request.url.query:
-        joiner = '&' if '?' in url else '?'
-        url = f'{url}{joiner}{request.url.query}'
-    return await _serve_feed(request, profile, url)
+    return await _serve_feed(request, profile, _with_query(rewrite.decode_token(token), request))
 
 
 @app.api_route('/{profile}/osd/{token}', methods=['GET', 'HEAD'])
@@ -389,15 +393,16 @@ def _query_int(raw: str) -> int:
 
 
 @app.api_route('/{profile}/p/{token}', methods=['GET', 'HEAD'])
-@app.api_route(f'/{{profile}}/p/{{token}}{kavita.LOOKUP_PATH}', methods=['GET', 'HEAD'])
+@app.api_route('/{profile}/p/{token}/api/opds/{key}/image', methods=['GET', 'HEAD'])
 async def page(profile: str, token: str, request: Request, page: str = '0', maxWidth: str = '0', count: str = '0'):
     p = _profile_or_404(profile)
     _refuse_stream(p)
     template = rewrite.decode_token(token)
+    return await _stream(request, p, template, _query_int(page), _query_int(maxWidth), _query_int(count))
+
+
+async def _stream(request: Request, p: Profile, template: str, page_no: int, max_width: int, pages: int) -> Response:
     headers = request_headers(request.headers)
-    page_no = _query_int(page)
-    max_width = _query_int(maxWidth)
-    pages = _query_int(count)
     told = kavita.streams(template)
     fetch = kavita.unread(headers) if told else headers
 
@@ -429,28 +434,6 @@ async def _prefetch(url: str, p: Profile, max_width: int | None, headers: dict[s
             await _render_cached(url, p, max_width, headers, 'ahead')
 
 
-def _stream_chapter(profile: str, token: str) -> int:
-    _refuse_stream(_profile_or_404(profile))
-    chapter = kavita.chapter_of(rewrite.decode_token(token))
-    if chapter is None:
-        raise UpstreamError(404, 'not a Kavita page stream')
-    return chapter
-
-
-@app.post('/{profile}/p/{token}/api/Plugin/authenticate')
-async def stream_sign_in(profile: str, token: str):
-    _stream_chapter(profile, token)
-    return JSONResponse({'token': kavita.LOOKUP_TOKEN, 'refreshToken': kavita.LOOKUP_TOKEN})
-
-
-@app.get('/{profile}/p/{token}/api/Reader/get-progress')
-async def stream_progress(profile: str, token: str):
-    resp = await kavita.progress(_stream_chapter(profile, token))
-    if resp is None:
-        raise UpstreamError(502, 'Kavita refused the progress lookup')
-    return _relay(resp)
-
-
 @app.api_route('/{profile}/pf/{token}', methods=['GET', 'HEAD'])
 async def page_fixed(profile: str, token: str, request: Request, maxWidth: str = '0'):
     p = _profile_or_404(profile)
@@ -466,6 +449,44 @@ async def image(profile: str, token: str, request: Request):
     url = rewrite.decode_token(token)
     blob, ctype = await _render_cached(url, cover_for(p), None, request_headers(request.headers), 'cover')
     return Response(blob, media_type=ctype, headers={'Cache-Control': 'private, max-age=604800'})
+
+
+# --------------------------------------------------------------------------
+# Kavita's layout, mirrored under each profile
+# --------------------------------------------------------------------------
+
+
+@app.api_route('/{profile}/api/opds/{key}/image', methods=['GET', 'HEAD'])
+async def mirrored_page(profile: str, request: Request, maxWidth: str = '0', count: str = '0'):
+    p = _profile_or_404(profile)
+    _refuse_stream(p)
+    template, page_no = kavita.unmirror(request.url.query)
+    return await _stream(request, p, template, _query_int(page_no), _query_int(maxWidth), _query_int(count))
+
+
+@app.post('/{profile}/api/Plugin/authenticate')
+async def stream_sign_in(profile: str):
+    _refuse_stream(_profile_or_404(profile))
+    kavita.mirror_root()
+    return JSONResponse({'token': kavita.LOOKUP_TOKEN, 'refreshToken': kavita.LOOKUP_TOKEN})
+
+
+@app.get('/{profile}/api/Reader/get-progress')
+async def stream_progress(profile: str, chapterId: str = ''):
+    _refuse_stream(_profile_or_404(profile))
+    resp = await kavita.progress(chapterId)
+    if resp is None:
+        raise UpstreamError(502, 'Kavita refused the progress lookup')
+    return _relay(resp)
+
+
+@app.api_route('/{profile}/catalog/{rest:path}', methods=['GET', 'HEAD'])
+@app.api_route('/{profile}/api/opds/{key}', methods=['GET', 'HEAD'])
+@app.api_route('/{profile}/api/opds/{key}/{rest:path}', methods=['GET', 'HEAD'])
+async def mirrored_feed(profile: str, request: Request, rest: str = ''):
+    _profile_or_404(profile)
+    url = kavita.mirror_feed(rest) if rest else settings.upstream_catalog
+    return await _serve_feed(request, profile, _with_query(url, request))
 
 
 # --------------------------------------------------------------------------
