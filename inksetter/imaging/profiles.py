@@ -3,6 +3,7 @@ Device profiles.
 To add or modify device profiles - edit profiles.toml.
 """
 
+import math
 import tomllib
 import importlib.resources
 from dataclasses import dataclass, fields, replace
@@ -209,6 +210,11 @@ def validate(p: Profile, where: str = 'profile') -> Profile:
         for field, choices in _CHOICES.items()
         if getattr(p, field) not in choices
     ]
+    problems += [
+        f'{f.name}={getattr(p, f.name)} must be a finite number'
+        for f in fields(Profile)
+        if f.type is float and not math.isfinite(getattr(p, f.name))
+    ]
     if not 0.0 <= p.descreen_strength <= 1.0:
         problems.append(f'descreen_strength={p.descreen_strength} must be 0..1')
     if not 0.0 < p.descreen_width < 0.5:
@@ -243,8 +249,8 @@ def validate(p: Profile, where: str = 'profile') -> Profile:
         )
     if not 0 < p.descreen_max_megapixels <= 64:
         problems.append(f'descreen_max_megapixels={p.descreen_max_megapixels} must be >0 and <=64')
-    if p.usm_sigma <= 0:
-        problems.append(f'usm_sigma={p.usm_sigma} must be > 0; set usm_amount=0 to disable sharpening')
+    if not 0 < p.usm_sigma <= 10:
+        problems.append(f'usm_sigma={p.usm_sigma} must be >0 and <=10; set usm_amount=0 to disable sharpening')
     if p.usm_amount < 0:
         problems.append(f'usm_amount={p.usm_amount} must be >= 0; a negative amount blurs')
     if not 0 <= p.autocrop_threshold < 255:
@@ -272,15 +278,14 @@ def validate(p: Profile, where: str = 'profile') -> Profile:
         problems.append(f'png_effort={p.png_effort} must be 1-10')
     if not 2 <= p.palette_colours <= 256:
         problems.append(f'palette_colours={p.palette_colours} must be 2-256')
-    elif (p.palette_colours - 1).bit_length() not in (1, 2, 4, 8):
-        problems.append(
-            f'palette_colours={p.palette_colours} needs a {(p.palette_colours - 1).bit_length()}-bit '
-            'index, which PNG has no format for; use 2, 3-4, 9-16 or 129-256'
-        )
     if not 0 <= p.png_compression <= 9:
         problems.append(f'png_compression={p.png_compression} must be 0-9')
     if p.saturation < 0:
         problems.append(f'saturation={p.saturation} must be >= 0')
+    if not 0.1 <= p.chroma_ratio <= 1.0:
+        problems.append(f'chroma_ratio={p.chroma_ratio} must be 0.1..1, the colour resolution over the mono one')
+    if not 0 <= p.chroma_blur <= 10:
+        problems.append(f'chroma_blur={p.chroma_blur} must be 0..10; 0 takes it from chroma_ratio')
     if problems:
         raise ValueError(f'{where} {p.name!r}: ' + '; '.join(problems))
     return p

@@ -7071,10 +7071,23 @@ def check_profile_config() -> None:
         ('bad png level', 'png_compression = 11', 'png_compression=11'),
         ('defringe without a CFA', 'defringe = "diagonal"', 'filter array'),
         ('defringe typo', 'panel = "kaleido"\ndefringe = "diagnal"', "defringe='diagnal' is not one of"),
-        ('palette needing 3 bits', 'palette_colours = 8', 'palette_colours=8'),
-        ('palette needing 5 bits', 'palette_colours = 17', 'palette_colours=17'),
-        ('palette needing 6 bits', 'palette_colours = 64', 'palette_colours=64'),
-        ('palette needing 7 bits', 'palette_colours = 128', 'palette_colours=128'),
+        ('a palette of one colour', 'palette_colours = 1', 'palette_colours=1'),
+        ('a palette past 8 bits', 'palette_colours = 257', 'palette_colours=257'),
+        ('a NaN gamma', 'gamma = nan', 'gamma=nan must be a finite number'),
+        ('an endless saturation', 'saturation = inf', 'saturation=inf must be a finite number'),
+        ('a NaN sharpening amount', 'usm_amount = nan', 'usm_amount=nan must be a finite number'),
+        ('a negative endless deadband', 'descreen_deadband = -inf', 'descreen_deadband=-inf must be a finite number'),
+        (
+            'a NaN switch-over for auto_mono',
+            'mono_chroma_threshold = nan',
+            'mono_chroma_threshold=nan must be a finite',
+        ),
+        ('no colour layer at all', 'chroma_ratio = 0.0', 'chroma_ratio=0.0'),
+        ('a colour layer too coarse to blur for', 'chroma_ratio = 0.0001', 'chroma_ratio=0.0001'),
+        ('a colour layer finer than the panel', 'chroma_ratio = 1.5', 'chroma_ratio=1.5'),
+        ('a negative chroma blur', 'chroma_blur = -1.0', 'chroma_blur=-1.0'),
+        ('a chroma blur libvips refuses', 'chroma_blur = 2000.0', 'chroma_blur=2000.0'),
+        ('a sharpening radius past the bound', 'usm_sigma = 600.0', 'usm_sigma=600.0'),
         ('negative blur radius', 'usm_sigma = -1.0', 'usm_sigma=-1.0'),
         ('zero blur radius', 'usm_sigma = 0.0', 'usm_sigma=0.0'),
         ('sharpening that blurs', 'usm_amount = -5.0', 'usm_amount=-5.0'),
@@ -7102,13 +7115,27 @@ def check_profile_config() -> None:
             check(f'profiles.toml {label} rejected', isinstance(exc, ValueError) and needle in str(exc), said[:72])
 
     body = '\n'.join(('[profiles.x]', 'width = 1072', 'height = 1448', 'usm_amount = 0.0', ''))
-    for good in (2, 4, 16, 129, 256):
+    for good in (2, 4, 8, 16, 17, 64, 128, 129, 256):
         ok = f'[profiles.x]{LF}width = 1072{LF}height = 1448{LF}palette_colours = {good}{LF}'
         try:
             profiles._build(ok, 'test.toml')
             check(f'palette_colours = {good} is accepted', True)
         except ValueError as exc:
             check(f'palette_colours = {good} is accepted', False, str(exc)[:56])
+
+    for field, edge in (
+        ('chroma_ratio', 0.1),
+        ('chroma_ratio', 1.0),
+        ('chroma_blur', 0.0),
+        ('chroma_blur', 10.0),
+        ('usm_sigma', 10.0),
+    ):
+        ok = f'[profiles.x]{LF}width = 1072{LF}height = 1448{LF}{field} = {edge}{LF}'
+        try:
+            profiles._build(ok, 'test.toml')
+            check(f'{field} = {edge} is accepted', True)
+        except ValueError as exc:
+            check(f'{field} = {edge} is accepted', False, str(exc)[:56])
 
     whole = f'[profiles.x]{LF}width = 1072{LF}height = 1448{LF}upscale_max = 2{LF}'
     try:
