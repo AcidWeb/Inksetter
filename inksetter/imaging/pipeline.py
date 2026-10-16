@@ -14,8 +14,8 @@ COLOUR (Kaleido 3):
          -> downscale or upscale -> pad to the panel box
          -> LCh saturation boost -> Lab: blur a/b only
          -> levels+gamma, unsharp and defringe on L only
-         -> sRGB -> re-flatten the pad -> encode (palette PNG, PNG or JPEG)
-         -> pin the palette PNG's pure white and pure black
+         -> sRGB -> re-flatten the pad -> encode (palette PNG, PNG, JPEG or WebP)
+         -> for the palette PNG: libimagequant, then pin pure white and pure black
 """
 
 import os
@@ -29,6 +29,7 @@ import numpy as np
 import pyvips
 import scipy.fft as sfft
 from typing import NamedTuple
+from imagequant._libimagequant import ffi as liq_ffi, lib as liq
 
 from . import folio
 from .profiles import UPSCALE_MAX_CEILING, Profile
@@ -51,9 +52,10 @@ def _size_vips() -> None:
 _size_vips()
 
 # Bump this whenever anything in this module changes in a way that alters output pixels. Bump invalidates the cache.
-PIPELINE_VERSION = '12'
+PIPELINE_VERSION = '13'
 
 _BAYER_N = 8
+_PALETTE_DITHER = 0.7
 
 NO_HEIGHT_CAP = 10_000_000
 
@@ -692,41 +694,67 @@ def _png_chunk(kind: bytes, data: bytes) -> bytes:
     return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data))
 
 
-def _pin_extremes(png: bytes, rgb: np.ndarray, compression: int) -> bytes:
-    chunks, at = [], len(_PNG_SIGNATURE)
-    while at < len(png):
-        size, kind = struct.unpack('>I4s', png[at : at + 8])
-        chunks.append((kind, png[at + 8 : at + 8 + size]))
-        at += 12 + size
-    head = dict(chunks)
-    width, height, depth, colour = struct.unpack('>IIBB', head[b'IHDR'][:10])
-    if depth != 8 or colour != 3 or b'PLTE' not in head:
-        return png
-    raw = zlib.decompress(b''.join(data for kind, data in chunks if kind == b'IDAT'))
-    rows = np.frombuffer(raw, np.uint8).reshape(height, width + 1)
-    if rows[:, 0].any():
-        return png
-    palette = np.frombuffer(head[b'PLTE'], np.uint8).reshape(-1, 3)
-    fixed = None
+def _quantise(
+    rgba: np.ndarray, colours: int, effort: int, fixed: tuple[int, ...] = ()
+) -> tuple[np.ndarray, np.ndarray]:
+    h, w, _ = rgba.shape
+    attr = liq.liq_attr_create()
+    image = result = liq_ffi.NULL
+    try:
+        liq.liq_set_max_colors(attr, colours)
+        liq.liq_set_speed(attr, 11 - effort)
+        image = liq.liq_image_create_rgba(attr, liq_ffi.from_buffer(rgba), w, h, 0)
+        for level in fixed:
+            liq.liq_image_add_fixed_color(image, liq_ffi.new('liq_color *', (level, level, level, 255))[0])
+        found = liq_ffi.new('liq_result**')
+        code = liq.liq_image_quantize(image, attr, found)
+        if code != liq.LIQ_OK:
+            raise RuntimeError(f'libimagequant could not quantise the page (error {code})')
+        result = found[0]
+        liq.liq_set_dithering_level(result, _PALETTE_DITHER)
+        idx = np.empty((h, w), np.uint8)
+        liq.liq_write_remapped_image(result, image, liq_ffi.from_buffer(idx), w * h)
+        pal = liq.liq_get_palette(result)
+        palette = np.frombuffer(liq_ffi.buffer(pal.entries, 4 * pal.count), np.uint8).reshape(-1, 4)[:, :3].copy()
+    finally:
+        if result != liq_ffi.NULL:
+            liq.liq_result_destroy(result)
+        if image != liq_ffi.NULL:
+            liq.liq_image_destroy(image)
+        liq.liq_attr_destroy(attr)
+    return idx, palette
+
+
+def _extremes(rgb: np.ndarray) -> dict[int, np.ndarray]:
+    masks = {}
     for level in (255, 0):
+        mask = rgb[..., 0] == level
+        for band in (1, 2):
+            mask &= rgb[..., band] == level
+        masks[level] = mask
+    return masks
+
+
+def _pin_extremes(idx: np.ndarray, palette: np.ndarray, masks: dict[int, np.ndarray]) -> None:
+    for level, pure in masks.items():
         entry = np.flatnonzero((palette == level).all(axis=1))
-        if not len(entry):
-            continue
-        wrong = (rgb == level).all(axis=2) & (rows[:, 1:] != entry[0])
-        if wrong.any():
-            if fixed is None:
-                fixed = rows.copy()
-            fixed[:, 1:][wrong] = entry[0]
-    if fixed is None:
-        return png
-    out = [_PNG_SIGNATURE]
-    for kind, data in chunks:
-        if kind != b'IDAT':
-            out.append(_png_chunk(kind, data))
-        elif fixed is not None:
-            out.append(_png_chunk(b'IDAT', zlib.compress(fixed.tobytes(), compression)))
-            fixed = None
-    return b''.join(out)
+        if len(entry):
+            idx[pure] = entry[0]
+
+
+def _palette_png(idx: np.ndarray, palette: np.ndarray, compression: int) -> bytes:
+    h, w = idx.shape
+    rows = np.zeros((h, w + 1), np.uint8)
+    rows[:, 1:] = idx
+    return b''.join(
+        (
+            _PNG_SIGNATURE,
+            _png_chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 3, 0, 0, 0)),
+            _png_chunk(b'PLTE', palette.tobytes()),
+            _png_chunk(b'IDAT', zlib.compress(rows, compression)),
+            _png_chunk(b'IEND', b''),
+        )
+    )
 
 
 def _render_mono(
@@ -821,19 +849,11 @@ def _render_colour(
             'image/webp',
         )
     if p.palette:
-        out = out.copy_memory()
-        png = out.pngsave_buffer(
-            palette=True,
-            bitdepth=8,
-            colours=p.palette_colours,
-            dither=1.0,
-            effort=p.png_effort,
-            compression=p.png_compression,
-            filter='none',
-            strip=True,
-        )
-        rgb = np.ndarray(buffer=out.write_to_memory(), dtype=np.uint8, shape=(out.height, out.width, out.bands))
-        return _pin_extremes(png, rgb, p.png_compression), 'image/png'
+        rgba = np.ndarray(buffer=out.bandjoin(255).write_to_memory(), dtype=np.uint8, shape=(out.height, out.width, 4))
+        masks = _extremes(rgba)
+        idx, palette = _quantise(rgba, p.palette_colours, p.png_effort, tuple(k for k, m in masks.items() if m.any()))
+        _pin_extremes(idx, palette, masks)
+        return _palette_png(idx, palette, p.png_compression), 'image/png'
     return out.pngsave_buffer(compression=p.png_compression, strip=True), 'image/png'
 
 

@@ -2456,17 +2456,27 @@ def check_palette_pin() -> None:
         'black': ((slice(0, 60), slice(50, 100)), (0, 0, 0), (2, 3)),
         'near-white': ((slice(0, 60), slice(100, 150)), (254, 254, 254), (4, 1)),
         'orange': ((slice(0, 60), slice(150, 200)), (255, 120, 0), (6, 1)),
-        'red': ((slice(60, 120), slice(0, 200)), (200, 30, 30), (5, 5)),
+        'red': ((slice(60, 120), slice(0, 40)), (200, 30, 30), (5, 5)),
+        'yellow': ((slice(60, 120), slice(40, 80)), (255, 255, 0), (6, 1)),
+        'cyan': ((slice(60, 120), slice(80, 120)), (0, 255, 255), (1, 7)),
+        'dark blue': ((slice(60, 120), slice(120, 160)), (0, 0, 90), (3, 7)),
+        'dark red': ((slice(60, 120), slice(160, 200)), (90, 0, 0), (3, 5)),
     }
     checker = (np.add.outer(np.arange(h), np.arange(w)) % 2).astype(bool)
     for where, colour, (even, odd) in regions.values():
         src[where] = colour
         idx[where] = np.where(checker[where], odd, even)
-    cast = _indexed_png(idx, palette)
-    before = _rgb_of(cast)
-    pinned = pipeline._pin_extremes(cast, src, 6)
-    after = _rgb_of(pinned)
+    before, kept_palette = palette[idx], palette.copy()
     white_at, black_at = (src == 255).all(axis=2), (src == 0).all(axis=2)
+    masks = pipeline._extremes(src)
+    check(
+        'the masks hold every pixel pure white or pure black in all three bands, and no other',
+        np.array_equal(masks.get(255), white_at) and np.array_equal(masks.get(0), black_at),
+    )
+    masks = {255: white_at, 0: black_at}
+    pinned = idx.copy()
+    pipeline._pin_extremes(pinned, palette, masks)
+    after = palette[pinned]
     check(
         'premise: half the white and half the black of the source come back off-white and off-black',
         (before[white_at] != 255).any(axis=1).sum() == white_at.sum() // 2
@@ -2480,66 +2490,50 @@ def check_palette_pin() -> None:
     )
     rest = ~white_at & ~black_at
     check(
-        'and leaves every other pixel as the quantiser chose, near-white and colours with a 255 in them too',
+        'and leaves every other pixel as the quantiser chose',
         np.array_equal(after[rest], before[rest]),
         f'{int((after[rest] != before[rest]).any(axis=1).sum())} other pixels moved',
     )
-    check(
-        'the page keeps its palette and its size',
-        np.array_equal(_indices_of(pinned)[1], palette) and after.shape == before.shape,
-    )
-    check(
-        'a page with nothing to pin is handed back as it came',
-        pipeline._pin_extremes(pinned, src, 6) is pinned,
-    )
-    filtered = _indexed_png(idx, palette, filters=np.r_[2, np.zeros(h - 1, np.uint8)])
-    check(
-        'premise: an Up filter on the first row reads the same as no filter',
-        np.array_equal(_rgb_of(filtered), before),
-    )
-    check(
-        'a page with a filtered row is left alone, since its rows are not plain indices',
-        pipeline._pin_extremes(filtered, src, 6) is filtered,
-    )
+    check('and the palette as it was', np.array_equal(palette, kept_palette))
+    again = pinned.copy()
+    pipeline._pin_extremes(again, palette, masks)
+    check('a page pinned once has nothing left to pin', np.array_equal(again, pinned))
     no_white = palette.copy()
     no_white[0] = (250, 250, 250)
-    greyed = _indexed_png(idx, no_white)
-    kept = _rgb_of(pipeline._pin_extremes(greyed, src, 6))
+    kept = idx.copy()
+    pipeline._pin_extremes(kept, no_white, masks)
     check(
         'with no pure white in the palette white is left as it was, and black is still pinned',
-        np.array_equal(kept[white_at], _rgb_of(greyed)[white_at]) and (kept[black_at] == 0).all(),
+        np.array_equal(kept[white_at], idx[white_at]) and (no_white[kept][black_at] == 0).all(),
     )
-    truecolour = pyvips.Image.new_from_memory(src.tobytes(), w, h, 3, 'uchar').pngsave_buffer()
-    check('a PNG that is not a palette PNG is left alone', pipeline._pin_extremes(truecolour, src, 6) is truecolour)
-    nibbles = pyvips.Image.new_from_memory(src.tobytes(), w, h, 3, 'uchar').pngsave_buffer(
-        palette=True, bitdepth=4, colours=16
-    )
-    try:
-        left = pipeline._pin_extremes(nibbles, src, 6) is nibbles
-    except Exception as exc:
-        left = False
-        print(f'    {type(exc).__name__}: {exc}')
+
+    png = pipeline._palette_png(pinned, palette, 6)
+    rows, written = _indices_of(png)
+    head = dict(_png_chunks(png))[b'IHDR']
     check(
-        'premise: a 4-bit palette PNG', _png_chunks(nibbles)[0][1][8:10] == bytes([4, 3]), f'{_png_chunks(nibbles)[0]}'
+        'the palette PNG holds 8-bit indices, every row unfiltered',
+        head[8:10] == bytes([8, 3]) and not rows[:, 0].any(),
+        f'{head[8:10]!r}, {int(rows[:, 0].astype(bool).sum())} filtered rows',
     )
-    check('a palette PNG of another depth is left alone, since its rows are not one byte a pixel', left)
+    check(
+        'exactly the indices and the palette it was handed',
+        np.array_equal(rows[:, 1:], pinned) and np.array_equal(written, palette),
+    )
+    check('and it decodes to the colours they name', np.array_equal(_rgb_of(png), palette[pinned]))
 
     prof = profiles.PROFILES['kindle-colorsoft-1-2']
     page = pyvips.Image.new_from_buffer(_rich_colour_page(), '')
     a = np.ndarray(buffer=page.write_to_memory(), dtype=np.uint8, shape=(page.height, page.width, 3)).copy()
     a[800:1000, 100:800] = 255
     page_png = pyvips.Image.new_from_memory(a.tobytes(), page.width, page.height, 3, 'uchar').pngsave_buffer()
-    real = pyvips.Image.pngsave_buffer
+    real = pipeline._quantise
     seen: dict = {}
 
-    def faulty(self, **kw):
-        png = real(self, **kw)
-        if not kw.get('palette'):
-            return png
-        rows, pal = _indices_of(png)
-        rows = rows.copy()
-        shown = np.ndarray(buffer=self.write_to_memory(), dtype=np.uint8, shape=(self.height, self.width, self.bands))
-        cells = (np.add.outer(np.arange(self.height), np.arange(self.width)) % 2).astype(bool)
+    def faulty(rgba, colours, effort, fixed=()):
+        got, pal = real(rgba, colours, effort, fixed)
+        got = got.copy()
+        shown = rgba[..., :3]
+        cells = (np.add.outer(np.arange(got.shape[0]), np.arange(got.shape[1])) % 2).astype(bool)
         moved = np.zeros(cells.shape, bool)
         for level in (255, 0):
             own = np.flatnonzero((pal == level).all(axis=1))
@@ -2547,21 +2541,21 @@ def check_palette_pin() -> None:
             other = next(i for i in near if not (pal[i] == level).all())
             hit = (shown == level).all(axis=2) & cells
             if len(own):
-                rows[:, 1:][hit] = other
+                got[hit] = other
                 moved |= hit
                 seen[level] = int(hit.sum())
-        seen['moved'], seen['shown'] = moved, shown.copy()
-        seen['cast'] = _indexed_png(rows[:, 1:], pal, rows[:, 0])
-        return seen['cast']
+        seen['moved'], seen['shown'], seen['cast'] = moved, shown.copy(), pal[got]
+        seen['size'] = len(_indexed_png(got, pal))
+        return got, pal
 
-    with mock.patch.object(pyvips.Image, 'pngsave_buffer', faulty):
+    with mock.patch.object(pipeline, '_quantise', faulty):
         out, _ = pipeline.render_page(page_png, prof)
     moved = seen.get('moved', np.zeros((1, 1), bool))
     check(
-        'premise: a colour page with white and black in it, its palette save made to cast them',
+        'premise: a colour page with white and black in it, its quantiser made to cast them',
         seen.get(255, 0) > 10_000
         and seen.get(0, 0) > 10_000
-        and (_rgb_of(seen['cast'])[moved] != seen['shown'][moved]).any(axis=1).all(),
+        and (seen['cast'][moved] != seen['shown'][moved]).any(axis=1).all(),
         f'{seen.get(255, 0)} white and {seen.get(0, 0)} black pixels cast',
     )
     got = _rgb_of(out)
@@ -2571,14 +2565,131 @@ def check_palette_pin() -> None:
         np.array_equal(got[pure], seen['shown'][pure]),
         f'{int((got[pure] != seen["shown"][pure]).any(axis=1).sum())} still off',
     )
+    check('and every other pixel as the quantiser left it', np.array_equal(got[~pure], seen['cast'][~pure]))
     check(
-        'and every other pixel as the palette save left it',
-        np.array_equal(got[~pure], _rgb_of(seen['cast'])[~pure]),
+        'compressed as tightly as the quantiser output it mends',
+        len(out) <= 1.02 * seen['size'],
+        f'{len(out) // 1024} kB against {seen["size"] // 1024} kB',
+    )
+
+
+def _liq_plain(value):
+    ffi = pipeline.liq_ffi
+    if isinstance(value, ffi.CData) and ffi.typeof(value).kind == 'struct':
+        return tuple(getattr(value, field) for field, _ in ffi.typeof(value).fields)
+    return value
+
+
+class _Recording:
+    def __init__(self, lib, fail: str = '') -> None:
+        self.lib, self.fail, self.calls = lib, fail, []
+
+    def __getattr__(self, name: str):
+        target = getattr(self.lib, name)
+        if not callable(target):
+            return target
+
+        def call(*args):
+            self.calls.append((name, tuple(_liq_plain(a) for a in args[1:])))
+            if name == self.fail:
+                return self.lib.LIQ_OUT_OF_MEMORY
+            return target(*args)
+
+        return call
+
+
+def check_palette_quantiser() -> None:
+    prof = dataclasses.replace(profiles.PROFILES['kindle-colorsoft-1-2'], png_effort=4, palette_colours=16)
+    src = _rich_colour_page()
+    told = _Recording(pipeline.liq)
+    with mock.patch.object(pipeline, 'liq', told):
+        out, ctype = pipeline.render_page(src, prof)
+    names = [name for name, _ in told.calls]
+    last = dict(told.calls)
+    check("the palette PNG is libimagequant's", ctype == 'image/png' and 'liq_image_quantize' in names, f'{names}')
+    check('at speed 11 less png_effort', last.get('liq_set_speed') == (7,), f'{last.get("liq_set_speed")}')
+    check(
+        'with palette_colours as the most colours it may use, and the page uses no more',
+        last.get('liq_set_max_colors') == (16,) and len(_indices_of(out)[1]) <= 16,
+        f'{last.get("liq_set_max_colors")}, {len(_indices_of(out)[1])} entries',
+    )
+    check('dithered at 0.7', last.get('liq_set_dithering_level') == (0.7,), f'{last.get("liq_set_dithering_level")}')
+    check(
+        'and everything it made is freed once',
+        all(names.count(n) == 1 for n in ('liq_result_destroy', 'liq_image_destroy', 'liq_attr_destroy')),
+        f'{[n for n in names if n.endswith("destroy")]}',
+    )
+    rng = np.random.default_rng(174)
+    for level, label, low, high, side in ((0, 'black', 0, 5, 240), (255, 'white', 240, 256, 480)):
+        rgb = rng.integers(low, high, (side, side, 3), dtype=np.uint8)
+        rgb[:, side // 2 :] = rng.integers(40, 220, (side, side - side // 2, 3), dtype=np.uint8)
+        rgba = np.dstack([rgb, np.full((side, side), 255, np.uint8)])
+        pure = (rgb == level).all(axis=2)
+        _, loose = pipeline._quantise(rgba, 256, 6)
+        _, held = pipeline._quantise(rgba, 256, 6, (level,))
+        check(
+            f'premise: pure {label} amid near-{label} noise, quantised as it comes, has no palette entry of its own',
+            pure.sum() >= 10 and not (loose == level).all(axis=1).any(),
+            f'{int(pure.sum())} pure pixels',
+        )
+        check(f'reserved, pure {label} has one', (held == level).all(axis=1).any())
+    shown: list = []
+    real = pipeline._quantise
+
+    def spy(rgba, colours, effort, fixed=()):
+        shown.append(rgba[..., :3].copy())
+        return real(rgba, colours, effort, fixed)
+
+    yy, xx = np.mgrid[0:600, 0:400]
+    mid = np.dstack([90 + 60 * xx / 400, 80 + 70 * yy / 600, 140 - 40 * xx / 400]).astype(np.uint8)
+    ends = mid.copy()
+    ends[100:200, 50:350], ends[350:450, 50:350] = 255, 0
+    pages = {
+        name: pyvips.Image.new_from_memory(a.tobytes(), 400, 600, 3, 'uchar').pngsave_buffer()
+        for name, a in (('ends', ends), ('mid', mid))
+    }
+    plain = profiles.PROFILES['kindle-colorsoft-1-2']
+    added = {}
+    for name, page in pages.items():
+        told = _Recording(pipeline.liq)
+        with mock.patch.object(pipeline, '_quantise', spy), mock.patch.object(pipeline, 'liq', told):
+            out, _ = pipeline.render_page(page, plain)
+        added[name] = ([args[0] for n, args in told.calls if n == 'liq_image_add_fixed_color'], out)
+    has = [tuple(lvl for lvl in (255, 0) if (s == lvl).all(axis=2).any()) for s in shown]
+    check(
+        'premise: one page reaches the quantiser with pure white and black in it, the other with neither',
+        has == [(255, 0), ()],
+        f'{has}',
     )
     check(
-        'compressed as tightly as the save it mends',
-        len(out) <= 1.02 * len(seen['cast']),
-        f'{len(out) // 1024} kB against {len(seen["cast"]) // 1024} kB',
+        'pure white and pure black are reserved in the palette of a page that has them, and of no other',
+        added['ends'][0] == [(255, 255, 255, 255), (0, 0, 0, 255)] and added['mid'][0] == [],
+        f'{added["ends"][0]} / {added["mid"][0]}',
+    )
+    entries = _indices_of(added['ends'][1])[1]
+    check(
+        'and that page ships them pure',
+        (entries == 255).all(axis=1).any()
+        and (entries == 0).all(axis=1).any()
+        and all((_rgb_of(added['ends'][1])[(shown[0] == lvl).all(axis=2)] == lvl).all() for lvl in (255, 0)),
+    )
+    failing = _Recording(pipeline.liq, fail='liq_image_quantize')
+    with mock.patch.object(pipeline, 'liq', failing):
+        try:
+            pipeline.render_page(src, prof)
+            outcome = 'rendered'
+        except pipeline.RenderFailed:
+            outcome = 'RenderFailed'
+        except Exception as exc:
+            outcome = type(exc).__name__
+    names = [name for name, _ in failing.calls]
+    check('a quantiser that fails is a page that will not render, not a crash', outcome == 'RenderFailed', outcome)
+    check(
+        'and what was made before it failed is still freed',
+        names.count('liq_image_destroy') == 1
+        and names.count('liq_attr_destroy') == 1
+        and 'liq_result_destroy' not in names,
+        f'{[n for n in names if n.endswith("destroy")]}',
     )
 
 
@@ -10966,6 +11077,7 @@ async def main() -> int:
     check_webp_colour()
     print('palette pin')
     check_palette_pin()
+    check_palette_quantiser()
     print('colour pad ring')
     check_colour_pad_ring()
     print('webtoon pad')
