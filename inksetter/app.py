@@ -15,7 +15,7 @@ import collections
 import contextlib
 import importlib.resources
 from email.message import Message
-from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
+from urllib.parse import quote, unquote, urljoin, urlsplit, urlunsplit
 from fastapi import FastAPI, Request
 from fastapi.responses import (
     HTMLResponse,
@@ -26,7 +26,7 @@ from fastapi.responses import (
 
 from . import __version__, cores, kavita, kosync, logs, status, web
 from .cache import DiskCache, Prefetcher, render_key
-from .imaging import cbz, profiles
+from .imaging import azw3, cbz, profiles
 from .imaging.pipeline import RenderFailed, UnreadableImage, render_page
 from .imaging.profiles import Profile, cover_for
 from .opds import rewrite
@@ -537,6 +537,8 @@ async def _repacking(chunks, body, track: status.Download, sync: kosync.Pending 
                 if sync is not None:
                     await asyncio.to_thread(_record, sync)
                 return
+            if not block:
+                continue
             track.update(sent=track.sent + len(block))
             if sync is not None:
                 sync.feed(block)
@@ -554,14 +556,6 @@ def _spool():
 
 
 _ZIP_MAGIC = (b'PK\x03\x04', b'PK\x05\x06', b'PK\x07\x08')
-_ZIP_TYPES = frozenset(
-    {
-        'application/vnd.comicbook+zip',
-        'application/x-cbz',
-        'application/zip',
-        'application/x-zip-compressed',
-    }
-)
 
 
 _EPUB_TYPE = 'application/epub+zip'
@@ -594,10 +588,6 @@ def _is_comic_zip(ctype: str, body) -> bool:
     return not _is_epub(ctype, head) and head[:4] in _ZIP_MAGIC
 
 
-def _probably_zip(url: str, ctype: str) -> bool:
-    return url.lower().endswith(('.cbz', '.zip')) or ctype.split(';')[0].strip().lower() in _ZIP_TYPES
-
-
 async def _cover_bytes(url: str | None, request: Request) -> bytes | None:
     if not url:
         return None
@@ -619,7 +609,7 @@ def _stale(headers: dict[str, str]) -> dict[str, str]:
     return out
 
 
-async def _repack_over_ranges(url: str, cover_url: str | None, p: Profile, request: Request, track):
+async def _repack_over_ranges(url: str, cover_url: str | None, p: Profile, request: Request, track, pack=None):
     headers = request_headers(request.headers)
     reader = await asyncio.to_thread(open_range, url, headers)
     if reader is None:
@@ -629,7 +619,7 @@ async def _repack_over_ranges(url: str, cover_url: str | None, p: Profile, reque
         if not await asyncio.to_thread(_is_comic_zip, ctype, reader):
             await asyncio.to_thread(reader.close)
             return None
-        return await _repack(reader, url, cover_url, p, request, track, reader.headers)
+        return await (pack or _repack)(reader, url, cover_url, p, request, track, reader.headers)
     except Exception:
         await asyncio.to_thread(reader.close)
         return None
@@ -681,6 +671,47 @@ async def _repack(src, url: str, cover_url: str | None, p: Profile, request: Req
     )
 
 
+def _attachment(name: str) -> str:
+    plain = ''.join(ch if ' ' <= ch <= '~' and ch not in '"\\' else '_' for ch in name)
+    if plain == name:
+        return f'attachment; filename="{name}"'
+    return f'attachment; filename="{plain}"; filename*=UTF-8\'\'{quote(name, safe="")}'
+
+
+def _kindle_name(url: str, upstream) -> tuple[str, str]:
+    named = _download_name(url, upstream)
+    stem, dot, suffix = named.rpartition('.')
+    title = stem if dot and stem and suffix.lower() in ('cbz', 'zip') else named
+    return title, f'{title}{azw3.SUFFIX}'
+
+
+async def _kindle_book(src, url: str, cover_url: str | None, p: Profile, request: Request, track, upstream):
+    title, name = _kindle_name(url, upstream)
+    track.update(name=name)
+    cover = await _pick_cover(url, cover_url, request)
+    meta = await kavita.for_download(url)
+    book = azw3.Book(_spool(), p.width, p.height, title, rewrite.encode_token(url))
+    try:
+        chunks = await asyncio.to_thread(
+            cbz.repack_iter,
+            src,
+            p,
+            settings.repack_page_workers,
+            cover=cover,
+            comicinfo=meta,
+            progress=_reporter(track),
+            out=book,
+        )
+    except BaseException:
+        book.close()
+        raise
+    return StreamingResponse(
+        _repacking(chunks, src, track),
+        media_type=azw3.MIME,
+        headers={'content-disposition': _attachment(name)},
+    )
+
+
 @app.api_route('/{profile}/dl-status/{job}', methods=['GET', 'HEAD'])
 async def download_status(profile: str, job: str):
     _profile_or_404(profile)
@@ -698,7 +729,7 @@ async def download(profile: str, token: str, request: Request, job: str = ''):
         resp = await client.stream(url, request_headers(request.headers))
         ctype = resp.headers.get('content-type', 'application/octet-stream')
         out_headers = {k: v for k, v in resp.headers.items() if k.lower() in FORWARD_RESPONSE}
-        if p.fmt != 'raw' and _probably_zip(url, ctype):
+        if p.fmt != 'raw' and cbz.probably_zip(url, ctype):
             out_headers = _stale(out_headers)
             ctype = 'application/vnd.comicbook+zip'
         head = Response(media_type=ctype, headers=out_headers)
@@ -749,6 +780,54 @@ async def _deliver(p: Profile, url: str, cover_url: str | None, request: Request
     track.update(name=_download_name(url, out_headers), sent=int(out_headers['content-length']))
     track.finish('done')
     return StreamingResponse(_drain(body), media_type=ctype, headers=out_headers)
+
+
+@app.api_route('/{profile}/azw3/{token}.azw3', methods=['GET', 'HEAD'])
+@app.api_route('/{profile}/azw3/{job}/{token}.azw3', methods=['GET', 'HEAD'])
+async def kindle_download(profile: str, token: str, request: Request, job: str = ''):
+    p = azw3.profile_for(_profile_or_404(profile))
+    if p is None:
+        raise UpstreamError(404, 'this profile makes no AZW3 book: the Kindle profiles do, bar the webtoon ones')
+    url, cover_url = rewrite.decode_parts(token)
+    if request.method == 'HEAD':
+        resp = await client.stream(url, request_headers(request.headers))
+        _, name = _kindle_name(url, resp.headers)
+        head = Response(media_type=azw3.MIME, headers={'content-disposition': _attachment(name)})
+        del head.headers['content-length']
+        return head
+
+    track = board.begin(profile, _download_name(url, {}), functools.partial(jobs.set, job))
+    track.update(stage='fetching', done=0, total=0)
+    try:
+        return await _deliver_kindle(p, url, cover_url, request, track)
+    except BaseException as exc:
+        track.finish('stopped' if isinstance(exc, asyncio.CancelledError) else 'error')
+        raise
+
+
+async def _deliver_kindle(p: Profile, url: str, cover_url: str | None, request: Request, track) -> Response:
+    ranged = await _repack_over_ranges(url, cover_url, p, request, track, _kindle_book)
+    if ranged is not None:
+        return ranged
+    body = _spool()
+    try:
+        resp = await client.stream(url, request_headers(request.headers), body)
+    except BaseException:
+        body.close()
+        raise
+    if not _is_comic_zip(resp.headers.get('content-type', ''), body):
+        body.close()
+        raise UpstreamError(502, 'an AZW3 book is made from a comic archive, and upstream sent something else')
+    body.seek(0)
+    upstream = {k: v for k, v in resp.headers.items() if k.lower() in FORWARD_RESPONSE}
+    try:
+        return await _kindle_book(body, url, cover_url, p, request, track, upstream)
+    except Exception as exc:
+        body.close()
+        raise UpstreamError(502, 'upstream sent a comic archive that cannot be read') from exc
+    except BaseException:
+        body.close()
+        raise
 
 
 # --------------------------------------------------------------------------

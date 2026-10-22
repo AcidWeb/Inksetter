@@ -11,6 +11,7 @@ from urllib.parse import quote
 
 from .opds import rewrite
 from .opds.rewrite import ATOM, Ctx
+from .imaging import azw3, cbz
 from .imaging.profiles import Profile
 
 BROWSE_KIND = {'f': 'b', 's': 'bs', 'osd': 'bs'}
@@ -127,19 +128,22 @@ if(!window.Promise)return;
 ev.preventDefault();
 var id=(window.crypto&&crypto.randomUUID)?crypto.randomUUID()
 :String(Date.now())+'-'+String(Math.random()).slice(2,8);
-var href=link.href+(link.href.indexOf('?')<0?'?':'&')+'job='+id;
+var href=link.classList.contains('kf8')?link.href.replace(/[^\\/]*$/,id+'/$&')
+:link.href+(link.href.indexOf('?')<0?'?':'&')+'job='+id;
 var note=document.createElement('span');
 note.className='working';
 note.setAttribute('role','status');
 note.textContent=say.starting;
 link.replaceWith(note);
-var frame=document.createElement('iframe');
+var frame=null;
+if(link.classList.contains('kf8'))location.assign(href);
+else{frame=document.createElement('iframe');
 frame.hidden=true;
 frame.src=href;
-document.body.appendChild(frame);
+document.body.appendChild(frame);}
 var missed=0,timer=setInterval(poll,__POLL_MS__);
 function stop(word){clearInterval(timer);note.textContent=word;
-setTimeout(function(){frame.remove();},3000);}
+if(frame)setTimeout(function(){frame.remove();},3000);}
 function poll(){
 fetch(api+id,{headers:{accept:'application/json'}}).then(function(r){
 return r.ok?r.json():null;}).then(function(s){
@@ -169,6 +173,7 @@ class Item:
     cover: str | None
     note: str
     download: bool
+    kindle: str | None = None
 
 
 @dataclass(frozen=True)
@@ -289,7 +294,18 @@ def _entry_item(entry, ctx: Ctx) -> Item | None:
         cover=_map(cover, 'img', ctx),
         note=_note(entry, acquisition),
         download=acquisition is not None,
+        kindle=_kindle_href(href) if acquisition is not None and _comic_archive(acquisition) else None,
     )
+
+
+def _comic_archive(link) -> bool:
+    kind = link.get('type') or ''
+    return not kind.split(';')[0].strip() or cbz.probably_zip(link.get('href') or '', kind)
+
+
+def _kindle_href(href: str) -> str | None:
+    head, sep, token = href.rpartition('/dl/')
+    return f'{head}/azw3/{token}{azw3.SUFFIX}' if sep else None
 
 
 def parse(body: bytes, ctx: Ctx) -> Feed | None:
@@ -339,13 +355,15 @@ def _cover_tag(item: Item) -> str:
     return f'<img class="cover" loading="lazy" alt="" src="{escape(item.cover)}">'
 
 
-def _rows(items, trail: str, status: str) -> str:
+def _rows(items, trail: str, status: str, kindle: bool = False) -> str:
     out = []
     for item in items:
         note = f'<div class="s">{escape(item.note)}</div>' if item.note else ''
         if item.download:
             title = f'<span class="t">{escape(item.title)}</span>'
             action = f'<a class="dl" href="{escape(item.href)}">Download CBZ</a>'
+            if kindle and item.kindle:
+                action += f'<a class="dl kf8" href="{escape(item.kindle)}">Download AZW3</a>'
         else:
             href = escape(_q(item.href, trail))
             title = f'<a class="t" href="{href}">{escape(item.title)}</a>'
@@ -410,7 +428,7 @@ def page(feed: Feed, p: Profile, base: str, term: str = '', trail: str = '', her
     if not feed.items:
         parts.append('<div class="empty">Nothing here.</div>')
     elif any(i.download for i in feed.items):
-        parts.append(_rows(feed.items, child, f'{base}/{quote(p.name)}/dl-status/'))
+        parts.append(_rows(feed.items, child, f'{base}/{quote(p.name)}/dl-status/', azw3.profile_for(p) is not None))
         parts.append(f'<script>{SCRIPT}</script>')
     else:
         parts.append(_grid(feed.items, child))

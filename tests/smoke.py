@@ -233,6 +233,39 @@ def _thumb():
     return Response(fake_page(0), media_type='image/jpeg')
 
 
+NARROW_COVER = fake_colour_page(1000, 1600)
+MANGA_INFO = (
+    '<?xml version="1.0"?><ComicInfo xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">'
+    '<Writer>BlueBrand, Fujimaru</Writer><Penciller>Someone Else</Penciller>'
+    '<Manga>YesAndRightToLeft</Manga></ComicInfo>'
+)
+
+
+def _pages_cbz(info: str | None) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w') as z:
+        if info is not None:
+            z.writestr('ComicInfo.xml', info)
+        for i in range(2):
+            z.writestr(f'p{i:03d}.jpg', fake_page(i))
+    return buf.getvalue()
+
+
+@upstream.get('/opds/v1.2/manga.cbz')
+def _manga_cbz():
+    return Response(_pages_cbz(MANGA_INFO), media_type='application/vnd.comicbook+zip')
+
+
+@upstream.get('/opds/v1.2/bare.cbz')
+def _bare_cbz():
+    return Response(_pages_cbz(None), media_type='application/vnd.comicbook+zip')
+
+
+@upstream.get('/opds/v1.2/narrow-cover')
+def _narrow_cover():
+    return Response(NARROW_COVER, media_type='image/jpeg')
+
+
 FEED_V2 = {
     'metadata': {'title': 'Fake v2'},
     'links': [
@@ -1606,6 +1639,7 @@ def check_module_boundary() -> None:
                 'inksetter.imaging.pipeline',
                 'inksetter.imaging.cbz',
                 'inksetter.imaging.webtoon',
+                'inksetter.imaging.azw3',
             ],
             [
                 'httpx',
@@ -1800,7 +1834,7 @@ def check_repack_parallel() -> None:
 
     queue = [('page', i, f'{i:03d}.png', b'x') for i in range(1, 41)]
     with mock.patch.object(_cbz, '_render', slow):
-        run = _cbz._run_pooled(iter(queue), _zf.ZipFile(_io.BytesIO(), 'w'), prof, 3, 4)
+        run = _cbz._run_pooled(iter(queue), _cbz._Zip(), prof, 3, 4)
         next(run)
         closed = time.perf_counter()
         run.close()
@@ -7971,7 +8005,7 @@ async def check_fail_closed(c) -> None:
                 def fails(exc=exc):
                     raise exc
 
-                cbz._emit_rendered(zipfile.ZipFile(io.BytesIO(), 'w'), ('page', 1, 'p1.jpg', b'x'), 4, fails)
+                cbz._emit_rendered(cbz._Zip(), ('page', 1, 'p1.jpg', b'x'), 4, fails)
     finally:
         cbz.log.removeHandler(grab)
     traced = [bool(r.exc_info) for r in records if r.levelno == _logging.WARNING]
@@ -10371,6 +10405,792 @@ def _dl_href(html: str) -> str:
     return found.group(1) if found else ''
 
 
+_KF8_DIGITS = '0123456789ABCDEFGHIJKLMNOPQRSTUV'
+
+
+def _kf8_u32(b: bytes, at: int) -> int:
+    return struct.unpack_from('>I', b, at)[0]
+
+
+def _kf8_fvwi(b: bytes, pos: int) -> tuple[int, int]:
+    n = 0
+    while True:
+        c = b[pos]
+        pos += 1
+        n = n << 7 | c & 0x7F
+        if c & 0x80:
+            return n, pos
+
+
+def _kf8_strip(rec: bytes, flags: int) -> tuple[bytes, list[bytes]]:
+    entries = []
+    for bit in range(1, 16):
+        if flags >> bit & 1:
+            size = shift = k = 0
+            while True:
+                k += 1
+                c = rec[-k]
+                size |= (c & 0x7F) << shift
+                shift += 7
+                if c & 0x80:
+                    break
+            entries.append(rec[len(rec) - size : len(rec) - k])
+            rec = rec[: len(rec) - size]
+    if flags & 1:
+        rec = rec[: len(rec) - ((rec[-1] & 3) + 1)]
+    return rec, entries
+
+
+def _kf8_index(recs: list[bytes], at: int) -> tuple[list[tuple[str, dict]], list[bytes], list[bytes]]:
+    head = recs[at]
+    count, cncx = _kf8_u32(head, 24), _kf8_u32(head, 52)
+    tagx = _kf8_u32(head, 180)
+    tags = [tuple(head[k : k + 4]) for k in range(tagx + 12, tagx + _kf8_u32(head, tagx + 4), 4)]
+    entries = []
+    data = recs[at + 1 : at + 1 + count]
+    for rec in data:
+        idxt = _kf8_u32(rec, 20)
+        for k in range(_kf8_u32(rec, 24)):
+            pos = struct.unpack_from('>H', rec, idxt + 4 + 2 * k)[0]
+            key = rec[pos + 1 : pos + 1 + rec[pos]].decode()
+            pos += 1 + rec[pos]
+            control = rec[pos]
+            pos += 1
+            values: dict[int, list[int]] = {}
+            for tag, per, mask, end in tags:
+                if end:
+                    break
+                low = mask & -mask
+                for _ in range((control & mask) // low * per):
+                    value, pos = _kf8_fvwi(rec, pos)
+                    values.setdefault(tag, []).append(value)
+            entries.append((key, values))
+    return entries, recs[at + 1 + count : at + 1 + count + cncx], [head, *data]
+
+
+def _kf8_string(cncx: list[bytes], offset: int) -> str:
+    rec = cncx[offset >> 16]
+    length, pos = _kf8_fvwi(rec, offset & 0xFFFF)
+    return rec[pos : pos + length].decode()
+
+
+def _kf8_read(data: bytes) -> dict:
+    count = struct.unpack_from('>H', data, 76)[0]
+    offs = [_kf8_u32(data, 78 + 8 * i) for i in range(count)] + [len(data)]
+    recs = [data[offs[i] : offs[i + 1]] for i in range(count)]
+    r0 = recs[0]
+    compression, _, text_length, ntext, record_size = struct.unpack_from('>HHIHH', r0, 0)
+    exth_at = 16 + _kf8_u32(r0, 20)
+    exth, exth_all, pos = {}, [], exth_at + 12
+    for _ in range(_kf8_u32(r0, exth_at + 8)):
+        code, size = struct.unpack_from('>II', r0, pos)
+        exth[code] = r0[pos + 8 : pos + size]
+        exth_all.append((code, exth[code]))
+        pos += size
+    flags = _kf8_u32(r0, 240)
+    split = [_kf8_strip(r, flags) for r in recs[1 : 1 + ntext]]
+    text = b''.join(t for t, _ in split)
+    fdst = recs[_kf8_u32(r0, 192)]
+    flows = [struct.unpack_from('>II', fdst, 12 + 8 * k) for k in range(_kf8_u32(fdst, 8))]
+    skel, _, skel_records = _kf8_index(recs, _kf8_u32(r0, 252))
+    chunks, chunk_cncx, chunk_records = _kf8_index(recs, _kf8_u32(r0, 248))
+    toc, toc_cncx, toc_records = _kf8_index(recs, _kf8_u32(r0, 244))
+    first_image = _kf8_u32(r0, 108)
+
+    pieces: dict[int, list] = {}
+    for key, v in chunks:
+        pieces.setdefault(v[3][0], []).append((int(key), v[6][0], v[6][1], _kf8_string(chunk_cncx, v[2][0])))
+    pages = []
+    for number, (_, v) in enumerate(skel):
+        start, length = v[6][0], v[6][1]
+        html = text[start : start + length]
+        after = start + length
+        selectors = []
+        for insert, at, size, selector in reversed(pieces.get(number, [])):
+            cut = insert - start
+            html = html[:cut] + text[after + at : after + at + size] + html[cut:]
+            selectors.append(selector)
+        html = html.decode()
+        images = []
+        for digits, mime in re.findall(r'kindle:embed:([0-9A-V]{4})\?mime=([\w/]+)', html):
+            index = 0
+            for ch in digits:
+                index = index * 32 + _KF8_DIGITS.index(ch)
+            images.append((recs[first_image + index - 1], mime))
+        viewport = re.search(r'name="viewport" content="width=(\d+), height=(\d+)"', html)
+        body_aid = re.search(r'<body[^>]* aid="([^"]+)"', html)
+        pages.append(
+            {
+                'html': html,
+                'images': images,
+                'viewport': (int(viewport.group(1)), int(viewport.group(2))) if viewport else None,
+                'selectors': selectors,
+                'body_aid': body_aid.group(1) if body_aid else None,
+            }
+        )
+    return {
+        'type': data[60:68],
+        'name': data[:32],
+        'compression': compression,
+        'text_length': text_length,
+        'record_size': record_size,
+        'text': text,
+        'text_records': [t for t, _ in split],
+        'trailing': [e for _, e in split],
+        'flows': flows,
+        'exth': exth,
+        'authors': [v.decode() for c, v in exth_all if c == 100],
+        'pages': pages,
+        'toc': [(v[1][0], v[2][0], _kf8_string(toc_cncx, v[3][0]), v[6]) for _, v in toc],
+        'index_records': skel_records + chunk_records + toc_records,
+        'images': recs[first_image : _kf8_u32(r0, 192)],
+        'skel_records': len(skel_records) - 1,
+        'chunk_cncx': len(chunk_cncx),
+        'records': recs,
+    }
+
+
+def _kf8_tbs_ok(book: dict) -> list[int]:
+    wrong = []
+    start = 0
+    for k, (text, entries) in enumerate(zip(book['text_records'], book['trailing'], strict=True)):
+        end = start + len(text)
+        touching = [i for i, (at, length, _, _) in enumerate(book['toc']) if at < end and at + length > start]
+        seq = entries[0] if entries else b''
+        if not touching:
+            ok = seq == b''
+        elif not seq:
+            ok = False
+        else:
+            value, pos = _kf8_fvwi(seq, 0)
+            first, flags = value >> 3, value & 7
+            count = 1
+            if flags & 2:
+                _, pos = _kf8_fvwi(seq, pos)
+            if flags & 4:
+                count = seq[pos]
+            ok = first == touching[0] and count == len(touching)
+        if not ok:
+            wrong.append(k)
+        start = end
+    return wrong
+
+
+def _tiny_png(n: int) -> bytes:
+    raw = b'\0' + bytes((n >> 8 & 255, n & 255, 7))
+    return (
+        b'\x89PNG\r\n\x1a\n'
+        + _png_chunk(b'IHDR', struct.pack('>IIBBBBB', 1, 1, 8, 2, 0, 0, 0))
+        + _png_chunk(b'IDAT', zlib.compress(raw))
+        + _png_chunk(b'IEND', b'')
+    )
+
+
+def _png_chunk(kind: bytes, data: bytes) -> bytes:
+    return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data))
+
+
+def check_azw3_book() -> None:
+    from inksetter.imaging import azw3
+
+    kp = profiles.PROFILES['kindle-colorsoft-1-2']
+    w, h = kp.width, kp.height
+    grey, _ = pipeline.render_page(fake_page(1), kp)
+    colour, _ = pipeline.render_page(fake_colour_page(), kp)
+    photo = pyvips.Image.new_from_memory(np.full((h, w, 3), 90, np.uint8).tobytes(), w, h, 3, 'uchar')
+    jpeg = photo.jpegsave_buffer(Q=90)
+    wide = np.zeros((600, 800, 3), np.uint8)
+    wide[:, :, 0] = np.arange(800) % 256
+    webp = pyvips.Image.new_from_memory(wide.tobytes(), 800, 600, 3, 'uchar').webpsave_buffer(lossless=True)
+    check('premise: the grey page is a 4-bit PNG', grey[24:26] == b'\x04\x00', grey[24:26].hex())
+    check('premise: the colour page is a palette PNG', colour[24:26] == b'\x08\x03', colour[24:26].hex())
+
+    title = 'Fake Vol 1 — ünïcode'
+    book = azw3.Book(io.BytesIO(), w, h, title, 'ident-a')
+    for name, blob in (('1.png', grey), ('2.png', colour), ('3.jpg', jpeg), ('4.webp', webp), ('5.png', b'junk')):
+        book.page(name, blob)
+    data = b''.join(book.finish())
+    got = _kf8_read(data)
+
+    check('an AZW3 is a BOOKMOBI PalmDB', got['type'] == b'BOOKMOBI', repr(got['type']))
+    check(
+        'its database name is plain ASCII, as a PalmDB name has to be',
+        all(32 < c < 127 for c in got['name'].rstrip(b'\0')) and got['name'][31] == 0,
+        repr(got['name']),
+    )
+    check(
+        'the text is uncompressed and every record holds 4096 bytes of it but the last',
+        got['compression'] == 1
+        and got['record_size'] == 4096
+        and all(len(t) == 4096 for t in got['text_records'][:-1])
+        and 0 < len(got['text_records'][-1]) <= 4096,
+        f'compression {got["compression"]}, {[len(t) for t in got["text_records"]]}',
+    )
+    check('record 0 gives the text length', got['text_length'] == len(got['text']), f'{got["text_length"]}')
+    check(
+        'the flows are the pages and then their stylesheet',
+        got['flows'][0][0] == 0 and got['flows'][0][1] == got['flows'][1][0] and got['flows'][1][1] == len(got['text']),
+        f'{got["flows"]}',
+    )
+    exth = got['exth']
+    for code, want, label in (
+        (122, b'true', 'fixed layout'),
+        (123, b'comic', 'a comic'),
+        (126, f'{w}x{h}'.encode(), 'at the panel resolution'),
+        (501, b'PDOC', 'filed as a personal document, the one sideloaded kind whose cover the library shows'),
+        (503, title.encode('utf-8'), 'titled'),
+        (125, struct.pack('>I', 5), 'with a resource per page and one for the thumbnail'),
+        (201, struct.pack('>I', 0), 'with its first page for a cover'),
+        (129, b'kindle:embed:0001', 'with the cover named as KF8 names a picture'),
+    ):
+        check(f'the book says it is {label}', exth.get(code) == want, f'{code}: {exth.get(code)!r}')
+    thumb_at = _kf8_u32(exth[202], 0) if len(exth.get(202, b'')) == 4 else None
+    thumb = got['images'][thumb_at] if thumb_at is not None and thumb_at < len(got['images']) else b''
+    small = pyvips.Image.new_from_buffer(grey, '').thumbnail_image(900, height=1350)
+    seen = pyvips.Image.new_from_buffer(thumb, '') if thumb.startswith(b'\xff\xd8\xff\xe0') else None
+    check(
+        'with no picture behind it, the thumbnail is a JFIF JPEG of the first page itself, within 900 by 1350',
+        seen is not None
+        and (seen.width, seen.height) == (small.width, small.height)
+        and (seen.colourspace('b-w') - small.colourspace('b-w')).abs().avg() < 4,
+        f'{thumb[:4]!r} {(seen.width, seen.height) if seen else None}',
+    )
+    check(
+        'and it sits right after the cover, where calibre puts it, and is no page',
+        thumb_at == 1 and all(img != thumb for p in got['pages'] for img, _ in p['images']),
+        f'at {thumb_at}',
+    )
+
+    pages = got['pages']
+    check('a page the Kindle cannot show is left out, and only that', len(pages) == 4, f'{len(pages)} pages')
+    shown = [p['images'][0] for p in pages if len(p['images']) == 1]
+    check(
+        'every other page is its own picture, as handed in and in order',
+        [img for img, _ in shown[:3]] == [grey, colour, jpeg],
+        f'{len(shown)} pages with one image',
+    )
+    check(
+        'and each is labelled with its type',
+        [mime for _, mime in shown] == ['image/png', 'image/png', 'image/jpeg', 'image/png'],
+        f'{[mime for _, mime in shown]}',
+    )
+    converted = shown[3][0] if len(shown) == 4 else b''
+    same = converted.startswith(b'\x89PNG') and np.array_equal(
+        pyvips.Image.new_from_buffer(converted, '').numpy()[..., :3], wide
+    )
+    check('a WebP page, which KF8 has no place for, goes in as a PNG of the same pixels', same)
+    check(
+        'every page is laid out at the panel size',
+        all(p['viewport'] == (w, h) for p in pages),
+        f'{[p["viewport"] for p in pages]}',
+    )
+    check(
+        'every fragment goes into the body of its own page',
+        all(p['selectors'] == [f"P-//*[@aid='{p['body_aid']}']"] for p in pages),
+        f'{[(p["selectors"], p["body_aid"]) for p in pages][:2]}',
+    )
+    scale = min(w / 800, h / 600)
+    fw, fh = round(800 * scale), round(600 * scale)
+    css = got['text'][got['flows'][1][0] :].decode()
+    cls = re.search(r'class="(\w+)"/></div>', pages[3]['html']) if len(pages) == 4 else None
+    rule = re.search(r'\.' + cls.group(1) + r' \{([^}]*)\}', css) if cls else None
+    check(
+        'a page off the panel shape is fitted to it and centred',
+        rule is not None
+        and f'width: {fw}px' in rule.group(1)
+        and f'height: {fh}px' in rule.group(1)
+        and f'margin: {(h - fh) // 2}px 0 0 {(w - fw) // 2}px' in rule.group(1),
+        ' '.join(rule.group(1).split()) if rule else 'no rule',
+    )
+    check(
+        'a panel-sized page is shown at exactly its own size',
+        all(
+            re.search(
+                r'\.' + re.search(r'class="(\w+)"/></div>', p['html']).group(1) + rf' \{{[^}}]*height: {h}px;[^}}]*'
+                rf'width: {w}px;[^}}]*margin: 0;',
+                css,
+            )
+            for p in pages[:3]
+        ),
+    )
+    check(
+        'the contents name every page, from its body tag',
+        [label for _, _, label, _ in got['toc']] == [f'Page {i}' for i in range(1, 5)]
+        and all(got['text'][at : at + 5] == b'<body' for at, _, _, _ in got['toc']),
+        f'{got["toc"][:2]}',
+    )
+    bad = _kf8_tbs_ok(got)
+    check('every text record names the contents entries that touch it', not bad, f'records {bad[:5]}')
+
+    def thumbnail_of(source) -> pyvips.Image | None:
+        made = azw3.Book(io.BytesIO(), w, h, 'x', 'x')
+        made.page('1.png', grey, source)
+        book = _kf8_read(b''.join(made.finish()))
+        at = book['exth'].get(202)
+        blob = book['images'][_kf8_u32(at, 0)] if at else b''
+        return pyvips.Image.new_from_buffer(blob, '') if blob.startswith(b'\xff\xd8\xff\xe0') else None
+
+    def fitted(sw: int, sh: int) -> tuple[int, int]:
+        scale = min(1.0, 900 / sw, 1350 / sh)
+        return round(sw * scale), round(sh * scale)
+
+    def near(a: pyvips.Image | None, wh: tuple[int, int]) -> bool:
+        return a is not None and abs(a.width - wh[0]) <= 1 and abs(a.height - wh[1]) <= 1
+
+    def like(a: pyvips.Image, source: bytes) -> float:
+        b = pyvips.Image.new_from_buffer(source, '').thumbnail_image(a.width, height=a.height, size='force')
+        b = b.flatten(background=255) if b.hasalpha() else b
+        return (a.colourspace('b-w') - b.colourspace('b-w')).abs().avg()
+
+    narrow = fake_colour_page(1300, 2000)
+    seen = thumbnail_of(narrow)
+    check(
+        'a page that came from a picture gets its thumbnail from that picture, at its own shape, not the panel',
+        near(seen, fitted(1300, 2000)) and like(seen, narrow) < 6,
+        f'{(seen.width, seen.height) if seen else None} for a 1300 by 2000 picture',
+    )
+    small_source = fake_colour_page(400, 600)
+    seen = thumbnail_of(small_source)
+    check(
+        'a picture smaller than the box is not enlarged for it',
+        near(seen, (400, 600)),
+        f'{(seen.width, seen.height) if seen else None}',
+    )
+    clear = np.zeros((1500, 1000, 4), np.uint8)
+    clear[300:1200, 200:800] = (200, 40, 40, 255)
+    holed = pyvips.Image.new_from_array(clear).copy(interpretation='srgb').pngsave_buffer()
+    seen = thumbnail_of(holed)
+    corner = seen.crop(0, 0, 20, 20).avg() if seen else 0
+    check(
+        'a transparent picture is laid on white, as a page would be',
+        near(seen, fitted(1000, 1500)) and corner > 240,
+        f'{(seen.width, seen.height) if seen else None}, corner {corner:.0f}',
+    )
+    lying = pyvips.Image.new_from_buffer(narrow, '').rot90().copy()
+    lying.set_type(pyvips.GValue.gint_type, 'orientation', 8)
+    seen = thumbnail_of(lying.jpegsave_buffer(Q=92))
+    check(
+        'a picture stored on its side, as a camera stores one, is turned the way its EXIF says',
+        near(seen, fitted(1300, 2000)) and like(seen, narrow) < 8,
+        f'{(seen.width, seen.height) if seen else None}',
+    )
+    seen = thumbnail_of(b'not a picture')
+    check(
+        'and a picture that will not open leaves the page to stand for itself',
+        near(seen, fitted(w, h)),
+        f'{(seen.width, seen.height) if seen else None}',
+    )
+
+    again = azw3.Book(io.BytesIO(), w, h, title, 'ident-a')
+    again.page('1.png', grey)
+    other = azw3.Book(io.BytesIO(), w, h, title, 'ident-b')
+    other.page('1.png', grey)
+    first = _kf8_read(b''.join(again.finish()))['exth'][113]
+    second = _kf8_read(b''.join(other.finish()))['exth'][113]
+    check(
+        'a book keeps its ASIN when made again, and another book gets another',
+        first == exth[113] != second and b'ident' not in first,
+        f'{first!r} {second!r}',
+    )
+
+    empty = azw3.Book(io.BytesIO(), w, h, 'x', 'x')
+    try:
+        b''.join(empty.finish())
+        refused = False
+    except ValueError:
+        refused = True
+    check('a book with no page in it is refused, not written', refused)
+
+    def described(info: bytes | None, meta: bytes | None = None, name: str = 'ComicInfo.xml') -> dict:
+        made = azw3.Book(io.BytesIO(), w, h, 'x', 'x')
+        if info is not None:
+            made.copy(name, info)
+        made.page('1.png', grey)
+        return _kf8_read(b''.join(made.finish(meta)))
+
+    def comicinfo(**fields: str) -> bytes:
+        return ('<ComicInfo>' + ''.join(f'<{k}>{v}</{k}>' for k, v in fields.items()) + '</ComicInfo>').encode()
+
+    def direction(book: dict) -> tuple:
+        return book['exth'].get(527), book['exth'].get(525)
+
+    got = described(MANGA_INFO.encode())
+    check(
+        "a book takes its authors from its ComicInfo's Writer, one record each, and its Penciller only failing that",
+        got['authors'] == ['BlueBrand', 'Fujimaru'],
+        f'{got["authors"]}',
+    )
+    check(
+        'and turns right to left where its ComicInfo calls it right-to-left manga, as calibre marks a book so',
+        direction(got) == (b'rtl', b'horizontal-rl'),
+        f'{direction(got)}',
+    )
+    for value, rtl in (('Yes', True), ('yes', True), ('No', False), ('Unknown', False)):
+        got = described(comicinfo(Manga=value))
+        check(
+            f'Manga={value} turns it {"right to left" if rtl else "left to right"}',
+            direction(got) == ((b'rtl', b'horizontal-rl') if rtl else (b'ltr', b'horizontal-lr')),
+            f'{direction(got)}',
+        )
+    got = described(None)
+    check(
+        'a book with no ComicInfo has no author and turns left to right',
+        got['authors'] == [] and direction(got) == (b'ltr', b'horizontal-lr'),
+        f'{got["authors"]} {direction(got)}',
+    )
+    got = described(comicinfo(Penciller='Artist One'))
+    check('a ComicInfo with no Writer gives its Penciller', got['authors'] == ['Artist One'], f'{got["authors"]}')
+    got = described(comicinfo(Writer=' A ,  A, B  C ,, '))
+    check('names are trimmed, spaced once and taken once', got['authors'] == ['A', 'B C'], f'{got["authors"]}')
+    got = described(None, meta=comicinfo(Writer='From Kavita', Manga='Yes'))
+    check(
+        'where the archive has no ComicInfo, the generated one is read',
+        got['authors'] == ['From Kavita'] and direction(got)[0] == b'rtl',
+        f'{got["authors"]} {direction(got)}',
+    )
+    got = described(comicinfo(Writer='Its Own'), meta=comicinfo(Writer='From Kavita'))
+    check("and where it has one, the archive's own wins", got['authors'] == ['Its Own'], f'{got["authors"]}')
+    got = described(comicinfo(Writer='In A Folder'), name='Meta/comicinfo.XML')
+    check('a ComicInfo in a folder, in any case, is read', got['authors'] == ['In A Folder'], f'{got["authors"]}')
+    got = described(b'<ComicInfo xmlns="urn:x"><Writer>Spaced Name</Writer></ComicInfo>')
+    check('a ComicInfo with a namespace of its own is read', got['authors'] == ['Spaced Name'], f'{got["authors"]}')
+    for label, broken in (('cut short', b'<ComicInfo><Writer>Half'), ('no XML at all', b'\xff\xfe\x00junk')):
+        try:
+            got = described(broken)
+            fine = got['authors'] == [] and direction(got)[0] == b'ltr'
+        except Exception as exc:
+            fine = False
+            got = {'authors': repr(exc)}
+        check(f'a ComicInfo {label} is passed over, not fatal', fine, f'{got["authors"]}')
+
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, 'w') as z:
+        z.writestr('p000.jpg', fake_page(0))
+        z.writestr('extra/preview.dat', grey)
+        z.writestr('p001.jpg', fake_page(1))
+    shelf = azw3.Book(io.BytesIO(), w, h, 'x', 'x')
+    repacked = _kf8_read(b''.join(cbz.repack_iter(io.BytesIO(archive.getvalue()), kp, 2, out=shelf)))
+    check(
+        'a repack hands the book its pages only: a file that is no page stays out, picture or not',
+        len(repacked['pages']) == 2,
+        f'{len(repacked["pages"])} pages',
+    )
+
+    many = 4600
+    big = azw3.Book(io.BytesIO(), w, h, 'Long', 'long')
+    for n in range(many):
+        big.page(f'{n}.png', _tiny_png(n))
+    got = _kf8_read(b''.join(big.finish()))
+    order = [p['images'][0][0] if p['images'] else b'' for p in got['pages']]
+    check(
+        'a long book keeps every page, each on its own picture',
+        len(order) == many and order == [_tiny_png(n) for n in range(many)],
+        f'{len(order)} pages',
+    )
+    check(
+        'premise: the long book needs more than one record for an index and its strings',
+        got['skel_records'] > 1 and got['chunk_cncx'] > 1,
+        f'{got["skel_records"]} skeleton records, {got["chunk_cncx"]} string records',
+    )
+    sizes = [len(r) for r in got['index_records']]
+    check('no index record reaches 64 KiB, which its offsets cannot address', max(sizes) < 0x10000, f'{max(sizes)}')
+    bad = _kf8_tbs_ok(got)
+    check(
+        'and every text record of it still names the contents entries that touch it',
+        not bad,
+        f'{len(bad)} of {len(got["text_records"])} wrong',
+    )
+    check(
+        'its contents key every page in order',
+        [label for _, _, label, _ in got['toc']] == [f'Page {i}' for i in range(1, many + 1)],
+    )
+
+
+async def check_azw3_download(c) -> None:
+    feed = (await c.get('/kindle-colorsoft-1-2/catalog')).text
+    tok = re.search(r'/kindle-colorsoft-1-2/dl/([\w-]+)', feed).group(1)
+    check('a reader is never offered the Kindle book in a feed', '/azw3/' not in feed)
+
+    r = await _get(c, f'/kindle-colorsoft-1-2/azw3/{tok}.azw3')
+    check(
+        'a Kindle profile makes an AZW3',
+        r.status_code == 200 and r.headers.get('content-type') == 'application/x-mobi8-ebook',
+        f'{r.status_code} {r.headers.get("content-type")}',
+    )
+    check(
+        'named after the upstream file',
+        r.headers.get('content-disposition') == 'attachment; filename="Fake Vol 1.azw3"',
+        repr(r.headers.get('content-disposition')),
+    )
+    for segment, title in (
+        ('Fake%20Vol%201.cbz', 'Fake Vol 1'),
+        ('Fake%20Vol%201.ZIP', 'Fake Vol 1'),
+        ('Vol.%2012', 'Vol. 12'),
+        ('One%20Piece%20v1.5', 'One Piece v1.5'),
+        ('.cbz', '.cbz'),
+    ):
+        got = app_mod._kindle_name(f'http://127.0.0.1:8899/opds/v1.2/{segment}', {})
+        check(
+            f'a download named {segment} makes a book titled {title!r}, losing only an archive suffix',
+            got == (title, f'{title}.azw3'),
+            f'{got}',
+        )
+    try:
+        book = _kf8_read(r.content)
+    except Exception as exc:
+        book = {'pages': [], 'exth': {}}
+        check('the AZW3 reads back', False, f'{type(exc).__name__}: {exc}')
+    packed = await c.get(f'/kindle-colorsoft-1-2/dl/{tok}')
+    zf = zipfile.ZipFile(io.BytesIO(packed.content))
+    pages = [zf.read(n) for n in sorted(zf.namelist()) if n.endswith(_PAGE_SUFFIXES)]
+    got = [p['images'][0][0] for p in book['pages'] if p['images']]
+    check('premise: the CBZ has every page', len(pages) >= 3, f'{len(pages)}')
+    check(
+        'its pages are the CBZ pages of the same profile, in order',
+        got == pages,
+        f'{len(got)} pages against {len(pages)}',
+    )
+    check('its title is the upstream file name', book['exth'].get(503) == b'Fake Vol 1', repr(book['exth'].get(503)))
+
+    def library_cover(got) -> pyvips.Image | None:
+        at = got['exth'].get(202)
+        blob = got['images'][_kf8_u32(at, 0)] if at else b''
+        return pyvips.Image.new_from_buffer(blob, '') if blob.startswith(b'\xff\xd8\xff') else None
+
+    def resembles(seen: pyvips.Image, source: bytes) -> float:
+        want = pyvips.Image.new_from_buffer(source, '').thumbnail_image(seen.width, height=seen.height, size='force')
+        return (seen.colourspace('b-w') - want.colourspace('b-w')).abs().avg()
+
+    seen = library_cover(book)
+    check(
+        "the library cover is page 1's own picture at its own shape, 2:3, not the panel's padded 3:4",
+        seen is not None and (seen.width, seen.height) == (900, 1350) and resembles(seen, fake_page(0)) < 6,
+        f'{(seen.width, seen.height) if seen else None}',
+    )
+    up = 'http://127.0.0.1:8899/opds/v1.2'
+    covered = encode_token(f'{up}/books/7/file', f'{up}/narrow-cover')
+    r = await _get(c, f'/kindle-colorsoft-1-2/azw3/{covered}.azw3')
+    got = _kf8_read(r.content) if r.status_code == 200 else {'pages': [], 'exth': {}, 'images': []}
+    packed = zipfile.ZipFile(io.BytesIO((await c.get(f'/kindle-colorsoft-1-2/dl/{covered}')).content))
+    cbz_pages = [packed.read(n) for n in sorted(packed.namelist()) if n.endswith(_PAGE_SUFFIXES)]
+    check(
+        'premise: a server cover unlike page 1 is put in front of it',
+        len(cbz_pages) == len(pages) + 1 and [p['images'][0][0] for p in got['pages'] if p['images']] == cbz_pages,
+        f'{len(cbz_pages)} pages against {len(pages)}',
+    )
+    seen = library_cover(got)
+    check(
+        'and the library cover is that cover as the server sent it, at its own narrow shape',
+        seen is not None and (seen.width, seen.height) == (844, 1350) and resembles(seen, NARROW_COVER) < 6,
+        f'{(seen.width, seen.height) if seen else None}',
+    )
+
+    from inksetter import kavita
+
+    async def as_book(path: str) -> dict:
+        r = await _get(c, f'/kindle-colorsoft-1-2/azw3/{encode_token(f"{up}/{path}")}.azw3')
+        return _kf8_read(r.content) if r.status_code == 200 else {'authors': None, 'exth': {}}
+
+    got = await as_book('manga.cbz')
+    check(
+        "a download takes its authors and reading direction from the archive's ComicInfo",
+        got['authors'] == ['BlueBrand', 'Fujimaru'] and got['exth'].get(527) == b'rtl',
+        f'{got["authors"]} {got["exth"].get(527)}',
+    )
+    got = await as_book('bare.cbz')
+    check(
+        'premise: an archive with no ComicInfo, and no Kavita to ask, has no author and turns left to right',
+        got['authors'] == [] and got['exth'].get(527) == b'ltr',
+        f'{got["authors"]} {got["exth"].get(527)}',
+    )
+    series = {
+        'series': {'name': 'Example Manga', 'format': 1},
+        'manga': True,
+        'meta': {'writers': [{'name': 'Kavita Writer'}], 'pencillers': [{'name': 'Kavita Artist'}]},
+        'numbers': {},
+    }
+
+    async def from_kavita(url: str):  # noqa: ARG001
+        return lambda sizes: kavita.render(series, '1', sizes)
+
+    with mock.patch.object(app_mod.kavita, 'for_download', from_kavita):
+        got = await as_book('bare.cbz')
+    check(
+        "with Kavita's generated ComicInfo it takes Kavita's writer, and a manga series turns right to left",
+        got['authors'] == ['Kavita Writer'] and got['exth'].get(527) == b'rtl',
+        f'{got["authors"]} {got["exth"].get(527)}',
+    )
+
+    snap = (await c.get('/status')).json()
+    mine = [d for d in snap['downloads'] if d['name'] == 'Fake Vol 1.azw3']
+    check(
+        'the status page shows it under its own name, finished, every byte counted',
+        bool(mine) and mine[0]['stage'] == 'done' and mine[0]['sent'] == len(r.content),
+        f'{mine[:1]}',
+    )
+
+    h = await c.request('HEAD', f'/kindle-colorsoft-1-2/azw3/{tok}.azw3')
+    check(
+        'HEAD answers the type, with no body and no length',
+        h.status_code == 200
+        and h.headers.get('content-type') == 'application/x-mobi8-ebook'
+        and not h.content
+        and 'content-length' not in {k.lower() for k in h.headers},
+        f'{h.status_code} {dict(h.headers)}',
+    )
+    check(
+        'and the name the GET gives the book',
+        h.headers.get('content-disposition') == 'attachment; filename="Fake Vol 1.azw3"',
+        repr(h.headers.get('content-disposition')),
+    )
+    h = await _send(c, 'HEAD', f'/kindle-colorsoft-1-2/azw3/{encode_token(f"{up}/missing")}.azw3')
+    check('HEAD on a file the upstream does not have is its 404, as the GET is', h.status_code == 404, h.text)
+
+    for prof in ('kobo-clara-hd-2e-bw', 'kobo-libra-colour', 'passthrough'):
+        r = await _get(c, f'/{prof}/azw3/{tok}.azw3')
+        check(f'{prof} makes no AZW3', r.status_code == 404, f'status={r.status_code}')
+    r = await _get(c, '/kindle-colorsoft-1-2/azw3/!!!not-a-token.azw3')
+    check('a malformed token is 400 here too', r.status_code == 400, f'status={r.status_code}')
+
+    for prof in ('kindle-colorsoft-1-2-webtoon', 'kindle-scribe-colorsoft-webtoon'):
+        r = await _get(c, f'/{prof}/azw3/{tok}.azw3')
+        check(
+            f'{prof} makes no AZW3, since a webtoon volume runs past the 2 GiB a Kindle reads',
+            r.status_code == 404,
+            f'status={r.status_code}',
+        )
+    from inksetter.imaging import azw3
+
+    paged = profiles.PROFILES['kindle-colorsoft-1-2']
+    as_webp = azw3.profile_for(dataclasses.replace(paged, fmt='webpc'))
+    check(
+        'a Kindle profile that encodes WebP renders its book in palette PNG, which KF8 can show',
+        as_webp is not None and as_webp.fmt == 'pngc' and azw3.profile_for(paged) == paged,
+        f'{as_webp and as_webp.fmt}',
+    )
+
+    up = 'http://127.0.0.1:8899/opds/v1.2'
+    for label, path in (
+        ('a gzip file', 'tarball.tgz'),
+        ('a broken archive', 'corrupt.cbz'),
+        ('an EPUB', 'epub/whole/strict'),
+        ('a ranged EPUB', 'epub/ranged/loose'),
+    ):
+        r = await _get(c, f'/kindle-colorsoft-1-2/azw3/{encode_token(f"{up}/{path}")}.azw3')
+        check(
+            f'{label} is a 502, never passed through as a Kindle book',
+            r.status_code == 502 and not r.content.startswith((b'\x1f\x8b', b'PK')),
+            f'status={r.status_code}',
+        )
+
+    before = dict(_RANGED)
+    ranged = await _get(c, f'/kindle-colorsoft-1-2/azw3/{encode_token(f"{up}/ranged/file.cbz")}.azw3')
+    used = _RANGED['requests'] - before['requests']
+    plain = await _get(c, f'/kindle-colorsoft-1-2/azw3/{encode_token(f"{up}/norange/file.cbz")}.azw3')
+
+    def images_of(resp):
+        return [img for p in _kf8_read(resp.content)['pages'] for img, _ in p['images']]
+
+    check(
+        'an archive read over ranges makes the same book as one fetched whole',
+        ranged.status_code == plain.status_code == 200 and used > 0 and images_of(ranged) == images_of(plain),
+        f'{ranged.status_code} {plain.status_code}, {used} range requests',
+    )
+
+    for prof, offered in (
+        ('kindle-colorsoft-1-2', True),
+        ('kindle-pw-6-7', True),
+        ('kobo-clara-hd-2e-bw', False),
+        ('kindle-scribe-colorsoft-webtoon', False),
+    ):
+        html = (await c.get(f'/{prof}/browse')).text
+        links = re.findall(r'<a class="dl kf8" href="([^"]*)">Download AZW3</a>', html)
+        cbz_link = _dl_href(html)
+        want = [cbz_link.replace(f'/{prof}/dl/', f'/{prof}/azw3/') + '.azw3'] if offered else []
+        check(
+            f'the browse page {"offers" if offered else "does not offer"} an AZW3 on {prof}',
+            links == want and bool(cbz_link),
+            f'{links} vs {want}',
+        )
+    for link, want in (
+        ({'type': 'application/vnd.comicbook+zip', 'href': '/f'}, True),
+        ({'type': 'application/x-cbz', 'href': '/f'}, True),
+        ({'type': 'application/zip', 'href': '/f'}, True),
+        ({'type': 'application/x-zip-compressed', 'href': '/f'}, True),
+        ({'href': '/f'}, True),
+        ({'type': 'text/plain', 'href': '/book.CBZ'}, True),
+        ({'type': 'application/epub+zip', 'href': '/f'}, False),
+        ({'type': 'application/pdf', 'href': '/f'}, False),
+        ({'type': 'application/x-cbr', 'href': '/f'}, False),
+    ):
+        check(
+            f'an acquisition {link} {"is" if want else "is not"} offered as a Kindle book',
+            web._comic_archive(link) is want,
+        )
+
+    selector = re.search(r"querySelectorAll\('([^']*)'\)", web.SCRIPT).group(1)
+
+    def matches(classes: set[str]) -> bool:
+        need = re.match(r'a((?:\.[\w-]+)*)((?::not\(\.[\w-]+\))*)$', selector)
+        if not need:
+            return True
+        wanted = set(need.group(1).split('.')[1:])
+        refused = set(re.findall(r':not\(\.([\w-]+)\)', need.group(2)))
+        return wanted <= classes and not refused & classes
+
+    check(
+        'the page script takes over the AZW3 link as it does the CBZ link, to show its progress',
+        matches({'dl'}) and matches({'dl', 'kf8'}),
+        selector,
+    )
+    branch = re.search(
+        r"if\(link\.classList\.contains\('kf8'\)\)location\.assign\(href\);\s*"
+        r"else\{frame=document\.createElement\('iframe'\)",
+        web.SCRIPT,
+    )
+    check(
+        'and follows the AZW3 link in the page itself, as a Kindle was tried, where a CBZ downloads in a hidden frame',
+        branch is not None,
+    )
+
+    kf8_href = re.search(r"contains\('kf8'\)\?link\.href\.replace\(/(.+?)/,id\+'([^']*)'\)", web.SCRIPT)
+
+    def followed(href: str, job: str) -> str:
+        if kf8_href is None:
+            return f'{href}?job={job}'
+        return re.sub(kf8_href.group(1), lambda m: (job + kf8_href.group(2)).replace('$&', m.group(0)), href, count=1)
+
+    book_url = followed(f'http://proxy.test/kindle-colorsoft-1-2/azw3/{tok}.azw3', 'kf8-job-1')
+    check(
+        'the URL the page follows for an AZW3 still ends in .azw3, its job in the path, as the Kindle opened it',
+        book_url == f'http://proxy.test/kindle-colorsoft-1-2/azw3/kf8-job-1/{tok}.azw3',
+        book_url,
+    )
+    r = await _get(c, book_url)
+    state = (await c.get('/kindle-colorsoft-1-2/dl-status/kf8-job-1')).json()
+    check(
+        'an AZW3 download reports its pages to the job the page watches, and then that it is done',
+        r.status_code == 200 and state.get('stage') == 'done' and state.get('done') == state.get('total') == len(pages),
+        f'{state}',
+    )
+    missing = encode_token(f'{up}/missing')
+    await _get(c, followed(f'http://proxy.test/kindle-colorsoft-1-2/azw3/{missing}.azw3', 'kf8-job-2'))
+    state = (await c.get('/kindle-colorsoft-1-2/dl-status/kf8-job-2')).json()
+    check('and one that never arrives is reported as failed', state.get('stage') == 'error', f'{state}')
+
+
+async def check_repacking_steps() -> None:
+    track = _off_board()
+    chunks = iter([b'', b'ab', b'', b'', b'c'])
+    sent = [block async for block in app_mod._repacking(chunks, io.BytesIO(), track)]
+    check(
+        'a step that wrote nothing sends nothing: an empty chunk would end a chunked body',
+        sent == [b'ab', b'c'],
+        f'{sent}',
+    )
+    check('and the bytes counted are the bytes sent', track.sent == 3, f'{track.sent}')
+
+
 def check(name: str, ok: bool, detail: str = '') -> None:
     (PASS if ok else FAIL).append(name)
     print(f'  {"PASS" if ok else "FAIL"}  {name}{"  " + detail if detail else ""}')
@@ -10630,13 +11450,13 @@ async def main() -> int:
 
         check(
             'a HEAD does not mistake gzip for a zip',
-            not _app._probably_zip('http://x/f.tgz', 'application/gzip'),
+            not cbz.probably_zip('http://x/f.tgz', 'application/gzip'),
         )
         check(
             'a HEAD recognises a comic archive by type',
-            _app._probably_zip('http://x/f', 'application/vnd.comicbook+zip; charset=binary'),
+            cbz.probably_zip('http://x/f', 'application/vnd.comicbook+zip; charset=binary'),
         )
-        check('a HEAD recognises a comic archive by name', _app._probably_zip('http://x/BOOK.CBZ', 'text/plain'))
+        check('a HEAD recognises a comic archive by name', cbz.probably_zip('http://x/BOOK.CBZ', 'text/plain'))
 
         for raw, want in (('7', 7), ('0', 0), ('-5', 0), ('{pageNumber}', 0), ('', 0), ('12x', 0)):
             check(f'_query_int({raw!r}) -> {want}', _app._query_int(raw) == want, f'got {_app._query_int(raw)}')
@@ -10990,6 +11810,11 @@ async def main() -> int:
         check_cover_on_the_pool()
         check_job_board()
         check_progress_script()
+        await check_repacking_steps()
+
+        print('kindle books')
+        check_azw3_book()
+        await check_azw3_download(c)
 
         print('status page')
         await check_status(c)

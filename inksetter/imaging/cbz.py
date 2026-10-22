@@ -46,6 +46,14 @@ MUPDF_SUFFIXES = (
 )
 IMAGE_SUFFIXES = (*MUPDF_SUFFIXES, '.avif', '.jxl')
 JUNK_NAMES = frozenset({'__macosx', 'thumbs.db', 'ehthumbs.db', 'desktop.ini'})
+ZIP_TYPES = frozenset(
+    {
+        'application/vnd.comicbook+zip',
+        'application/x-cbz',
+        'application/zip',
+        'application/x-zip-compressed',
+    }
+)
 
 
 _NUM = re.compile(r'(\d+)')
@@ -67,6 +75,10 @@ def is_image(name: str) -> bool:
 def is_junk(name: str) -> bool:
     parts = [part for part in re.split(r'[\\/]', name.lower()) if part not in ('', '.', '..')]
     return any(part.startswith('.') or part in JUNK_NAMES for part in parts)
+
+
+def probably_zip(url: str, ctype: str) -> bool:
+    return url.lower().endswith(('.cbz', '.zip')) or ctype.split(';')[0].strip().lower() in ZIP_TYPES
 
 
 def _suffix_for(blob: bytes, fallback_name: str) -> str:
@@ -104,14 +116,14 @@ def _render(job, profile: Profile):
 _UNWRITTEN = object()
 
 
-def _emit_cover(zout, pad: int, render, *args):
+def _emit_cover(out, pad: int, source: bytes, render, *args):
     try:
         blob, _mime = render(*args)
     except Exception:
         blob = None
     if not blob:
         return _UNWRITTEN
-    zout.writestr(f'{0:0{pad}d}{_suffix_for(blob, "cover.png")}', blob)
+    out.page(f'{0:0{pad}d}{_suffix_for(blob, "cover.png")}', blob, source)
     return _dimensions(blob)
 
 
@@ -123,18 +135,18 @@ def _dimensions(blob: bytes) -> tuple[int, int] | None:
     return im.width, im.height
 
 
-def _emit(zout, job, blob: bytes | None, pad: int) -> tuple[int, int] | None:
+def _emit(out, job, blob: bytes | None, pad: int) -> tuple[int, int] | None:
     if job[0] == 'copy':
-        zout.writestr(job[1], job[2])
+        out.copy(job[1], job[2])
         return None
     index, name, piece = job[1:4]
     if blob is None:
         blob = piece if job[0] == 'page' else webtoon.tile_image(piece).pngsave_buffer()
-    zout.writestr(f'{index:0{pad}d}{_suffix_for(blob, name)}', blob)
+    out.page(f'{index:0{pad}d}{_suffix_for(blob, name)}', blob, piece if job[0] == 'page' else None)
     return _dimensions(blob)
 
 
-def _emit_rendered(zout, job, pad: int, render, *args) -> tuple[int, int] | None:
+def _emit_rendered(out, job, pad: int, render, *args) -> tuple[int, int] | None:
     try:
         blob, _ = render(*args)
     except Exception as exc:
@@ -142,36 +154,36 @@ def _emit_rendered(zout, job, pad: int, render, *args) -> tuple[int, int] | None
             'page %s failed to render; shipping it unchanged', job[2], exc_info=not isinstance(exc, RenderFailed)
         )
         blob = None
-    return _emit(zout, job, blob, pad)
+    return _emit(out, job, blob, pad)
 
 
-def _run(jobs, zout, profile: Profile, workers: int, pad: int):
+def _run(jobs, out, profile: Profile, workers: int, pad: int):
     if workers > 1:
-        return _run_pooled(jobs, zout, profile, workers, pad)
-    return _run_serial(jobs, zout, profile, pad)
+        return _run_pooled(jobs, out, profile, workers, pad)
+    return _run_serial(jobs, out, profile, pad)
 
 
-def _run_serial(jobs, zout, profile: Profile, pad: int):
+def _run_serial(jobs, out, profile: Profile, pad: int):
     for job in jobs:
         if job[0] == 'copy':
-            yield job, _emit(zout, job, None, pad)
+            yield job, _emit(out, job, None, pad)
         elif job[0] == 'cover':
-            yield job, _emit_cover(zout, pad, _render, job, profile)
+            yield job, _emit_cover(out, pad, job[1], _render, job, profile)
         else:
-            yield job, _emit_rendered(zout, job, pad, _render, job, profile)
+            yield job, _emit_rendered(out, job, pad, _render, job, profile)
 
 
-def _run_pooled(jobs, zout, profile: Profile, workers: int, pad: int):
+def _run_pooled(jobs, out, profile: Profile, workers: int, pad: int):
     window, most = workers * 2, workers * 8
     pending: collections.deque = collections.deque()
 
     def flush_one() -> tuple[tuple, tuple[int, int] | None]:
         job, fut = pending.popleft()
         if fut is None:
-            return job, _emit(zout, job, None, pad)
+            return job, _emit(out, job, None, pad)
         if job[0] == 'cover':
-            return job, _emit_cover(zout, pad, fut.result)
-        return job, _emit_rendered(zout, job, pad, fut.result)
+            return job, _emit_cover(out, pad, job[1], fut.result)
+        return job, _emit_rendered(out, job, pad, fut.result)
 
     def rendering() -> list:
         return [fut for _, fut in pending if fut is not None and not fut.done()]
@@ -217,6 +229,32 @@ class _StreamSink:
         return out
 
 
+class _Zip:
+    def __init__(self) -> None:
+        self._sink = _StreamSink()
+        self._zip = zipfile.ZipFile(self._sink, 'w', zipfile.ZIP_STORED)
+
+    def page(self, name: str, blob: bytes, source: bytes | None = None) -> None:  # noqa: ARG002
+        self._zip.writestr(name, blob)
+
+    def copy(self, name: str, data: bytes) -> None:
+        self._zip.writestr(name, data)
+
+    def ready(self) -> bytes:
+        return self._sink.drain()
+
+    def finish(self, meta: bytes | None):
+        if meta:
+            self._zip.writestr('ComicInfo.xml', meta)
+        self._zip.close()
+        tail = self._sink.drain()
+        if tail:
+            yield tail
+
+    def close(self) -> None:
+        self._zip.close()
+
+
 def repack_iter(
     src,
     profile: Profile,
@@ -226,6 +264,7 @@ def repack_iter(
     comicinfo=None,
     progress=None,
     sources: list[int] | None = None,
+    out=None,
 ):
     zin = zipfile.ZipFile(src)
     files = [i for i in zin.infolist() if not i.is_dir()]
@@ -274,15 +313,14 @@ def repack_iter(
         sizes: list[tuple[int, int] | None] = []
         tell(0)
         try:
-            sink = _StreamSink()
-            zout = zipfile.ZipFile(sink, 'w', zipfile.ZIP_STORED)
+            sink = _Zip() if out is None else out
             try:
                 consumed: dict[int, int] = {}
                 origins = {} if sources is not None else None
                 jobs = webtoon.strip_tiles(entries, profile, consumed, origins) if strip else entries
                 if lead is not None:
                     jobs = itertools.chain([('cover', lead)], jobs)
-                for job, size in _run(jobs, zout, profile, workers, pad):
+                for job, size in _run(jobs, sink, profile, workers, pad):
                     if job[0] == 'cover':
                         if size is not _UNWRITTEN:
                             sizes.append(size)
@@ -290,9 +328,7 @@ def repack_iter(
                                 sources.append(0)
                         pages += 1
                         tell(pages)
-                        block = sink.drain()
-                        if block:
-                            yield block
+                        yield sink.ready()
                         continue
                     written += 1
                     if job[0] != 'copy':
@@ -304,19 +340,12 @@ def repack_iter(
                         tell(pages)
                     elif job[0] == 'tile':
                         tell(pages + min(consumed.pop(job[1]), max(0, images - 1)))
-                    block = sink.drain()
-                    if block:
-                        yield block
+                    yield sink.ready()
                 if strip:
                     tell(total_pages)
-                meta = _metadata(comicinfo, sizes)
-                if meta:
-                    zout.writestr('ComicInfo.xml', meta)
+                yield from sink.finish(_metadata(comicinfo, sizes))
             finally:
-                zout.close()
-            tail = sink.drain()
-            if tail:
-                yield tail
+                sink.close()
             log.info('repack: finished, %d entr(y/ies) written in %.1f s', written, time.perf_counter() - begun)
         finally:
             zin.close()

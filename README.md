@@ -42,6 +42,12 @@ The status page (`/status`) displays the state of current tasks, performance sta
 
 If KOReader is used as client to read downloaded CBZ files it **MUST BE** configured in specific way to display output correctly. Please check the [wiki](https://github.com/AcidWeb/Inksetter/wiki/KOReader) for more details. Additionally, when an OPDS proxy is added to KOReader, I recommend enabling the `Use server filenames` option.
 
+### Kindle without KOReader
+
+This isn't the optimal way to use this app, but Kindle users who cannot or do not want to jailbreak their device to use KOReader can use Inksetter to generate AZW3 files that work with the default interface.
+
+Files can be generated only via the web interface. The resulting file must reach the Kindle unchanged, with no conversion or processing: copy it over USB into the `documents` directory, or download it straight from Inksetter in the Kindle’s own web browser.
+
 ### Kavita specific features
 
 Currently, if the proxy uses Kavita as the OPDS source, three additional features are available:
