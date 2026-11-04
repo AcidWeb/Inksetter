@@ -52,7 +52,7 @@ def _size_vips() -> None:
 _size_vips()
 
 # Bump this whenever anything in this module changes in a way that alters output pixels. Bump invalidates the cache.
-PIPELINE_VERSION = '13'
+PIPELINE_VERSION = '14'
 
 _BAYER_N = 8
 _PALETTE_DITHER = 0.7
@@ -535,11 +535,13 @@ def _geometry(
             luma = None
             if chatty:
                 step('folio', 'page number erased from the bottom margin')
+    cut = None
     if p.autocrop:
         if luma is None:
             luma = im if im.bands == 1 else im.colourspace('b-w').copy_memory()
         box = _autocrop_box(luma, p)
         if box is not None:
+            cut = (im, luma, box)
             im = im.crop(*box)
         if chatty:
             step('autocrop', f'box={box}' if box else 'refused, whole page kept')
@@ -581,6 +583,8 @@ def _geometry(
         elif mono or p.colour_pad == 'mono':
             short = im.height < th
             pad = _mono_pad_level(im, im.width < tw, short and p.fit != 'top', short and p.fit != 'bottom')
+        elif cut is not None:
+            pad = _cut_margin(*cut)
         im = _pad_to_box(im, tw, th, x, y, pad)
         if chatty:
             step('pad', f'content {content}, level {pad}')
@@ -594,6 +598,8 @@ def _geometry(
 _PAD_MIDPOINT = 128.0
 _PAD_FLAT_IQR = 17.0
 _BORDER = 2
+_CUT_MIN = 4
+_CUT_PURE = 12
 
 
 def _sides(im: pyvips.Image) -> tuple[pyvips.Image, ...]:
@@ -632,6 +638,35 @@ def _mono_pad_level(im: pyvips.Image, horizontal: bool, top: bool, bottom: bool)
         return 255.0
     ends = {0.0 if med < _PAD_MIDPOINT else 255.0 for med in flat}
     return ends.pop() if len(ends) == 1 else 255.0
+
+
+def _cut_margin(
+    im: pyvips.Image, luma: pyvips.Image, box: tuple[int, int, int, int]
+) -> float | tuple[float, ...] | None:
+    x, y, w, h = box
+    right, bottom = im.width - x - w, im.height - y - h
+    areas = [
+        area
+        for depth, area in (
+            (x, (0, 0, x, im.height)),
+            (right, (x + w, 0, right, im.height)),
+            (y, (0, 0, im.width, y)),
+            (bottom, (0, y + h, im.width, bottom)),
+        )
+        if depth >= _CUT_MIN
+    ]
+    if not areas or len({luma.crop(*area).percent(50) >= _PAD_MIDPOINT for area in areas}) > 1:
+        return None
+    counts = sum(
+        np.frombuffer(im.crop(*area).hist_find().write_to_memory(), np.uint32).reshape(256, -1).astype(np.int64)
+        for area in areas
+    )
+    below = counts.cumsum(axis=0)
+    colour = (below < below[-1] / 2).sum(axis=0)
+    for level in (255, 0):
+        if np.abs(colour - level).max() <= _CUT_PURE:
+            return float(level)
+    return tuple(float(v) for v in colour)
 
 
 def _border_background(im: pyvips.Image) -> list[float]:
@@ -872,7 +907,9 @@ def _render_colour(
         rgba = np.ndarray(buffer=out.bandjoin(255).write_to_memory(), dtype=np.uint8, shape=(out.height, out.width, 4))
         masks = _extremes(rgba)
         if isinstance(geom.pad, tuple) and (cw, ch) != (out.width, out.height):
-            masks[tuple(int(v) for v in background)] = _pad_mask(rgba.shape, geom.content)
+            shown = tuple(int(v) for v in background)
+            if shown not in ((255,) * 3, (0,) * 3):
+                masks[shown] = _pad_mask(rgba.shape, geom.content)
         idx, palette = _quantise(rgba, p.palette_colours, p.png_effort, tuple(k for k, m in masks.items() if m.any()))
         _pin_extremes(idx, palette, masks)
         return _palette_png(idx, palette, p.png_compression), 'image/png'

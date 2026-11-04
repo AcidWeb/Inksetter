@@ -2796,6 +2796,101 @@ def check_colour_pad_ring() -> None:
     )
 
 
+def _margined(above=(), below=(), grey: bool = False) -> bytes:
+    rng = np.random.default_rng(210)
+    if grey:
+        art = np.repeat(rng.integers(68, 188, (1000, 600, 1)), 3, axis=2)
+    else:
+        art = np.clip(np.array([60, 90, 200]) + rng.integers(-60, 61, (1000, 600, 3)), 0, 255)
+    bands = [[np.full((rows, 600, 3), colour) for rows, colour in side] for side in (above, below)]
+    a = np.concatenate([*bands[0], art, *bands[1]]).astype(np.uint8)
+    return pyvips.Image.new_from_memory(a.tobytes(), 600, a.shape[0], 3, 'uchar').pngsave_buffer()
+
+
+def _pad_colours(blob: bytes, prof: profiles.Profile, **kwargs) -> list:
+    import collections
+
+    out, _ = pipeline.render_page(blob, prof, **kwargs)
+    im = pyvips.Image.new_from_buffer(out, '')
+    a = np.ndarray(buffer=im.write_to_memory(), dtype=np.uint8, shape=(im.height, im.width, im.bands))
+    cx, cy, cw, ch = pipeline._geometry(blob, prof, prof.width, prof.height, mono=im.bands == 1).content
+    mask = np.ones(a.shape[:2], bool)
+    mask[cy : cy + ch, cx : cx + cw] = False
+    return [colour for colour, _ in collections.Counter(map(tuple, a[mask].tolist())).most_common()]
+
+
+def check_cut_margin_pad() -> None:
+    prof = profiles.PROFILES['kindle-colorsoft-1-2']
+    near_white, near_black, cream = (247, 250, 252), (8, 5, 10), (253, 249, 232)
+
+    def pad(**kwargs) -> list:
+        return _pad_colours(_margined(**kwargs), prof)
+
+    def bluish(found: list) -> bool:
+        return found[0][2] - found[0][0] > 100
+
+    got = pad()
+    check('premise: with no margin cut, the blue art pads in its own border colour', bluish(got), f'{got[:2]}')
+
+    def top(*bands) -> int | None:
+        box = pipeline._autocrop_box(pipeline.open_image(_margined(above=bands)).colourspace('b-w').copy_memory(), prof)
+        return box and box[1]
+
+    got = pad(above=[(60, near_white)])
+    check(
+        'a colour page whose cut margin was white pads pure white, every pixel', got == [(255, 255, 255)], f'{got[:2]}'
+    )
+    got = pad(above=[(60, near_black)])
+    check('one whose cut margin was black pads pure black, every pixel', got == [(0, 0, 0)], f'{got[:2]}')
+    got = pad(above=[(60, cream)])
+    check(
+        'one whose cut margin was cream pads cream, one colour in every pixel',
+        len(got) == 1 and got[0] != (255, 255, 255) and got[0][0] >= got[0][1] > got[0][2] + 12,
+        f'{got[:2]}',
+    )
+    got = pad(above=[(60, near_white)], below=[(80, near_black)])
+    check('a page cut white above and black below keeps its border colour', bluish(got), f'{got[:2]}')
+    edged = [(4, near_black), (40, near_white)]
+    check(
+        "premise: autocrop cuts a white margin together with the scan's dark line along its edge",
+        (top(*edged) or 0) >= 42,
+        f'cut to row {top(*edged)}',
+    )
+    got = pad(above=edged)
+    check('and that margin pads white, its median, not the grey of its mean', got == [(255, 255, 255)], f'{got[:2]}')
+
+    thin, wider = top((5, near_white)), top((6, near_white))
+    check(
+        'premise: autocrop cuts 3 rows of a 5-row white edge and 4 of a 6-row one',
+        (thin, wider) == (3, 4),
+        f'{thin}, {wider}',
+    )
+    got = pad(above=[(5, near_white)])
+    check('a cut of 3 rows is no margin: the page keeps its border colour', bluish(got), f'{got[:2]}')
+    got = pad(above=[(6, near_white)])
+    check('a cut of 4 rows is one: the page pads white', got == [(255, 255, 255)], f'{got[:2]}')
+
+    got = _pad_colours(_margined(above=[(60, near_black)]), dataclasses.replace(prof, colour_pad='mono'))
+    check(
+        'a profile that pads mono still pads by the sides, white beside noisy art, whatever was cut',
+        got == [(255, 255, 255)],
+        f'{got[:2]}',
+    )
+    got = _pad_colours(_margined(above=[(60, near_black)], grey=True), prof)
+    check('and so does a grey page on a colour profile, which renders mono', got == [(255,)], f'{got[:2]}')
+
+    told = _Recording(pipeline.liq)
+    with mock.patch.object(pipeline, 'liq', told):
+        got = _pad_colours(_margined(), prof, pad_level=(242.0, 242.0, 242.0))
+    fixed = [args[0] for name, args in told.calls if name == 'liq_image_add_fixed_color']
+    check('premise: a pad of grey 242 comes out of the colour pass pure white', got == [(255, 255, 255)], f'{got[:2]}')
+    check(
+        'a colour pad shown pure white is reserved in the palette once, not twice',
+        fixed.count((255, 255, 255, 255)) == 1,
+        f'{fixed}',
+    )
+
+
 def check_webtoon_pad() -> None:
     strip = _strip_profile()
     paged = dataclasses.replace(profiles.PROFILES['kindle-colorsoft-1-2'], auto_mono=False)
@@ -12620,6 +12715,7 @@ async def main() -> int:
     check_palette_quantiser()
     print('colour pad ring')
     check_colour_pad_ring()
+    check_cut_margin_pad()
     print('webtoon pad')
     check_webtoon_pad()
     print('gutter pad')
