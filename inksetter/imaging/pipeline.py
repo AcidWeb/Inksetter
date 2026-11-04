@@ -493,7 +493,7 @@ class _Geom(NamedTuple):
     image: pyvips.Image
     content: tuple[int, int, int, int]
     upscale: float
-    pad: float | None = None
+    pad: float | tuple[float, ...] | None = None
 
 
 def _geometry(
@@ -503,7 +503,7 @@ def _geometry(
     th: int,
     mono: bool,
     page: pyvips.Image | None = None,
-    pad_level: float | None = None,
+    pad_level: float | tuple[float, ...] | None = None,
 ) -> _Geom:
     chatty = log.isEnabledFor(logging.DEBUG)
     mark = time.perf_counter() if chatty else 0.0
@@ -639,13 +639,28 @@ def _border_background(im: pyvips.Image) -> list[float]:
     return [float(v) for v in np.rint(np.median(frame, axis=0))]
 
 
+def _pad_shown(im: pyvips.Image, content: tuple[int, int, int, int]) -> list[float]:
+    x, y, w, h = content
+    if x > 0:
+        line = im.crop(x // 2, 0, 1, im.height)
+    elif x + w < im.width:
+        line = im.crop((x + w + im.width) // 2, 0, 1, im.height)
+    else:
+        line = im.crop(0, y // 2 if y > 0 else (y + h + im.height) // 2, im.width, 1)
+    return [float(v) for v in np.rint(np.median(_band_stack(line), axis=0))]
+
+
 def _band_stack(part: pyvips.Image) -> np.ndarray:
     buf = np.frombuffer(part.cast('uchar').write_to_memory(), dtype=np.uint8)
     return buf.reshape(-1, part.bands)
 
 
-def _pad_to_box(im: pyvips.Image, tw: int, th: int, x: int, y: int, level: float | None = None) -> pyvips.Image:
-    if level is not None:
+def _pad_to_box(
+    im: pyvips.Image, tw: int, th: int, x: int, y: int, level: float | tuple[float, ...] | None = None
+) -> pyvips.Image:
+    if isinstance(level, tuple):
+        background = list(level)
+    elif level is not None:
         background = [level] * im.bands
     else:
         try:
@@ -677,13 +692,18 @@ def _unsharp(chan: pyvips.Image, p: Profile, upscale: float = 1.0) -> pyvips.Ima
     return chan + p.usm_amount * (chan - chan.gaussblur(sigma))
 
 
-def _flatten_pad(a: np.ndarray, content: tuple[int, int, int, int], level: float) -> np.ndarray:
+def _pad_mask(shape: tuple[int, ...], content: tuple[int, int, int, int]) -> np.ndarray:
     x, y, w, h = content
+    mask = np.ones(shape[:2], bool)
+    mask[y : y + h, x : x + w] = False
+    return mask
+
+
+def _flatten_pad(a: np.ndarray, content: tuple[int, int, int, int], level: float) -> np.ndarray:
+    _, _, w, h = content
     if w >= a.shape[1] and h >= a.shape[0]:
         return a
-    mask = np.ones(a.shape[:2], bool)
-    mask[y : y + h, x : x + w] = False
-    a[mask] = round(level)
+    a[_pad_mask(a.shape, content)] = round(level)
     return a
 
 
@@ -695,7 +715,7 @@ def _png_chunk(kind: bytes, data: bytes) -> bytes:
 
 
 def _quantise(
-    rgba: np.ndarray, colours: int, effort: int, fixed: tuple[int, ...] = ()
+    rgba: np.ndarray, colours: int, effort: int, fixed: tuple[int | tuple[int, int, int], ...] = ()
 ) -> tuple[np.ndarray, np.ndarray]:
     h, w, _ = rgba.shape
     attr = liq.liq_attr_create()
@@ -704,8 +724,9 @@ def _quantise(
         liq.liq_set_max_colors(attr, colours)
         liq.liq_set_speed(attr, 11 - effort)
         image = liq.liq_image_create_rgba(attr, liq_ffi.from_buffer(rgba), w, h, 0)
-        for level in fixed:
-            liq.liq_image_add_fixed_color(image, liq_ffi.new('liq_color *', (level, level, level, 255))[0])
+        for colour in fixed:
+            rgb = (colour,) * 3 if isinstance(colour, int) else colour
+            liq.liq_image_add_fixed_color(image, liq_ffi.new('liq_color *', (*rgb, 255))[0])
         found = liq_ffi.new('liq_result**')
         code = liq.liq_image_quantize(image, attr, found)
         if code != liq.LIQ_OK:
@@ -725,7 +746,7 @@ def _quantise(
     return idx, palette
 
 
-def _extremes(rgb: np.ndarray) -> dict[int, np.ndarray]:
+def _extremes(rgb: np.ndarray) -> dict[int | tuple[int, int, int], np.ndarray]:
     masks = {}
     for level in (255, 0):
         mask = rgb[..., 0] == level
@@ -735,7 +756,7 @@ def _extremes(rgb: np.ndarray) -> dict[int, np.ndarray]:
     return masks
 
 
-def _pin_extremes(idx: np.ndarray, palette: np.ndarray, masks: dict[int, np.ndarray]) -> None:
+def _pin_extremes(idx: np.ndarray, palette: np.ndarray, masks: dict[int | tuple[int, int, int], np.ndarray]) -> None:
     for level, pure in masks.items():
         entry = np.flatnonzero((palette == level).all(axis=1))
         if len(entry):
@@ -764,7 +785,7 @@ def _render_mono(
     th: int,
     fmt: str,
     page: pyvips.Image | None = None,
-    pad_level: float | None = None,
+    pad_level: float | tuple[float, ...] | None = None,
 ) -> tuple[bytes, str]:
     geom = _geometry(buf, p, tw, th, mono=True, page=page, pad_level=pad_level)
     g = geom.image
@@ -793,7 +814,7 @@ def _render_colour(
     tw: int,
     th: int,
     page: pyvips.Image | None = None,
-    pad_level: float | None = None,
+    pad_level: float | tuple[float, ...] | None = None,
 ) -> tuple[bytes, str]:
     geom = _geometry(buf, p, tw, th, mono=False, page=page, pad_level=pad_level)
     im = geom.image
@@ -819,14 +840,13 @@ def _render_colour(
     cx, cy, cw, ch = geom.content
     if (cw, ch) != (out.width, out.height):
         inner = out.crop(cx, cy, cw, ch)
-        out = inner.embed(
-            cx,
-            cy,
-            out.width,
-            out.height,
-            extend='background',
-            background=_border_background(inner) if geom.pad is None else [geom.pad] * out.bands,
-        )
+        if geom.pad is None:
+            background = _border_background(inner)
+        elif isinstance(geom.pad, tuple):
+            background = _pad_shown(out, geom.content)
+        else:
+            background = [geom.pad] * out.bands
+        out = inner.embed(cx, cy, out.width, out.height, extend='background', background=background)
 
     if p.fmt == 'jpegc':
         return (
@@ -851,6 +871,8 @@ def _render_colour(
     if p.palette:
         rgba = np.ndarray(buffer=out.bandjoin(255).write_to_memory(), dtype=np.uint8, shape=(out.height, out.width, 4))
         masks = _extremes(rgba)
+        if isinstance(geom.pad, tuple) and (cw, ch) != (out.width, out.height):
+            masks[tuple(int(v) for v in background)] = _pad_mask(rgba.shape, geom.content)
         idx, palette = _quantise(rgba, p.palette_colours, p.png_effort, tuple(k for k, m in masks.items() if m.any()))
         _pin_extremes(idx, palette, masks)
         return _palette_png(idx, palette, p.png_compression), 'image/png'
@@ -881,6 +903,10 @@ def open_image(buf: bytes) -> pyvips.Image:
     return _open(buf)
 
 
+def mono_pad_level(im: pyvips.Image, horizontal: bool, top: bool, bottom: bool) -> float:
+    return _mono_pad_level(im, horizontal, top, bottom)
+
+
 def fit_to_width(im: pyvips.Image, width: int, p: Profile) -> pyvips.Image:
     scale = width / im.width
     if scale < 1.0:
@@ -899,7 +925,7 @@ def render_page(
     p: Profile,
     max_width: int | None = None,
     source: pyvips.Image | None = None,
-    pad_level: float | None = None,
+    pad_level: float | tuple[float, ...] | None = None,
 ) -> tuple[bytes, str]:
     if p.fmt == 'raw':
         log.debug('render: fmt=raw, %d kB passed through untouched', len(buf) // 1024)
@@ -921,7 +947,11 @@ def render_page(
 
 
 def _render_page(
-    buf: bytes, p: Profile, max_width: int | None, source: pyvips.Image | None, pad_level: float | None
+    buf: bytes,
+    p: Profile,
+    max_width: int | None,
+    source: pyvips.Image | None,
+    pad_level: float | tuple[float, ...] | None,
 ) -> tuple[bytes, str]:
     started = time.perf_counter()
 

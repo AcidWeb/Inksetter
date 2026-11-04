@@ -2966,7 +2966,577 @@ def check_gutter_pad() -> None:
         grey_top[3][:10].std() == 0 and 30 < int(grey_top[3][0, 0, 0]) < 235 and artwork(grey_top[3][-10:]),
         f'{grey_top[3][0, 0]}',
     )
-    topped_page('a page with no gutter at either end, its top flat dark grey', grey_top, ink)
+    top = limit - len(grey_top[3])
+    shown = _uniform(_shipped(grey_top, p)[top + 8 : top + 200])
+    check('premise: it shows that grey as one colour', shown not in (None, ink, paper), f'{shown}')
+    topped_page('a page with no gutter at either end, its top flat dark grey', grey_top, shown)
+
+
+def _same_ground(a, b) -> bool:
+    if a is None or b is None:
+        return a is b
+    return a[1] == b[1] and bool(np.allclose(a[0], b[0], rtol=0, atol=1e-6))
+
+
+def check_ground_read() -> None:
+    luma = np.array([0.299, 0.587, 0.114], np.float32)
+
+    def whole(rows: np.ndarray, limit: int):
+        reach = round(limit * webtoon.STRIP_GROUND_REACH)
+        minrun = max(1, round(limit * webtoon.STRIP_GUTTER_MIN))
+        edge = round(rows.shape[1] * webtoon.STRIP_EDGE)
+        part = rows[: 2 * reach, edge : rows.shape[1] - edge].astype(np.float32)
+        colour, spread = part.mean(axis=1).astype(np.float64), (part @ luma).std(axis=1).astype(np.float64)
+        held = np.concatenate([[spread[0]] * 2, spread, [spread[-1]] * 2])
+        flat = np.array([held[i : i + 5].mean() for i in range(len(spread))]) <= webtoon.STRIP_GROUND_FLAT
+        s = 0
+        while s < len(flat):
+            if not flat[s]:
+                s += 1
+                continue
+            e = s
+            while e < len(flat) and flat[e]:
+                e += 1
+            if s > reach:
+                return None
+            if e - s >= minrun:
+                c = colour[s:e]
+                off = np.flatnonzero(np.abs(c - c[:5].mean(axis=0)).max(axis=1) > webtoon.STRIP_GROUND_MATCH)
+                c = c[: off[0] if len(off) else len(c)]
+                return (tuple(float(v) for v in c.mean(axis=0)), len(c)) if len(c) else None
+            s = e
+        return None
+
+    rng = np.random.default_rng(29)
+    w = 160
+
+    def busy(h: int) -> np.ndarray:
+        return rng.integers(0, 256, (h, w, 3), dtype=np.uint8)
+
+    def plain(h: int, colour, grain: int = 2) -> np.ndarray:
+        return np.clip(np.array(colour, np.int16) + rng.integers(-grain, grain + 1, (h, w, 3)), 0, 255).astype(np.uint8)
+
+    def fade(h: int, a: int, b: int) -> np.ndarray:
+        return np.repeat(np.linspace(a, b, h).round().astype(np.uint8)[:, None, None], w, axis=1).repeat(3, axis=2)
+
+    cases = []
+    for limit in (1696, 300):
+        reach = round(limit * webtoon.STRIP_GROUND_REACH)
+        minrun = max(1, round(limit * webtoon.STRIP_GUTTER_MIN))
+        for start in (0, 1, 61, 62, 63, 64, 65, 126, 127, 128, reach - 1, reach, reach + 1):
+            for length in (minrun - 1, minrun, 4, 60, 63, 64, 66, 2 * reach):
+                if length > 0:
+                    cases.append((limit, np.concatenate([busy(start), plain(length, (90, 140, 70)), busy(2 * reach)])))
+        cases.append((limit, np.concatenate([busy(10), fade(2 * reach, 40, 220)])))
+        cases.append((limit, np.concatenate([plain(minrun - 1, (200, 200, 200)), busy(5), plain(80, (30, 60, 90))])))
+        cases.append((limit, busy(2 * reach)))
+        cases.append((limit, plain(2 * reach, (250, 250, 250), 6)))
+        for at in (a for a in (61, 62, 63, 64, 125, 126, 127, 128) if a < 2 * reach):
+            spiked = plain(2 * reach, (120, 120, 120), 1)
+            spiked[at] = plain(1, (120, 120, 120), 80)[0]
+            cases.append((limit, spiked))
+    steps = np.concatenate([busy(56), np.zeros((2 + 4 + 200, w, 3), np.uint8)])
+    for row, level in zip(range(56, 62), (30, 30, 30, 30, 30, 13), strict=True):
+        steps[row] = level
+    cases.append((420, steps))
+    for _ in range(300):
+        limit = int(rng.choice([1696, 300]))
+        parts, h = [], 0
+        while h < 2 * round(limit * webtoon.STRIP_GROUND_REACH) + 10:
+            n = int(rng.integers(1, 140))
+            kind = rng.integers(0, 3)
+            parts.append(busy(n) if kind == 0 else plain(n, rng.integers(0, 256, 3), int(rng.integers(0, 9))))
+            h += n
+        cases.append((limit, np.concatenate(parts)))
+    wrong = [(i, webtoon._ground(rows, limit), whole(rows, limit)) for i, (limit, rows) in enumerate(cases)]
+    wrong = [x for x in wrong if not _same_ground(x[1], x[2])]
+    found = sum(1 for limit, rows in cases if whole(rows, limit) is not None)
+    check(
+        'premise: the cases find a ground on some and none on others',
+        0 < found < len(cases),
+        f'{found} of {len(cases)}',
+    )
+    check(
+        'the ground read a few rows at a time finds what a read of the whole window finds',
+        not wrong,
+        f'{len(wrong)} of {len(cases)} differ, first {wrong[:1]}',
+    )
+
+
+def check_ground_pad() -> None:
+    p = _strip_profile()
+    limit, width = p.height, p.width
+    rng = np.random.default_rng(23)
+    grey, ink, paper = (80, 86, 104), (0, 0, 0), (255, 255, 255)
+    Ground = webtoon._Ground
+
+    def art(h: int, w: int) -> np.ndarray:
+        yy, xx = np.mgrid[0:h, 0:w]
+        a = np.full((h, w, 3), (240, 220, 90), np.uint8)
+        a[(yy // 6 + xx // 6) % 2 == 0] = (40, 30, 120)
+        return a
+
+    def flat(h: int, w: int, colour=grey, grain: int = 3) -> np.ndarray:
+        noise = rng.integers(-grain, grain + 1, (h, w, 3))
+        return np.clip(np.array(colour, np.int16) + noise, 0, 255).astype(np.uint8)
+
+    def shipped(page: np.ndarray, ground=None, edges=(None, None), anchor: str = 'top', prof=p) -> np.ndarray:
+        job = ('tile', 1, 'x.png', page, edges, anchor)
+        return _shipped(job if ground is None else (*job, ground), prof)
+
+    def mean(a: np.ndarray) -> tuple:
+        return tuple(int(v) for v in np.rint(a.reshape(-1, 3).mean(axis=0)))
+
+    def near(a, b, by: int = 3) -> bool:
+        return bool(np.abs(np.subtract(a, b, dtype=float)).max() <= by)
+
+    def even(pad: np.ndarray) -> bool:
+        return _uniform(pad) is not None
+
+    banded = np.concatenate([art(900, width), flat(400, width)])
+    today = shipped(banded)
+    check('premise: a page that ends in a flat grey band pads below in black', _uniform(today[1300:]) == ink)
+    got = shipped(banded, Ground(bottom=True))
+    shown, pad = mean(got[1000:1290]), got[1300:]
+    check(
+        'a page cut in a grey band is padded below in that grey, as the page shows it',
+        near(mean(pad), shown) and even(pad),
+        f'pad {mean(pad)}, page {shown}',
+    )
+    check('and it still ships at exactly the screen', got.shape[:2] == (limit, width), f'{got.shape}')
+    check(
+        'premise: the colour pass moves that grey, so the pad must take it as shown, not as read',
+        not near(shown, grey, 4),
+        f'{shown} from {grey}',
+    )
+    check(
+        'a page that only opened on a ground it does not hold keeps its level',
+        _uniform(shipped(banded, Ground(top=True))[1300:]) == ink,
+    )
+    got = shipped(banded, Ground(top=True, above=flat(300, width)))
+    check(
+        'but takes the ground from the rows above its cut, where the page before ended in it',
+        near(mean(got[1300:]), shown),
+        f'{mean(got[1300:])}',
+    )
+    got = shipped(banded, Ground(bottom=True), prof=dataclasses.replace(p, auto_mono=True))
+    check('a profile that may render the page mono keeps its level', _uniform(got[1300:]) == ink)
+
+    tall = art(limit + 1, width)
+    tall[:, :200] = tall[:, -200:] = flat(limit + 1, 200)
+    check(
+        'premise: a page a row over the screen at the panel width shrinks one column short',
+        round(width * limit / (limit + 1)) == width - 1,
+    )
+    try:
+        got, failure = shipped(tall, Ground(colour=grey)), ''
+    except Exception as exc:
+        got, failure = None, f'{type(exc).__name__}: {exc}'
+    check(
+        'padded on its right alone in a ground, it ships at the screen, the pad that ground as the page shows it',
+        got is not None
+        and got.shape[:2] == (limit, width)
+        and even(got[:, -1:])
+        and near(mean(got[:, -1:]), mean(got[:, -150:-40])),
+        failure or f'{got.shape}, pad {mean(got[:, -1:])}, side {mean(got[:, -150:-40])}',
+    )
+
+    edged = art(2 * limit, width)
+    edged[:, 6:60] = edged[:, -60:-6] = 255
+    edged[::2, :6] = edged[::2, -6:] = 0
+    edged[1::2, :6] = edged[1::2, -6:] = 60
+    check('premise: with no ground, the page pads black, as its edge reads once shrunk', _sides(shipped(edged)) == ink)
+    got = shipped(edged, Ground(colour=(250.0, 250.0, 250.0)))
+    check(
+        'a white ground along its sides pads them white, weighed against the black it would ship',
+        _sides(got) == paper,
+        f'{_sides(got)}',
+    )
+
+    w = 1000
+    upper = art(800, w)
+    upper[:, :120] = upper[:, -120:] = 255
+    sided = np.concatenate([upper, flat(500, w)])
+    got = shipped(sided, Ground(bottom=True), edges=(255.0, None))
+    check(
+        'a page whose sides are mostly white keeps white pads, though it ends in a grey band',
+        _sides(got) == paper and _uniform(got[1305:]) == paper,
+        f'sides {_sides(got)}, below {_uniform(got[1305:])}',
+    )
+    lower = art(1240, w)
+    lower[:, :120] = lower[:, -120:] = flat(1240, 120)
+    ended = np.concatenate([lower, np.full((60, w, 3), 255, np.uint8)])
+    got = shipped(ended, Ground(colour=grey), edges=(None, 255.0))
+    check(
+        'a page with grey sides that ends on a white gutter keeps white pads',
+        _sides(got) == paper and _uniform(got[1305:]) == paper,
+        f'sides {_sides(got)}, below {_uniform(got[1305:])}',
+    )
+    both = np.concatenate([lower, flat(60, w)])
+    got = shipped(both, Ground(colour=grey), edges=(None, 255.0))
+    check(
+        'premise: with grey below it too, the same page takes the grey all round',
+        _sides(got) != paper and near(mean(got[1305:]), mean(got[600:1200, 140:250])) and even(got[1305:]),
+        f'sides {_sides(got)}, below {mean(got[1305:])}',
+    )
+
+    patchy = art(1300, width)
+    patchy[900:, : width // 4] = flat(400, width // 4)
+    got = shipped(patchy, Ground(colour=grey))
+    check('a ground along a quarter of the border leaves the pad as it was', _uniform(got[1300:]) == paper)
+    patchy[900:, : width // 2] = flat(400, width // 2)
+    got = shipped(patchy, Ground(colour=grey))
+    check(
+        'and one along half of it, all the rest busy, takes the pad',
+        _uniform(got[1300:]) not in (None, paper) and near(_uniform(got[1300:]), mean(got[1000:1290, :400])),
+        f'{_uniform(got[1300:])}',
+    )
+    dark = np.concatenate([art(900, width), np.full((400, width, 3), 6, np.uint8)])
+    got = shipped(dark, Ground(colour=(16.0, 16.0, 16.0)))
+    check('a ground that would pad near-black where the pad is black leaves it pure black', _uniform(got[1300:]) == ink)
+    pale = np.concatenate([art(900, width), flat(400, width, (255, 244, 250), 1)])
+    got = shipped(pale, Ground(bottom=True), edges=(0.0, None))
+    check(
+        'premise: a near-white band of a tint ships short of pure white',
+        not near(mean(got[1000:1290]), paper, 0),
+        f'{mean(got[1000:1290])}',
+    )
+    check(
+        'a near-white ground of a tint, where the pad is black, pads in pure white',
+        _uniform(got[1300:]) == paper,
+        f'{_uniform(got[1300:])} under {mean(got[1000:1290])}',
+    )
+
+    noisy = np.concatenate(
+        [rng.integers(0, 256, (900, width, 3), dtype=np.uint8), flat(400, width, (150, 125, 175), 10)]
+    )
+    got = shipped(noisy, Ground(bottom=True))
+    check(
+        'a pad beside busy art is still one colour, the band it was cut in',
+        _uniform(got[1300:]) is not None and near(_uniform(got[1300:]), mean(got[1000:1290])),
+        f'{_uniform(got[1300:])}, {len(np.unique(got[1300:].reshape(-1, 3), axis=0))} colours',
+    )
+
+    for rows, label, switches in ((80, 'long', True), (30, 'short', False)):
+        page = np.concatenate([flat(rows, width), art(1300 - rows, width)])
+        got = shipped(page, Ground(plain=True), anchor='bottom')
+        pad, shown = got[: limit - 1300], mean(got[limit - 1300 + 8 : limit - 1300 + rows - 8])
+        check(
+            f'a plain page that opens on a {label} grey run is padded above in '
+            + ('that grey' if switches else 'black'),
+            near(mean(pad), shown) and even(pad) if switches else _uniform(pad) == ink,
+            f'pad {mean(pad)}, run {shown}',
+        )
+    page = np.concatenate([art(1270, width), flat(30, width)])
+    got = shipped(page, Ground(plain=True))
+    check('and one that ends on a short grey run is padded below in black', _uniform(got[1300:]) == ink)
+
+    def strip(*parts: np.ndarray) -> bytes:
+        rows = np.concatenate(parts)
+        return _archive_of(*(rows[i : i + 1000] for i in range(0, len(rows), 1000)))
+
+    quiet, second = (90, 90, 90), (150, 150, 150)
+    band, other = np.full((120, 800, 3), quiet, np.uint8), np.full((120, 800, 3), second, np.uint8)
+    pages = list(_tiles(strip(art(700, 800), band, art(2400, 800), other, art(600, 800)), p))
+    first, pieces, last = pages[0], [t for t in pages if t[6].colour is not None], pages[-1]
+    check(
+        'the page cut in a gutter before the fold may take it, and opens on none',
+        first[6].bottom and not first[6].top and near(mean(first[3][-10:]), quiet, 1),
+        f'{first[6]}',
+    )
+    check(
+        'every piece of the artwork after it takes that gutter, read from the page before',
+        len(pieces) >= 2 and all(near(t[6].colour, quiet, 1) for t in pieces) and pieces[0][1] == 2,
+        f'{[(t[1], t[6].colour) for t in pieces]}',
+    )
+    check(
+        'and nothing of its own: no piece may take a run at its own ends, which its neighbours would not',
+        len(pieces) >= 2 and all(t[6] == Ground(colour=t[6].colour) for t in pieces),
+        f'{[t[6] for t in pieces]}',
+    )
+    check(
+        'the page after the second gutter, cut where it starts, opens on it and holds it',
+        last[6].top and near(mean(last[3][:20]), second, 1),
+        f'{last[6]}',
+    )
+    after = list(_tiles(strip(art(700, 800), band, art(600, 800)), p))
+    check(
+        'the page after a gutter cut before the fold opens on it, and is handed the rows above its cut',
+        len(after) == 2
+        and after[1][6].top
+        and after[1][6].above is not None
+        and near(mean(after[1][6].above[-20:]), quiet, 1)
+        and not near(mean(after[1][3][:20]), quiet, 1),
+        f'{[(len(t[3]), t[6]) for t in after]}',
+    )
+    past = list(_tiles(strip(art(1300, 800), band, art(900, 800)), p))
+    check(
+        'a page cut where a gutter starts past the fold may not take it, and the page after opens on it',
+        len(past) == 2 and not past[0][6].bottom and past[1][6].top and len(past[0][3]) > limit,
+        f'{[(len(t[3]), t[6]) for t in past]}',
+    )
+    on_fold = list(_tiles(strip(art(limit - 1, width), np.full((120, width, 3), quiet, np.uint8), art(600, width)), p))
+    check(
+        'premise: a gutter that starts on the last row before the fold is cut at that row',
+        len(on_fold) == 2 and len(on_fold[0][3]) == limit - 1 and on_fold[1][6].top,
+        f'{[(len(t[3]), t[6]) for t in on_fold]}',
+    )
+    check(
+        'and the page before it, holding none of it, may not take it, nor hand its art on as the gutter',
+        len(on_fold) == 2 and not on_fold[0][6].bottom and on_fold[1][6].above is None,
+        f'{[(len(t[3]), t[6], None if t[6].above is None else len(t[6].above)) for t in on_fold]}',
+    )
+    shown = _shipped(first, p)
+    check(
+        'and the page cut in it is padded below in it',
+        near(mean(shown[len(first[3]) :]), mean(shown[len(first[3]) - 60 : len(first[3]) - 5])),
+        f'{mean(shown[len(first[3]) :])}',
+    )
+    with _unplanned():
+        cut = list(_tiles(strip(art(700, 800), band, art(2400, 800), band, art(600, 800)), p))
+    through = [t for t in cut if t[5] == 'bottom']
+    check(
+        'a page cut through artwork takes no ground from its cut, nor does the page after it',
+        len(through) >= 1 and not any(t[6].bottom for t in through) and not cut[cut.index(through[0]) + 1][6].top,
+        f'{[(t[1], t[5], t[6]) for t in cut]}',
+    )
+
+
+def check_strip_paper() -> None:
+    p = _strip_profile()
+    limit, width = p.height, p.width
+    margin = round(limit * webtoon.STRIP_TOP_MARGIN)
+    rng = np.random.default_rng(206)
+    ground = np.array((77, 81, 93), np.int16)
+
+    def art(n: int) -> np.ndarray:
+        return rng.integers(0, 256, (n, width, 3), dtype=np.uint8)
+
+    def paper(n: int, specks: int = 2, lines: bool = False, soft: bool = False) -> np.ndarray:
+        rows = ground + rng.integers(-3 if soft else -12, 4 if soft else 13, (n, width, 1))
+        if soft:
+            rows = rows + np.linspace(-20, 20, width).astype(np.int16)[None, :, None]
+        for _ in range(0 if soft else specks):
+            rows[np.arange(n), rng.integers(20, width - 20, n)] = ground + 40
+        if lines:
+            rows[:, 400:406] = rows[:, 900:906] = 20
+        return np.clip(rows, 0, 255).astype(np.uint8)
+
+    def luma(rows: np.ndarray) -> np.ndarray:
+        edge = round(width * webtoon.STRIP_EDGE)
+        return rows[:, edge : width - edge].astype(np.float64) @ np.array([0.299, 0.587, 0.114])
+
+    def cut(*parts: np.ndarray):
+        rows = np.concatenate(parts)
+        pages = list(_tiles(_archive_of(*(rows[i : i + 1000] for i in range(0, len(rows), 1000))), p))
+        index = {r.tobytes(): i for i, r in enumerate(rows)}
+        return [(index.get(t[3][0].tobytes()), t) for t in pages]
+
+    grain, lined, soft = paper(200), paper(200, lines=True), paper(200, soft=True)
+    spread = _spread(grain)
+    off = (np.abs(luma(grain) - luma(grain).mean(axis=1, keepdims=True)) > 24).sum(axis=1)
+    check(
+        'premise: paper spreads past a flat band, and holds two specks or fewer off its mean a row',
+        bool((spread > webtoon.STRIP_FAINT).all()) and off.max() <= 2 and luma(grain).std(axis=1).max() <= 10,
+        f'spread {spread.min()}..{spread.max()}, off {off.max()}, std {luma(grain).std(axis=1).max():.1f}',
+    )
+    lohi = webtoon._lohi(grain)
+    check('rows of grain and specks are paper', bool(webtoon._paper_rows(grain, lohi).all()))
+    check(
+        'premise: a soft gradient is nowhere as far off its mean as a speck, but spreads past paper',
+        bool((np.abs(luma(soft) - luma(soft).mean(axis=1, keepdims=True)) < 24).all())
+        and luma(soft).std(axis=1).min() > 10
+        and bool((_spread(soft) > webtoon.STRIP_FAINT).all()),
+        f'std {luma(soft).std(axis=1).min():.1f}',
+    )
+    check('a soft gradient is not paper', not webtoon._paper_rows(soft, webtoon._lohi(soft)).any())
+    check('nor is paper with a bubble across it', not webtoon._paper_rows(lined, webtoon._lohi(lined)).any())
+    faint = _faint_lined(np.full((20, width, 3), ground, np.int16))
+    check(
+        'premise: a flat row with a faint line across it spreads past a gutter, within a flat band',
+        bool((webtoon.STRIP_QUIET < _spread(faint)).all() and (_spread(faint) <= webtoon.STRIP_FAINT).all()),
+    )
+    check('nor is a flat row with a faint line across it', not webtoon._paper_rows(faint, webtoon._lohi(faint)).any())
+    count = np.full((2, width, 3), ground, np.uint8)
+    count[0, 100:103] = count[1, 100:104] = ground + 40
+    allowance = webtoon.STRIP_PAPER_SPECKS * (width - 2 * round(width * webtoon.STRIP_EDGE))
+    check('premise: three pixels off a row are within the allowance at this width, four not', 3 <= allowance < 4)
+    check(
+        'a row is paper with three pixels off its mean, and not with four',
+        webtoon._paper_rows(count, webtoon._lohi(count)).tolist() == [True, False],
+        f'{webtoon._paper_rows(count, webtoon._lohi(count)).tolist()}',
+    )
+
+    a, b = round(0.8 * limit), round(1.1 * limit)
+    pages = cut(art(a), paper(b - a), art(round(0.6 * limit)))
+    check(
+        'a page with paper across its fold, and no gutter, is cut at the fold',
+        pages[0][0] == 0 and len(pages[0][1][3]) == limit,
+        f'{[(at, len(t[3])) for at, t in pages]}',
+    )
+    check(
+        'and the page after skips the paper bar the margin',
+        len(pages) > 1 and pages[1][0] == b - margin,
+        f'opens at {pages[1][0] if len(pages) > 1 else None}, paper ends {b}, margin {margin}',
+    )
+    check(
+        'the first ends in the paper, and the second opens on it',
+        len(pages) > 1 and pages[0][1][6].bottom and pages[1][1][6].top,
+        f'{[t[6] for _, t in pages[:2]]}',
+    )
+
+    a, b = round(1.2 * limit), round(1.5 * limit)
+    pages = cut(art(a), paper(b - a), art(limit))
+    check(
+        'with paper only past the fold, the page is cut where it starts',
+        pages[0][0] == 0 and len(pages[0][1][3]) == a and len(pages) > 1 and pages[1][0] == b - margin,
+        f'{[(at, len(t[3])) for at, t in pages]}, paper {a}..{b}',
+    )
+    a, b = round(0.4 * limit), round(0.52 * limit)
+    pages = cut(art(a), paper(b - a), art(round(1.6 * limit)))
+    check(
+        'paper that ends just past the gutter floor ends the page, however little of it lies past',
+        len(pages[0][1][3]) == b and b - int(limit * webtoon.STRIP_GUTTER_FLOOR) < 40,
+        f'{[(at, len(t[3])) for at, t in pages[:2]]}, paper {a}..{b}',
+    )
+    a = round(1.6 * limit)
+    pages = cut(art(a), paper(round(0.3 * limit)), art(limit))
+    check(
+        'but not when it starts further past the fold than a flat band is looked for',
+        len(pages[0][1][3]) < a,
+        f'{[(at, len(t[3])) for at, t in pages]}, paper at {a}',
+    )
+
+    a, b = round(0.6 * limit), round(0.85 * limit)
+    head = np.concatenate([art(round(0.25 * limit)), np.full((round(0.05 * limit), width, 3), 255, np.uint8)])
+    pages = cut(head, art(a - len(head)), paper(b - a), art(round(1.3 * limit)))
+    first = pages[0][1]
+    check(
+        'paper that ends before the fold ends the page, and the next opens after it',
+        len(first[3]) == b and len(pages) > 1 and pages[1][0] == b,
+        f'{[(at, len(t[3])) for at, t in pages]}',
+    )
+    check('premise: that page has white gutter rows in it, so no run at its end counts but the cut', not first[6].plain)
+    shown = _shipped(first, p)
+    pad, along = shown[b + 4 :], shown[a + 20 : b - 20]
+    check(
+        'and it is padded below in the paper, as the page shows it',
+        first[6].bottom
+        and _uniform(pad) is not None
+        and bool(np.abs(np.subtract(_uniform(pad), along.reshape(-1, 3).mean(axis=0))).max() <= 4),
+        f'pad {_uniform(pad)}, paper shown {along.reshape(-1, 3).mean(axis=0).round()}',
+    )
+
+    for label, kind in (('a soft gradient', {'soft': True}), ('paper with a bubble across it', {'lines': True})):
+        rows = np.concatenate([art(round(0.8 * limit)), paper(round(0.3 * limit), **kind), art(round(1.2 * limit))])
+        pages = cut(rows)
+        kept = np.zeros(len(rows), bool)
+        for at, t in pages:
+            if at is not None:
+                kept[at : at + len(t[3])] = True
+        check(
+            f'{label} is not cut in as paper, and none of it is skipped',
+            all(at is not None for at, _ in pages) and bool(kept.all()),
+            f'{int((~kept).sum())} rows skipped, {[(at, len(t[3])) for at, t in pages]}',
+        )
+    a, short = round(0.8 * limit), 40
+    check('premise: 40 rows are less than a band', short < round(limit * webtoon.STRIP_BAND_MIN))
+    pages = cut(art(a), paper(short), art(round(1.2 * limit)))
+    check(
+        'a run of paper shorter than a band does not end a page',
+        not pages[0][1][6].bottom and len(pages[0][1][3]) != a + short,
+        f'{[(at, len(t[3]), t[6]) for at, t in pages[:2]]}',
+    )
+
+    a, b = round(0.6 * limit), round(0.7 * limit)
+    light = (255 - rng.integers(0, 20, (b - a, width, 3))).astype(np.uint8)
+    pages = cut(art(a), light, art(round(0.2 * limit)), paper(round(0.2 * limit)), art(round(1.2 * limit)))
+    check(
+        'premise: the light band is no gutter, too noisy, but a loose one',
+        bool((_spread(light) > webtoon.STRIP_QUIET).all()) and bool((light.min(axis=(1, 2)) >= 235).all()),
+    )
+    check(
+        'a loose gutter in reach ends the page before paper does',
+        len(pages[0][1][3]) == b,
+        f'{[(at, len(t[3])) for at, t in pages[:2]]}, loose ends {b}',
+    )
+
+    rows = np.concatenate([art(6 * limit), paper(round(0.3 * limit)), art(limit)])
+    seen = []
+    real = webtoon._paper_rows
+
+    def counted(part, lohi):
+        seen.append(len(part))
+        return real(part, lohi)
+
+    with mock.patch.object(webtoon, '_paper_rows', counted):
+        pages = cut(rows)
+    check(
+        'each row is read for paper at most once, though cut after cut looks at it',
+        sum(seen) <= len(rows) and len(seen) > 2,
+        f'{sum(seen)} rows read in {len(seen)} reads, strip {len(rows)}',
+    )
+    check(
+        'and artwork is only sampled: no more than a quarter of the strip is read',
+        sum(seen) < len(rows) // 4,
+        f'{sum(seen)} rows read, strip {len(rows)}',
+    )
+    held = webtoon._Held(64)
+    held.add(paper(100))
+    got = held.paper()[10:60]
+    known = held.known[held.start : held.stop].copy()
+    check(
+        'a row read for paper keeps its answer beside it in the strip, and no other row has one',
+        bool(got.all()) and bool((known[10:60] == 1).all()) and bool((np.delete(known, np.s_[10:60]) == -1).all()),
+        f'{np.unique(known, return_counts=True)}',
+    )
+    held.drop(5)
+    held.add(art(200))
+    known = held.known[held.start : held.stop]
+    check('premise: adding past the headroom moved the rows', held.start == 0 and len(known) == 295)
+    check(
+        'and keeps it when the rows are moved, every other row unread',
+        bool((known[5:55] == 1).all()) and bool((np.delete(known, np.s_[5:55]) == -1).all()),
+        f'{np.unique(known, return_counts=True)}',
+    )
+
+    def every(mask: np.ndarray, first: int, end: int, band: int) -> list[tuple[int, int]]:
+        out, s = [], None
+        for i in range(first, end + 1):
+            on = i < end and bool(mask[i])
+            if on and s is None:
+                s = i
+            elif not on and s is not None:
+                if i - s >= band:
+                    out.append((s, i))
+                s = None
+        return out
+
+    def sampled(mask: np.ndarray, first: int, end: int, band: int) -> list[tuple[int, int]]:
+        known = webtoon._Paper(np.zeros((len(mask), 1, 3), np.uint8), None, mask.astype(np.int8))
+        return webtoon._paper_runs(known, first, end, band)
+
+    trials, wrong = 0, []
+    for seed in range(400):
+        r = np.random.default_rng(seed)
+        band = int(r.integers(2, 60))
+        lengths = r.integers(1, 3 * band, 200)
+        mask = np.repeat(np.arange(len(lengths)) % 2 == seed % 2, lengths)
+        first = int(r.integers(0, 3 * band))
+        end = int(r.integers(first, len(mask) + 1))
+        trials += 1
+        if sampled(mask, first, end, band) != every(mask, first, end, band):
+            wrong.append(seed)
+    for band, mask in ((4, '0111101111'), (4, '1111'), (4, '0011110'), (3, '110110111'), (5, '1111011111')):
+        mask = np.array([c == '1' for c in mask])
+        trials += 1
+        if sampled(mask, 0, len(mask), band) != every(mask, 0, len(mask), band):
+            wrong.append((band, mask.astype(int).tolist(), sampled(mask, 0, len(mask), band)))
+    check(
+        'sampling every band-th row finds the same runs of paper as reading them all',
+        not wrong,
+        f'{len(wrong)} of {trials} differ: {wrong[:3]}',
+    )
 
 
 def check_strip_width() -> None:
@@ -4841,6 +5411,13 @@ def _pages_of(blob: bytes):
     return out
 
 
+def _faint_lined(rows: np.ndarray) -> np.ndarray:
+    rows = rows.copy()
+    rows[:, 400:406] -= 30
+    rows[:, 900:906] -= 30
+    return np.clip(rows, 0, 255).astype(np.uint8)
+
+
 def _panel_strip(*segments, width=1272, seed=7):
     rng = np.random.default_rng(seed)
     parts = []
@@ -5784,6 +6361,107 @@ def check_strip_fill() -> None:
     )
 
 
+def check_strip_empty() -> None:
+    p = _strip_profile()
+    L = p.height
+    w = 1272
+    rng = np.random.default_rng(201)
+
+    def fade(n, top=200, bottom=60):
+        return np.repeat(np.linspace(top, bottom, n).round().astype(np.uint8)[:, None, None], w, 1).repeat(3, 2)
+
+    grain = np.clip(150 + rng.integers(-12, 13, (round(1.2 * L), w, 1)), 0, 255).astype(np.uint8).repeat(3, 2)
+    marked = fade(round(1.2 * L))
+    marked[600:620, 200:400] = 0
+    speckled = fade(round(1.2 * L))
+    for k in range(6):
+        speckled[150 + 120 * k, 300 + 110 * k] = speckled[150 + 120 * k, 300 + 110 * k] - 70
+    dots = fade(round(1.2 * L))
+    for x in (600, 620, 640):
+        dots[800:808, x : x + 8] = 0
+    parts = [
+        _panel_strip(('smooth', round(0.6 * L))),
+        _panel_strip(('white', round(0.1 * L))),
+        fade(round(1.5 * L)),
+        _panel_strip(('white', round(0.1 * L))),
+        _panel_strip(('smooth', round(0.6 * L)), seed=9),
+        _panel_strip(('white', round(0.1 * L))),
+        grain,
+        _panel_strip(('white', round(0.1 * L))),
+        marked,
+        _panel_strip(('white', round(0.1 * L))),
+        speckled,
+        _panel_strip(('white', round(0.1 * L))),
+        dots,
+        _panel_strip(('white', round(0.1 * L))),
+        _panel_strip(('smooth', round(0.6 * L)), seed=8),
+    ]
+    blob = _archive_of(np.concatenate(parts))
+    budget = webtoon.STRIP_SPECK * p.width * p.height
+
+    def ink(rows):
+        lit = rows[_spread(rows) > webtoon.STRIP_FAINT]
+        edge = round(rows.shape[1] * webtoon.STRIP_EDGE)
+        y = lit[:, edge : rows.shape[1] - edge].astype(np.float64) @ np.array([0.299, 0.587, 0.114])
+        return int((np.abs(y - y.mean(axis=1, keepdims=True)) > webtoon.STRIP_FAINT / 2).sum()) if len(lit) else 0
+
+    def nothing(rows):
+        return ink(rows) <= budget
+
+    def pages(source):
+        consumed, origins = {}, {}
+        got = [t for t in webtoon.strip_tiles(_strip_entries(source), p, consumed, origins) if t[0] == 'tile']
+        return got, consumed, origins
+
+    with mock.patch.object(webtoon, '_empty', lambda *_: False):
+        before, _, _ = pages(blob)
+    after, consumed, origins = pages(blob)
+    blank = [t for t in before if nothing(t[3])]
+    counts = [ink(t[3]) for t in before]
+    check(
+        'premise: without the rule, the fade and a flat grain of grey ship as pages with no ink on them, '
+        'the grain spreading more than a quiet gutter may',
+        len([t for t in blank if _spread(t[3]).max() <= webtoon.STRIP_FAINT]) >= 2
+        and any(webtoon.STRIP_QUIET < _spread(t[3]).max() <= webtoon.STRIP_FAINT for t in blank),
+        f'{len(blank)} empty pages of {len(before)}, spreading {[int(_spread(t[3]).max()) for t in blank]}',
+    )
+    check(
+        'premise: a fade with six specks of grain carries ink, but less than the threshold, and one with a '
+        'lone ellipsis of three dots carries more, but less than four times it',
+        any(0 < c <= budget for c in counts) and any(budget < c < 4 * budget for c in counts),
+        f'ink per page {counts}, threshold {budget:.0f} pixels',
+    )
+    same = [(t[3], t[4], t[5]) for t in before if not nothing(t[3])]
+    shipped = [ink(t[3]) for t in after]
+    check(
+        'a page with nothing on it but specks is left out, and every other page ships as it did, '
+        'the marked fade and the ellipsis included',
+        len(after) == len(before) - len(blank)
+        and all(np.array_equal(a[0], b[3]) and a[1:] == (b[4], b[5]) for a, b in zip(same, after, strict=True))
+        and not any(nothing(t[3]) for t in after)
+        and 3 * 8 * 8 in shipped
+        and 6 not in shipped,
+        f'{len(before)} pages before, {len(after)} after, ink per page {counts}, shipped {shipped}',
+    )
+    n = len(after)
+    check(
+        'the pages left are numbered 1..n, and the maps that report progress and sync it with them',
+        [t[1] for t in after] == list(range(1, n + 1))
+        and sorted(consumed) == list(range(1, n + 1))
+        and sorted(origins) == list(range(1, n + 1)),
+        f'numbers {[t[1] for t in after]}, progress {sorted(consumed)}, sync {sorted(origins)}',
+    )
+    only = _archive_of(fade(round(2.5 * L)))
+    with mock.patch.object(webtoon, '_empty', lambda *_: False):
+        whole, _, _ = pages(only)
+    kept, _, _ = pages(only)
+    check(
+        'a strip with nothing on it at all still ships its last page, so a download is never empty',
+        len(kept) == 1 and kept[0][1] == 1 and np.array_equal(kept[0][3], whole[-1][3]),
+        f'{len(kept)} page(s) of {len(whole)}',
+    )
+
+
 def check_strip_decode_ahead() -> None:
     p = _strip_profile()
     src = _strip_cbz([900, 700, 1100, 800, 1000, 600, 1200, 900, 700, 1000], gutter=[(1, 300), (4, 500), (7, 200)])
@@ -5896,13 +6574,22 @@ def check_strip_rescue() -> None:
         return np.clip(level - noise if level > 128 else level + noise, 0, 255).astype(np.uint8)
 
     def flat(n: int) -> np.ndarray:
-        return np.clip(150 + rng.integers(-10, 11, (n, w, 3)), 0, 255).astype(np.uint8)
+        return _faint_lined(150 + rng.integers(-5, 6, (n, w, 3)))
 
     def smooth(n: int) -> np.ndarray:
         return _panel_strip(('smooth', n), width=w)
 
     def jobs(*parts: np.ndarray):
         return list(_tiles(_archive_of(np.concatenate(parts)), p))
+
+    lined = flat(80)
+    y = lined[:, 6:-6].astype(np.float64) @ np.array([0.299, 0.587, 0.114])
+    check(
+        'premise: the near-flat band spreads past a gutter, within a flat band, with a dozen pixels far off a row',
+        bool(((_spread(lined) > webtoon.STRIP_QUIET) & (_spread(lined) <= webtoon.STRIP_FAINT)).all())
+        and int((np.abs(y - y.mean(axis=1, keepdims=True)) > 24).sum(axis=1).min()) >= 12,
+        f'spread {_spread(lined).min()}..{_spread(lined).max()}',
+    )
 
     mono = profiles.PROFILES['kobo-clara-hd-2e-bw']
     page = np.full((1000, mono.width), 128, np.uint8)
@@ -6290,7 +6977,7 @@ def check_strip_plan() -> None:
 
     body = art(round(1.67 * limit))
     body[limit - 30 - margin : limit - margin] = _panel_strip(('smooth', 30), width=w)
-    band = np.clip(150 + rng.integers(-10, 11, (80, w, 3)), 0, 255).astype(np.uint8)
+    band = _faint_lined(150 + rng.integers(-5, 6, (80, w, 3)))
     strip = np.concatenate([gutter(150), body, band, art(2500), gutter(150)])
     got, before = both(strip)
     end = find(strip, before[1][3]) + len(before[1][3])
@@ -11898,6 +12585,7 @@ async def main() -> int:
     check_reslice_edges()
     check_strip_lettering()
     check_strip_fill()
+    check_strip_empty()
     check_strip_decode_ahead()
     print('no gutter in reach')
     check_strip_rescue()
@@ -11936,6 +12624,10 @@ async def main() -> int:
     check_webtoon_pad()
     print('gutter pad')
     check_gutter_pad()
+    print('ground pad')
+    check_ground_read()
+    check_ground_pad()
+    check_strip_paper()
     print('strip width')
     check_strip_width()
     print('pad seam')

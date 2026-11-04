@@ -47,6 +47,18 @@ STRIP_WIDTH_SAMPLE = 8
 STRIP_FILL_BLANK = 0.40
 STRIP_FILL_FLOOR = 0.90
 STRIP_FILL_READ = 0.08
+STRIP_SPECK = 3e-5
+STRIP_GROUND_REACH = 0.15
+STRIP_GROUND_LONG = 0.03
+STRIP_GROUND_FLAT = 10
+STRIP_GROUND_MATCH = 12
+STRIP_GROUND_SHARE = 0.30
+STRIP_GROUND_SIDE = 24
+STRIP_GROUND_END = 8
+STRIP_PAPER_SPECKS = 0.0025
+
+_LUMA = np.array([0.299, 0.587, 0.114], np.float32)
+_GROUNDS = frozenset({'gutter', 'loose', 'paper', 'flat'})
 
 
 def _slice_width(blob: bytes) -> int | None:
@@ -148,7 +160,7 @@ def _proper(white: np.ndarray, black: np.ndarray, minrun: int) -> np.ndarray:
 
 
 def _row_busy(rows: np.ndarray) -> np.ndarray:
-    y = _inner(rows).astype(np.float32) @ np.array([0.299, 0.587, 0.114], np.float32)
+    y = _inner(rows).astype(np.float32) @ _LUMA
     hard = (np.abs(y[:, STRIP_HARD_SPAN:] - y[:, :-STRIP_HARD_SPAN]) >= STRIP_HARD).mean(axis=1)
     detail = np.abs(np.diff(y, axis=1)).mean(axis=1)
     return hard + detail * 1e-4
@@ -283,6 +295,79 @@ def _loose_gutter(head: np.ndarray, limit: int, margin: int) -> tuple[int, int, 
     return at, max(at, e - margin), 255.0 if white else 0.0 if black else None
 
 
+def _paper_rows(rows: np.ndarray, lohi: np.ndarray) -> np.ndarray:
+    out = _spread(lohi) <= STRIP_QUIET
+    read = np.flatnonzero(~out)
+    inner = _inner(rows)
+    allow = STRIP_PAPER_SPECKS * inner.shape[1]
+    for at in range(0, len(read), 64):
+        pick = read[at : at + 64]
+        y = inner[pick].astype(np.float32) @ _LUMA
+        off = (np.abs(y - y.mean(axis=1, keepdims=True)) > STRIP_FAINT / 2).sum(axis=1)
+        out[pick] = (y.std(axis=1) <= STRIP_GROUND_FLAT) & (off <= allow)
+    return out
+
+
+class _Paper:
+    def __init__(self, rows: np.ndarray, lohi: np.ndarray, known: np.ndarray | None = None):
+        self.rows, self.lohi = rows, lohi
+        self.known = np.full(len(rows), -1, np.int8) if known is None else known
+
+    def __len__(self) -> int:
+        return len(self.known)
+
+    def __getitem__(self, at: slice | np.ndarray) -> np.ndarray:
+        rows = np.arange(*at.indices(len(self.known))) if isinstance(at, slice) else at
+        new = rows[self.known[rows] < 0]
+        if len(new) and new[-1] - new[0] + 1 == len(new):
+            span = slice(int(new[0]), int(new[-1]) + 1)
+            self.known[span] = _paper_rows(self.rows[span], self.lohi[span])
+        elif len(new):
+            self.known[new] = _paper_rows(self.rows[new], self.lohi[new])
+        return self.known[rows] == 1
+
+    def after(self, pos: int) -> _Paper:
+        return _Paper(self.rows[pos:], self.lohi[pos:], self.known[pos:])
+
+
+def _paper_runs(paper: _Paper, first: int, end: int, band: int) -> list[tuple[int, int]]:
+    runs, done = [], first
+    probes = np.arange(first + band - 1, end, band)
+    for at in probes[paper[probes]].tolist():
+        if at < done:
+            continue
+        s, e = at, at + 1
+        while s > first:
+            up = paper[max(first, s - 64) : s]
+            stop = np.flatnonzero(~up)
+            s -= len(up) - (int(stop[-1]) + 1 if len(stop) else 0)
+            if len(stop):
+                break
+        while e < end:
+            down = paper[e : min(end, e + 64)]
+            stop = np.flatnonzero(~down)
+            e += int(stop[0]) if len(stop) else len(down)
+            if len(stop):
+                break
+        done = e
+        if e - s >= band:
+            runs.append((s, e))
+    return runs
+
+
+def _paper_band(paper: _Paper, limit: int, margin: int) -> tuple[int, int] | None:
+    lo = max(1, int(limit * STRIP_GUTTER_FLOOR))
+    band = round(limit * STRIP_BAND_MIN)
+    runs = _paper_runs(paper, max(0, lo - band), min(len(paper), round(limit * STRIP_OVERSHOOT)), band)
+    before = [(s, e) for s, e in runs if e > lo and s < limit]
+    past = [(s, e) for s, e in runs if limit <= s <= round(limit * STRIP_FLAT_REACH)]
+    if not before and not past:
+        return None
+    s, e = before[-1] if before else past[0]
+    at = min(e, limit) if before else s
+    return at, max(at, e - margin)
+
+
 def _flat_band(head: np.ndarray, limit: int) -> int | None:
     lo = max(1, int(limit * STRIP_GUTTER_FLOOR))
     band = round(limit * STRIP_BAND_MIN)
@@ -305,23 +390,43 @@ def _overlap_start(block: np.ndarray, at: int, limit: int) -> int:
 
 
 def _cut(
-    block: np.ndarray, lohi: np.ndarray, limit: int, margin: int, resumed: bool, lettering: bool = False
-) -> tuple[int, int, float | None, str]:
+    block: np.ndarray,
+    lohi: np.ndarray,
+    limit: int,
+    margin: int,
+    resumed: bool,
+    lettering: bool = False,
+    paper: _Paper | None = None,
+) -> tuple[int, int, float | None, str, str]:
     minrun = max(1, round(limit * STRIP_GUTTER_MIN))
     if len(block) <= limit:
-        return len(block), len(block), None, 'top'
+        return len(block), len(block), None, 'top', 'end'
     at = _gutter_seam(lohi, limit, block if lettering else None, not resumed)
     if at is not None:
-        return at, at, _gutter_at(lohi, at, minrun) if at < len(block) else None, 'top'
+        return at, at, _gutter_at(lohi, at, minrun) if at < len(block) else None, 'top', 'gutter'
     head = lohi[: round(limit * STRIP_OVERSHOOT)]
     loose = _loose_gutter(head, limit, margin)
     if loose is not None:
-        return *loose, 'top'
+        return *loose, 'top', 'loose'
+    found = _paper_band(_Paper(block, lohi) if paper is None else paper, limit, margin)
+    if found is not None:
+        return *found, None, 'top', 'paper'
     at = _flat_band(head, limit)
     if at is not None:
-        return at, at, None, 'top'
+        return at, at, None, 'top', 'flat'
     at = limit if resumed else _least_busy(block, limit)
-    return at, _overlap_start(block, at, limit), None, 'top' if resumed else 'bottom'
+    return at, _overlap_start(block, at, limit), None, 'top' if resumed else 'bottom', 'art'
+
+
+def _ends_in(tier: str, lohi: np.ndarray, at: int, limit: int, paper: _Paper | None = None) -> bool:
+    if tier == 'loose':
+        lo, hi = lohi[at - 1]
+        return bool(lo >= STRIP_GUTTER_WHITE or hi <= STRIP_GUTTER_BLACK)
+    if tier == 'paper':
+        return paper is not None and bool(paper[at - 1 : at][0])
+    if tier == 'gutter':
+        return at < limit and bool(_spread(lohi[at - 1 : at])[0] <= STRIP_QUIET)
+    return tier == 'flat'
 
 
 def _place(busy: np.ndarray, end: int, h: int, k: int, limit: int) -> tuple[float, list[int]] | None:
@@ -393,6 +498,17 @@ def _opening(lohi: np.ndarray, step: int, minrun: int) -> tuple[int, int, bool]:
     return start, end, art is not None
 
 
+def _empty(lohi: np.ndarray, rows: np.ndarray, budget: float) -> bool:
+    ink = np.flatnonzero(_spread(lohi) > STRIP_FAINT)
+    seen = 0
+    for at in range(0, len(ink), 64):
+        y = _inner(rows[ink[at : at + 64]]).astype(np.float32) @ _LUMA
+        seen += int((np.abs(y - y.mean(axis=1, keepdims=True)) > STRIP_FAINT / 2).sum())
+        if seen > budget:
+            return False
+    return True
+
+
 def _gutter_at(lohi: np.ndarray, at: int, minrun: int) -> float | None:
     lo = max(0, at - minrun)
     _, white, black = _classes(lohi[lo : at + minrun])
@@ -402,10 +518,70 @@ def _gutter_at(lohi: np.ndarray, at: int, minrun: int) -> float | None:
     return None
 
 
+@dataclasses.dataclass(frozen=True)
+class _Ground:
+    top: bool = False
+    bottom: bool = False
+    plain: bool = False
+    colour: tuple[float, float, float] | None = None
+    above: np.ndarray | None = dataclasses.field(default=None, compare=False, repr=False)
+
+
+def _smooth(a: np.ndarray, k: int = 5) -> np.ndarray:
+    padded = np.pad(a, ((k // 2, k // 2),) + ((0, 0),) * (a.ndim - 1), mode='edge')
+    c = np.concatenate([np.zeros((1, *a.shape[1:])), np.cumsum(padded, axis=0, dtype=np.float64)])
+    return (c[k:] - c[:-k]) / k
+
+
+def _row_stats(rows: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    part = rows.astype(np.float32)
+    return part.mean(axis=1), (part @ _LUMA).std(axis=1)
+
+
+def _ground(rows: np.ndarray, limit: int) -> tuple[tuple[float, float, float], int] | None:
+    reach = round(limit * STRIP_GROUND_REACH)
+    minrun = max(1, round(limit * STRIP_GUTTER_MIN))
+    rows = _inner(rows[: 2 * reach])
+    n = len(rows)
+    colour, spread = np.empty((n, 3)), np.empty(n)
+    done = 0
+    while done < n:
+        colour[done : done + 64], spread[done : done + 64] = _row_stats(rows[done : done + 64])
+        done = min(n, done + 64)
+        sure = done if done == n else done - 2
+        flat = _smooth(spread[:done])[:sure] <= STRIP_GROUND_FLAT
+        edges = np.flatnonzero(np.diff(np.concatenate([[0], flat.astype(np.int8), [0]])))
+        waiting = False
+        for s, e in zip(edges[::2], edges[1::2], strict=True):
+            if s > reach:
+                return None
+            open_ = e == sure < n
+            if e - s < minrun and not open_:
+                continue
+            if open_ and e - s < max(minrun, 5):
+                waiting = True
+                break
+            c = colour[s:e]
+            off = np.flatnonzero(np.abs(c - c[:5].mean(axis=0)).max(axis=1) > STRIP_GROUND_MATCH)
+            if len(off) or not open_:
+                c = c[: off[0] if len(off) else len(c)]
+                return (tuple(float(v) for v in c.mean(axis=0)), len(c)) if len(c) else None
+            waiting = True
+            break
+        if not waiting and sure > reach:
+            return None
+    return None
+
+
+def _plain(lohi: np.ndarray, minrun: int) -> bool:
+    _, white, black = _classes(lohi)
+    return not _proper(white, black, minrun).any()
+
+
 class _Held:
     def __init__(self, headroom: int):
         self.headroom = headroom
-        self.pixels = self.lohi = None
+        self.pixels = self.lohi = self.known = None
         self.start = self.stop = 0
         self.dropped = 0
 
@@ -417,11 +593,14 @@ class _Held:
             live = len(self)
             pixels = np.empty((live + len(a) + self.headroom, *a.shape[1:]), np.uint8)
             lohi = np.empty((len(pixels), 2), np.uint8)
+            known = np.empty(len(pixels), np.int8)
             if live:
                 pixels[:live], lohi[:live] = self.rows(), self.stats()
-            self.pixels, self.lohi, self.start, self.stop = pixels, lohi, 0, live
+                known[:live] = self.known[self.start : self.stop]
+            self.pixels, self.lohi, self.known, self.start, self.stop = pixels, lohi, known, 0, live
         self.pixels[self.stop : self.stop + len(a)] = a
         self.lohi[self.stop : self.stop + len(a)] = _lohi(a)
+        self.known[self.stop : self.stop + len(a)] = -1
         self.stop += len(a)
 
     def drop(self, n: int) -> None:
@@ -433,6 +612,9 @@ class _Held:
 
     def stats(self) -> np.ndarray:
         return self.lohi[self.start : self.stop]
+
+    def paper(self) -> _Paper:
+        return _Paper(self.rows(), self.stats(), self.known[self.start : self.stop])
 
 
 def strip_tiles(entries, p: Profile, consumed: dict[int, int], origins: dict[int, int] | None = None):
@@ -449,6 +631,11 @@ def strip_tiles(entries, p: Profile, consumed: dict[int, int], origins: dict[int
     chain = None
     firsts: list[int] = []
     slices: list[int] = []
+    spare = None
+    dropped = 0
+    specks = STRIP_SPECK * p.width * p.height
+    grounded, tail = False, None
+    ground_rows = 2 * round(limit * STRIP_GROUND_REACH)
 
     def rows() -> int:
         return 0 if opening else len(held)
@@ -460,13 +647,23 @@ def strip_tiles(entries, p: Profile, consumed: dict[int, int], origins: dict[int
             held.drop(max(start, end - margin))
             opening = not art
 
-    def tile(name: str, piece: np.ndarray, edges, anchor: str, offset: int = 0):
+    def tile(name: str, piece: np.ndarray, lohi: np.ndarray, edges, anchor: str, ground: _Ground, offset: int = 0):
+        nonlocal spare, dropped
+        origin = None
+        if origins is not None and firsts:
+            origin = slices[max(0, bisect.bisect_right(firsts, held.dropped + offset) - 1)]
+        if _empty(lohi, piece, specks):
+            spare, dropped = (name, piece.copy(), edges, anchor, ground, origin), dropped + 1
+            return None
+        return numbered(name, piece.copy(), edges, anchor, ground, origin)
+
+    def numbered(name: str, piece: np.ndarray, edges, anchor: str, ground: _Ground, origin: int | None):
         nonlocal index
         index += 1
         consumed[index] = seen
-        if origins is not None and firsts:
-            origins[index] = slices[max(0, bisect.bisect_right(firsts, held.dropped + offset) - 1)]
-        return ('tile', index, name, piece.copy(), edges, anchor)
+        if origin is not None:
+            origins[index] = origin
+        return ('tile', index, name, piece, edges, anchor, ground)
 
     def carry_on(nxt: int, again: bool) -> None:
         nonlocal opening, resumed
@@ -474,45 +671,76 @@ def strip_tiles(entries, p: Profile, consumed: dict[int, int], origins: dict[int
         opening, resumed = True, again
         settle()
 
-    def cut(name: str, final: bool) -> list:
+    def lay(tier: str, ended: bool, end: int) -> None:
+        nonlocal grounded, tail
+        grounded = tier in _GROUNDS
+        tail = held.rows()[max(0, end - ground_rows) : end].copy() if ended else None
+
+    def cut(name: str, final: bool) -> list | None:
         nonlocal chain
-        block, lohi = held.rows(), held.stats()
+        block, lohi, paper = held.rows(), held.stats(), held.paper()
         if chain is None:
-            at, nxt, below, anchor = _cut(block, lohi, limit, margin, resumed, lettering)
+            at, nxt, below, anchor, tier = _cut(block, lohi, limit, margin, resumed, lettering, paper)
             if anchor != 'bottom':
-                out = tile(name, block[:at], (_gutter_at(lohi[:at], 0, minrun), below), anchor)
+                ended = _ends_in(tier, lohi, at, limit, paper)
+                ground = _Ground(grounded, ended, _plain(lohi[:at], minrun), above=tail if grounded else None)
+                out = tile(name, block[:at], lohi[:at], (_gutter_at(lohi[:at], 0, minrun), below), anchor, ground)
+                lay(tier, ended, at)
                 carry_on(nxt, nxt < at)
-                return [out]
-            chain = [0, 0, (at, nxt, below)]
+                return [out] if out is not None else []
+            chain = [0, 0, (at, nxt, below, tier)]
         plan = None
         while chain[0] + reach <= STRIP_PLAN_REACH * limit:
             pos = chain[0]
             if not final and len(block) - pos <= ahead:
-                return []
+                return None
             if chain[1] == 0:
-                at, nxt, below = chain[2]
+                at, nxt, below, tier = chain[2]
             else:
-                at, nxt, below = _cut(block[pos:], lohi[pos:], limit, margin, True, lettering)[:3]
+                at, nxt, below, _, tier = _cut(
+                    block[pos:], lohi[pos:], limit, margin, True, lettering, paper.after(pos)
+                )
             chain[1] += 1
             if nxt >= at:
                 plan = _even(block, pos + at, chain[1], limit)
                 break
             chain[0] += nxt
         if plan is None:
-            (at, nxt, below), chain = chain[2], None
+            (at, nxt, below, _), chain = chain[2], None
             log.debug('strip: an artwork could not be planned whole; cut as it comes')
-            out = tile(name, block[:at], (_gutter_at(lohi[:at], 0, minrun), below), 'bottom')
+            ground = _Ground(grounded, plain=_plain(lohi[:at], minrun), above=tail if grounded else None)
+            out = tile(name, block[:at], lohi[:at], (_gutter_at(lohi[:at], 0, minrun), below), 'bottom', ground)
+            lay('art', False, at)
             carry_on(nxt, True)
-            return [out]
+            return [out] if out is not None else []
         chain = None
         h, starts = plan
         end, after = pos + at, pos + nxt
         level = _gutter_at(lohi, 0, minrun)
         level = below if level is None else level
+        found = _ground(block, limit) if grounded else None
+        if found is None and grounded and tail is not None:
+            found = _ground(tail[::-1], limit)
+        ended = _ends_in(tier, lohi[pos:], at, limit, paper.after(pos))
+        if found is None and tier in _GROUNDS:
+            found = _ground(block[:end][::-1] if ended else block[end:], limit)
+        colour = found[0] if found else None
         stops = [a + h for a in starts[:-1]] + [end]
-        out = [tile(name, block[a:stop], (level, level), 'top', a) for a, stop in zip(starts, stops, strict=True)]
+        out = [
+            tile(
+                name,
+                block[a:stop],
+                lohi[a:stop],
+                (level, level),
+                'top',
+                _Ground(colour=colour),
+                a,
+            )
+            for a, stop in zip(starts, stops, strict=True)
+        ]
+        lay(tier, ended, end)
         carry_on(after, False)
-        return out
+        return [t for t in out if t is not None]
 
     last = ''
     decoded = _decoded(entries, p)
@@ -531,13 +759,18 @@ def strip_tiles(entries, p: Profile, consumed: dict[int, int], origins: dict[int
                 settle()
                 while rows() > ahead:
                     got = cut(name, False)
-                    if not got:
+                    if got is None:
                         break
                     yield from got
     finally:
         decoded.close()
     while rows():
         yield from cut(last, True)
+    if not index and spare is not None:
+        dropped -= 1
+        yield numbered(*spare)
+    if dropped:
+        log.info('strip: %d page(s) with nothing on them left out', dropped)
 
 
 @functools.lru_cache(maxsize=16)
@@ -550,8 +783,68 @@ def tile_image(a: np.ndarray) -> pyvips.Image:
     return pyvips.Image.new_from_memory(a, a.shape[1], a.shape[0], a.shape[2], 'uchar')
 
 
+def _pad_border(tile: np.ndarray, sides: bool, scale: float, end: str | None):
+    w = tile.shape[1]
+    colours, flats, ends = [], [], []
+    if sides:
+        edge, cols = round(w * STRIP_EDGE), max(1, round(STRIP_GROUND_SIDE / scale))
+        for band in (tile[:, edge : edge + cols], tile[:, w - edge - cols : w - edge]):
+            colour, spread = _row_stats(band)
+            colours.append(_smooth(colour))
+            flats.append(_smooth(spread) <= STRIP_GROUND_FLAT)
+            ends.append(np.zeros(len(tile), bool))
+    if end is not None:
+        rows = _inner(tile[-STRIP_GROUND_END:] if end == 'below' else tile[:STRIP_GROUND_END]).astype(np.float32)
+        colours.append(rows.mean(axis=0))
+        flats.append((rows @ _LUMA).std(axis=0) <= STRIP_GROUND_FLAT)
+        ends.append(np.ones(rows.shape[1], bool))
+    return np.concatenate(colours), np.concatenate(flats), np.concatenate(ends)
+
+
+def _ground_pad(tile: np.ndarray, p: Profile, fit: str, level: float | None, ground: _Ground):
+    if not p.is_colour or p.auto_mono or (level is None and p.colour_pad != 'mono'):
+        return None
+    limit, (n, w) = p.height, tile.shape[:2]
+    scale = min(1.0, limit / n)
+    sides, short = round(w * scale) < p.width, n < limit
+    if not sides and not short:
+        return None
+    if level is None:
+        im = tile_image(tile)
+        if scale < 1.0:
+            im = im.thumbnail_image(p.width, height=limit, size='down', linear=p.linear_light)
+        level = pipeline.mono_pad_level(im, im.width < p.width, short and fit != 'top', short and fit != 'bottom')
+    today = np.full(3, level)
+    colours, flats, ends = _pad_border(tile, sides, scale, ('below' if fit == 'top' else 'above') if short else None)
+    held = flats & (np.abs(colours - today).max(axis=1) <= STRIP_GROUND_MATCH)
+    if flats.mean() < STRIP_GROUND_SHARE or not (flats & ~held).any():
+        return None
+    top = _ground(tile, limit) if ground.top or ground.plain else None
+    bottom = _ground(tile[::-1], limit) if ground.bottom or ground.plain else None
+    opened = top if top is not None or ground.above is None else _ground(ground.above[::-1], limit)
+    found = [] if ground.colour is None else [ground.colour]
+    found += [g[0] for g, wanted in ((opened, ground.top), (bottom, ground.bottom)) if g and wanted]
+    if ground.plain:
+        found += [g[0] for g in (top, bottom) if g and g[1] >= limit * STRIP_GROUND_LONG]
+    found = [np.array(c) for c in found]
+    if all(np.abs(c - today).max() <= STRIP_GROUND_MATCH for c in found):
+        return None
+    covered = [held] + [flats & (np.abs(colours - c).max(axis=1) <= STRIP_GROUND_MATCH) for c in found]
+    shares = [m.mean() for m in covered]
+    best = int(np.argmax(shares))
+    if best == 0 or shares[best] < STRIP_GROUND_SHARE:
+        return None
+    if any(part.any() and covered[best][part].mean() < covered[0][part].mean() for part in (ends, ~ends)):
+        return None
+    colour = colours[covered[best]].mean(axis=0)
+    for pure in (0.0, 255.0):
+        if np.abs(colour - pure).max() <= STRIP_GROUND_MATCH:
+            return None if pure == level else pure
+    return tuple(float(v) for v in colour)
+
+
 def render_tile(job, profile: Profile):
-    _, _, _, tile, (above, below), anchor = job
+    _, _, _, tile, (above, below), anchor, *ground = job
     if len(tile) > profile.height:
         known = {level for level in (above, below) if level is not None}
         fit, level = 'box', known.pop() if len(known) == 1 else None
@@ -559,4 +852,7 @@ def render_tile(job, profile: Profile):
         fit, level = 'bottom', above
     else:
         fit, level = 'top', below if below is not None else above
-    return render_page(b'', _refit(profile, fit), source=tile_image(tile), pad_level=level)
+    colour = _ground_pad(tile, profile, fit, level, ground[0]) if ground else None
+    return render_page(
+        b'', _refit(profile, fit), source=tile_image(tile), pad_level=level if colour is None else colour
+    )
