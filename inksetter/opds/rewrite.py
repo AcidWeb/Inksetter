@@ -3,11 +3,13 @@ Feed rewriting for OPDS 1.x (Atom), OPDS 2.0 (JSON) and Readium manifests.
 """
 
 import re
+import copy
 import json
 import base64
 import codecs
 from lxml import etree
 from dataclasses import dataclass
+from collections.abc import Callable
 from urllib.parse import quote, urljoin, urlsplit
 
 
@@ -54,6 +56,7 @@ JSON_TYPES = (
     'application/json',
 )
 PAGE_CONTAINERS = ('readingOrder', 'resources')
+MAX_PARTS = 99
 SAME_RESOURCE_KEYS = ('alternate',)
 SEARCH_VARIABLES = frozenset({'searchTerms', 'query', 'search'})
 GENERIC_TYPES = frozenset({'', 'text/plain', 'application/octet-stream', 'binary/octet-stream'})
@@ -176,6 +179,45 @@ class Ctx:
     profile: str
     public_base: str
     base_url: str
+    parts: Callable[[str, int], int] | None = None
+
+
+def parts_of(ctx: Ctx, href: str | None, count: int) -> int:
+    if ctx.parts is None or not href:
+        return 1
+    try:
+        n = ctx.parts(urljoin(ctx.base_url, _unfilled(href)), count)
+    except Exception:
+        return 1
+    return min(MAX_PARTS, n) if isinstance(n, int) and n > 1 else 1
+
+
+def part_href(href: str, part: int, parts: int) -> str:
+    return f'{href}{"&" if "?" in href else "?"}part={part}&parts={parts}'
+
+
+def part_title(title: str, part: int, parts: int) -> str:
+    return f'{title} ({part} of {parts})'
+
+
+def is_acquisition(rel) -> bool:
+    return any(r.startswith(ACQ_PREFIX) for r in (rel or '').split())
+
+
+def _page_count(raw) -> int:
+    text = str(raw if raw is not None else '').strip()
+    return int(text) if text.isdecimal() and len(text) < 10 else 0
+
+
+def entry_parts(entry, ctx: Ctx) -> int:
+    if ctx.parts is None:
+        return 1
+    links = [link for link in entry.iter(f'{{{ATOM}}}link') if link.get('href')]
+    book = next((link for link in links if is_acquisition(link.get('rel'))), None)
+    if book is None:
+        return 1
+    count = max((_page_count(link.get(PSE_COUNT)) for link in links), default=0)
+    return parts_of(ctx, book.get('href'), count)
 
 
 def classify(rel: str | None, type_: str | None, href: str | None) -> str:
@@ -275,11 +317,25 @@ def _rewrite_link(link, ctx: Ctx, page_mime: str | None, cover: str | None) -> N
     if not href:
         return
     kind = classify(link.get('rel'), link.get('type'), href)
-    count = (link.get(PSE_COUNT) or '').strip()
-    pages = int(count) if count.isdecimal() and len(count) < 10 else 0
-    link.set('href', map_href(href, kind, ctx, cover=cover, count=pages))
+    link.set('href', map_href(href, kind, ctx, cover=cover, count=_page_count(link.get(PSE_COUNT))))
     if kind == 'p' and page_mime:
         link.set('type', page_mime)
+
+
+def _split_entry(entry, parts: int) -> None:
+    parent = entry.getparent()
+    at = parent.index(entry)
+    for part in range(1, parts + 1):
+        clone = copy.deepcopy(entry)
+        for tag in ('title', 'id'):
+            el = clone.find(f'{{{ATOM}}}{tag}')
+            if el is not None and (el.text or '').strip():
+                el.text = part_title(el.text.strip(), part, parts)
+        for link in clone.iter(f'{{{ATOM}}}link'):
+            if link.get('href') and is_acquisition(link.get('rel')):
+                link.set('href', part_href(link.get('href'), part, parts))
+        parent.insert(at + part - 1, clone)
+    parent.remove(entry)
 
 
 def rewrite_atom(body: bytes, ctx: Ctx, page_mime: str | None, stream: bool = True) -> bytes:
@@ -302,14 +358,20 @@ def rewrite_atom(body: bytes, ctx: Ctx, page_mime: str | None, stream: bool = Tr
                 link.getparent().remove(link)
 
     done: set = set()
+    long: list = []
     for entry in root.iter(f'{{{ATOM}}}entry'):
+        parts = entry_parts(entry, ctx)
         cover = entry_cover(entry)
         for link in entry.iter(f'{{{ATOM}}}link'):
             _rewrite_link(link, ctx, page_mime, cover)
             done.add(link)
+        if parts > 1:
+            long.append((entry, parts))
     for link in root.iter(f'{{{ATOM}}}link'):
         if link not in done:
             _rewrite_link(link, ctx, page_mime, None)
+    for entry, parts in long:
+        _split_entry(entry, parts)
 
     return etree.tostring(root, xml_declaration=True, encoding='utf-8')
 
@@ -420,13 +482,65 @@ def _walk_json(
         _walk_json(value, ctx, page_mime, sub, own_cover if key == 'links' else None, stream)
 
 
+def _book_links(publication: dict) -> list[dict]:
+    links = publication.get('links')
+    if not isinstance(links, list):
+        return []
+    return [
+        link
+        for link in links
+        if isinstance(link, dict) and isinstance(link.get('href'), str) and is_acquisition(_rel_string(link.get('rel')))
+    ]
+
+
+def _long_publications(doc, ctx: Ctx) -> list[tuple[list, dict, int]]:
+    found = []
+    if ctx.parts is None:
+        return found
+    stack = [doc]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, list):
+            stack.extend(node)
+        elif isinstance(node, dict):
+            stack.extend(node.values())
+            listed = node.get('publications')
+            for publication in listed if isinstance(listed, list) else ():
+                books = _book_links(publication) if isinstance(publication, dict) else []
+                if not books:
+                    continue
+                meta = publication.get('metadata')
+                count = _page_count(meta.get('numberOfPages')) if isinstance(meta, dict) else 0
+                parts = parts_of(ctx, books[0]['href'], count)
+                if parts > 1:
+                    found.append((listed, publication, parts))
+    return found
+
+
+def _split_publication(listed: list, publication: dict, parts: int) -> None:
+    at = next(i for i, item in enumerate(listed) if item is publication)
+    clones = []
+    for part in range(1, parts + 1):
+        clone = copy.deepcopy(publication)
+        meta = clone.get('metadata')
+        if isinstance(meta, dict) and isinstance(meta.get('title'), str):
+            meta['title'] = part_title(meta['title'], part, parts)
+        for link in _book_links(clone):
+            link['href'] = part_href(link['href'], part, parts)
+        clones.append(clone)
+    listed[at : at + 1] = clones
+
+
 def rewrite_json(body: bytes, ctx: Ctx, page_mime: str | None, stream: bool = True) -> bytes:
     try:
         try:
             doc = json.loads(body)
         except ValueError:
             return _unrewritten(body)
+        long = _long_publications(doc, ctx)
         _walk_json(doc, ctx, page_mime, stream=stream)
+        for listed, publication, parts in long:
+            _split_publication(listed, publication, parts)
         return json.dumps(doc, ensure_ascii=False).encode('utf-8')
     except RecursionError as exc:
         raise FeedError('upstream feed is nested too deeply to rewrite') from exc

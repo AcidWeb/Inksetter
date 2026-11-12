@@ -5,6 +5,7 @@ Basic web OPDS client.
 import json
 import time
 import base64
+import dataclasses
 from html import escape
 from dataclasses import dataclass
 from urllib.parse import quote
@@ -318,8 +319,15 @@ def parse(body: bytes, ctx: Ctx) -> Feed | None:
     for entry in root.iter(f'{{{ATOM}}}entry'):
         inner.update(entry.iter(f'{{{ATOM}}}link'))
         item = _entry_item(entry, ctx)
-        if item is not None:
+        if item is None:
+            continue
+        parts = rewrite.entry_parts(entry, ctx) if item.download else 1
+        if parts == 1:
             items.append(item)
+            continue
+        for part in range(1, parts + 1):
+            title, href = rewrite.part_title(item.title, part, parts), rewrite.part_href(item.href, part, parts)
+            items.append(dataclasses.replace(item, title=title, href=href, kindle=None))
 
     rels: dict[str, str] = {}
     for link in root.iter(f'{{{ATOM}}}link'):

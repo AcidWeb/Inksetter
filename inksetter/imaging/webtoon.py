@@ -57,8 +57,24 @@ STRIP_GROUND_SIDE = 24
 STRIP_GROUND_END = 8
 STRIP_PAPER_SPECKS = 0.0025
 
+STRIP_PART_BYTES = 3_500_000_000
+STRIP_BYTES_PER_MPX = {'pngc': 200_000, 'webpc': 60_000}
+
 _LUMA = np.array([0.299, 0.587, 0.114], np.float32)
 _GROUNDS = frozenset({'gutter', 'loose', 'paper', 'flat'})
+
+
+def strip_parts(sizes: list[tuple[int, int]], count: int, p: Profile) -> int:
+    if count <= 0:
+        return 1
+    widths = collections.Counter(w for w, _ in sizes)
+    if widths:
+        width = min(p.width, round(widths.most_common(1)[0][0] * p.strip_scale_max))
+        rows = count * sum(h * width / w for w, h in sizes) / len(sizes)
+    else:
+        rows = count * 2 * p.width
+    size = rows * p.width / 1e6 * STRIP_BYTES_PER_MPX.get(p.fmt, STRIP_BYTES_PER_MPX['pngc'])
+    return max(1, math.ceil(size / STRIP_PART_BYTES))
 
 
 def _slice_width(blob: bytes) -> int | None:

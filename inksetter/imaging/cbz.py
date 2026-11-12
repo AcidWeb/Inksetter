@@ -4,6 +4,9 @@ CBZ repacking for the download path.
 
 import re
 import time
+import zlib
+import bisect
+import struct
 import pyvips
 import logging
 import zipfile
@@ -56,6 +59,10 @@ ZIP_TYPES = frozenset(
 )
 
 
+CBZ_LIMIT = 1 << 32
+STRIP_SAMPLE = 12
+_HEAD_BYTES = 1 << 15
+
 _NUM = re.compile(r'(\d+)')
 _COMICINFO = 'comicinfo.xml'
 _JPEG_SOI = b'\xff\xd8\xff'
@@ -91,6 +98,67 @@ def _suffix_for(blob: bytes, fallback_name: str) -> str:
     return fallback_name[fallback_name.rfind('.') :]
 
 
+def _pages(zin) -> list:
+    return sorted(
+        (i for i in zin.infolist() if not i.is_dir() and not is_junk(i.filename) and is_image(i.filename)),
+        key=lambda i: natural_key(i.filename),
+    )
+
+
+def _read_at(src, offset: int, size: int) -> bytes:
+    exact = getattr(src, 'sample', None)
+    if exact is not None:
+        return exact(offset, size)
+    src.seek(offset)
+    return src.read(size)
+
+
+def _head_size(src, info) -> tuple[int, int] | None:
+    try:
+        header = _read_at(src, info.header_offset, 30)
+        name, extra = struct.unpack('<HH', header[26:30])
+        head = _read_at(src, info.header_offset + 30 + name + extra, min(_HEAD_BYTES, info.compress_size))
+        if info.compress_type == zipfile.ZIP_DEFLATED:
+            head = zlib.decompressobj(-15).decompress(head)
+        elif info.compress_type != zipfile.ZIP_STORED:
+            return None
+        im = pyvips.Image.new_from_buffer(head, '')
+    except Exception:
+        return None
+    return im.width, im.height
+
+
+def parts_for(src, profile: Profile) -> int:
+    if not profile.reslice:
+        return 1
+    with zipfile.ZipFile(src) as zin:
+        pages = _pages(zin)
+    if not pages:
+        return 1
+    step = max(1, len(pages) // STRIP_SAMPLE)
+    sizes = [size for info in pages[step // 2 :: step][:STRIP_SAMPLE] if (size := _head_size(src, info))]
+    return webtoon.strip_parts(sizes, len(pages), profile)
+
+
+def _folder(info) -> str:
+    return info.filename.rpartition('/')[0]
+
+
+def split(pages: list, parts: int) -> list[int]:
+    begins = list(itertools.accumulate((i.file_size for i in pages), initial=0))
+    total = begins[-1]
+    folders = [j for j in range(1, len(pages)) if _folder(pages[j]) != _folder(pages[j - 1])]
+    bounds = [0]
+    for k in range(1, parts):
+        target = total * k / parts
+        at = bisect.bisect_left(begins, target)
+        near = min(folders, key=lambda j: abs(begins[j] - target), default=None)
+        if near is not None and abs(begins[near] - target) <= total / parts / 2:
+            at = near
+        bounds.append(at)
+    return [*bounds, len(pages)]
+
+
 def _entries(zin, infos, first=None):
     index = 0
     for info in infos:
@@ -103,6 +171,11 @@ def _entries(zin, infos, first=None):
             continue
         index += 1
         yield ('page', index, info.filename, data)
+
+
+def _numbered_on(entries, start: int):
+    for entry in entries:
+        yield entry if entry[0] != 'page' else ('page', entry[1] + start, *entry[2:])
 
 
 def _render(job, profile: Profile):
@@ -265,17 +338,27 @@ def repack_iter(
     progress=None,
     sources: list[int] | None = None,
     out=None,
+    part: tuple[int, int] | None = None,
 ):
     zin = zipfile.ZipFile(src)
     files = [i for i in zin.infolist() if not i.is_dir()]
     infos = sorted((i for i in files if not is_junk(i.filename)), key=lambda i: natural_key(i.filename))
+    junk = len(files) - len(infos)
+    start = 0
+    if part is not None and part[1] > 1:
+        pages = [i for i in infos if is_image(i.filename)]
+        bounds = split(pages, part[1])
+        start, end = bounds[part[0] - 1], bounds[part[0]]
+        kept = {id(i) for i in pages[start:end]}
+        infos = [i for i in infos if not is_image(i.filename) or id(i) in kept]
+        log.info('repack: part %d of %d, pages %d to %d of %d', part[0], part[1], start + 1, end, len(pages))
     declared = sum(i.file_size for i in infos)
     images = sum(1 for i in infos if is_image(i.filename))
     log.info(
         'repack: %d entries, %d image(s), %d system file(s) left out, %.0f MB declared, %d worker(s)',
         len(infos),
         images,
-        len(files) - len(infos),
+        junk,
         declared / 1e6,
         workers,
     )
@@ -301,6 +384,8 @@ def repack_iter(
 
     total_pages = images + (lead is not None)
     entries = _entries(zin, infos, first)
+    if start:
+        entries = _numbered_on(entries, start)
 
     def tell(done: int) -> None:
         if progress is not None:
@@ -309,6 +394,7 @@ def repack_iter(
     def chunks():
         begun = time.perf_counter()
         written = 0
+        sent = 0
         pages = 0
         sizes: list[tuple[int, int] | None] = []
         tell(0)
@@ -328,7 +414,9 @@ def repack_iter(
                                 sources.append(0)
                         pages += 1
                         tell(pages)
-                        yield sink.ready()
+                        chunk = sink.ready()
+                        sent += len(chunk)
+                        yield chunk
                         continue
                     written += 1
                     if job[0] != 'copy':
@@ -339,13 +427,19 @@ def repack_iter(
                         pages += 1
                         tell(pages)
                     elif job[0] == 'tile':
-                        tell(pages + min(consumed.pop(job[1]), max(0, images - 1)))
-                    yield sink.ready()
+                        tell(pages + min(consumed.pop(job[1]) - start, max(0, images - 1)))
+                    chunk = sink.ready()
+                    sent += len(chunk)
+                    yield chunk
                 if strip:
                     tell(total_pages)
-                yield from sink.finish(_metadata(comicinfo, sizes))
+                for chunk in sink.finish(_metadata(comicinfo, sizes)):
+                    sent += len(chunk)
+                    yield chunk
             finally:
                 sink.close()
+            if out is None and sent >= CBZ_LIMIT:
+                log.warning('repack: the book came to %.1f GB, and KOReader opens none past 4 GB', sent / 1e9)
             log.info('repack: finished, %d entr(y/ies) written in %.1f s', written, time.perf_counter() - begun)
         finally:
             zin.close()

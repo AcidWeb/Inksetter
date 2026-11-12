@@ -60,6 +60,8 @@ from inksetter import cores  # noqa: E402
 from inksetter import __main__ as entry  # noqa: E402
 from inksetter.imaging import cbz, deblock, folio, pipeline, profiles, webtoon  # noqa: E402
 from inksetter import web  # noqa: E402
+from inksetter import kavita  # noqa: E402
+from lxml import etree  # noqa: E402
 from inksetter.opds import rewrite  # noqa: E402
 from inksetter.opds.rewrite import encode_token  # noqa: E402
 from inksetter.opds.upstream import client as up_client  # noqa: E402
@@ -2517,7 +2519,6 @@ def check_deblock() -> None:
     ring[5:14, 5:14] = 0
     check('and round a speck', (ring > 0.05).mean() > 0.3, f'{(ring > 0.05).mean():.2f} of the pixels 5-9 px from it')
 
-
     chequer = np.zeros((h, w, 3), np.float32)
     chequer[:, :, 0] = 40 + 0.03 * ys + 0.1 * (((ys // 16) + (xs // 16)) % 2 * 2 - 1)
     got = _smoothed_lab(chequer)
@@ -2676,6 +2677,517 @@ def check_deblock() -> None:
     )
     scribe = profiles.PROFILES['kindle-scribe-colorsoft-webtoon']
     check('as a palette PNG', scribe.fmt == 'pngc' and scribe.palette, f'{scribe.fmt}')
+
+
+def _episodes_cbz(episodes: int = 6, each: int = 5, sizes=None, folders: bool = True, deflate: bool = False) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED if deflate else zipfile.ZIP_STORED) as z:
+        z.writestr('ComicInfo.xml', '<ComicInfo/>')
+        for e in range(episodes):
+            for i in range(each):
+                w, h = (sizes or {}).get((e, i), (80, 200))
+                a = np.full((h, w, 3), 255, np.uint8)
+                a[20 : h - 20, 10 : w - 10] = ((40 + 30 * e) % 256, 90, (200 - 20 * i) % 256)
+                page = pyvips.Image.new_from_memory(a.tobytes(), w, h, 3, 'uchar').jpegsave_buffer(Q=90)
+                z.writestr(f'Episode {e + 1:02d}/{i:03d}.jpg' if folders else f'{e:02d}{i:03d}.jpg', page)
+    return buf.getvalue()
+
+
+class _Counted(io.BytesIO):
+    def __init__(self, data: bytes):
+        super().__init__(data)
+        self.taken = 0
+        self.exact = 0
+
+    def read(self, size: int = -1) -> bytes:
+        out = super().read(size)
+        self.taken += len(out)
+        return out
+
+    def sample(self, offset: int, size: int) -> bytes:
+        self.taken += size
+        self.exact += 1
+        return self.getvalue()[offset : offset + size]
+
+
+def _part_pages(blob: bytes, prof: profiles.Profile, part) -> tuple[list[str], list[int]]:
+    sources: list[int] = []
+    out = b''.join(cbz.repack_iter(io.BytesIO(blob), prof, 2, sources=sources, part=part))
+    return zipfile.ZipFile(io.BytesIO(out)).namelist(), sources
+
+
+def check_parts_core() -> None:
+    scribe = profiles.PROFILES['kindle-scribe-colorsoft-webtoon']
+
+    def wanted(count: int, rows: float, per_mpx: int = 200_000) -> int:
+        return max(1, math.ceil(count * rows * 1986 / 1e6 * per_mpx / 3.5e9))
+
+    slice_ = [(940, 1835)]
+    got = {count: webtoon.strip_parts(slice_, count, scribe) for count in (1, 2400, 2402, 4802, 4804, 9000)}
+    check(
+        'a strip goes out in as many parts as keep each under 3.5 GB',
+        got == {count: wanted(count, 3670) for count in got} and got[2400] == 1 and got[2402] == 2 and got[4804] == 3,
+        f'{got}',
+    )
+    as_webp = webtoon.strip_parts(slice_, 9000, dataclasses.replace(scribe, fmt='webpc'))
+    check('and in fewer as WebP, which is smaller', as_webp == wanted(9000, 3670, 60_000) < got[9000], f'{as_webp}')
+    narrow = webtoon.strip_parts([(700, 1000)], 8000, scribe)
+    check(
+        'slices too narrow to reach the panel are measured at twice their width, not at the width of the panel',
+        narrow == wanted(8000, 2000) == 2 < wanted(8000, 1000 * 1986 / 700),
+        f'{narrow}',
+    )
+    mixed = webtoon.strip_parts([(940, 1000), (940, 3000), (300, 100)], 7000, scribe)
+    check(
+        'and a mixed sample at the commonest width, each slice by its own shape',
+        mixed == wanted(7000, (2000 + 6000 + 1880 * 100 / 300) / 3) == 3,
+        f'{mixed}',
+    )
+    blind = webtoon.strip_parts([], 3000, scribe)
+    check('with no slice measured, each is taken twice as tall as the panel is wide', blind == wanted(3000, 3972))
+    check('and a strip of no slices is one part', webtoon.strip_parts(slice_, 0, scribe) == 1)
+
+    def info(name: str, size: int) -> zipfile.ZipInfo:
+        made = zipfile.ZipInfo(name)
+        made.file_size = size
+        return made
+
+    flat = [info(f'{i:03d}.jpg', 100) for i in range(10)]
+    check('pages of one size and one folder are cut evenly', cbz.split(flat, 2) == [0, 5, 10], f'{cbz.split(flat, 2)}')
+    check('into three, as near even as whole pages go', cbz.split(flat, 3) == [0, 4, 7, 10], f'{cbz.split(flat, 3)}')
+    heavy = [info(f'{i:03d}.jpg', 700 if i == 0 else 100) for i in range(4)]
+    check('by the bytes of the pages, not their number', cbz.split(heavy, 2) == [0, 1, 4], f'{cbz.split(heavy, 2)}')
+    episodes = [info(f'Episode {e}/{i:02d}.jpg', 100) for e, n in enumerate((3, 4, 3)) for i in range(n)]
+    check(
+        "a cut moves to an episode's end when one is within half a part",
+        cbz.split(episodes, 2) == [0, 3, 10] and cbz.split(episodes, 3) == [0, 3, 7, 10],
+        f'{cbz.split(episodes, 2)} {cbz.split(episodes, 3)}',
+    )
+    lopsided = [info(f'Episode {e}/{i:02d}.jpg', 100) for e, n in enumerate((1, 19)) for i in range(n)]
+    check(
+        'and stays where it fell when the nearest is further off',
+        cbz.split(lopsided, 2) == [0, 10, 20],
+        f'{cbz.split(lopsided, 2)}',
+    )
+    check('more parts than pages leaves the last ones empty', cbz.split(flat[:2], 4) == [0, 1, 1, 2, 2])
+
+    tall = {(e, i): (80, 600) for e in range(6) for i in range(5)}
+    for name, blob, rows in (
+        ('stored', _episodes_cbz(), 200 * 160 / 80),
+        ('deflated', _episodes_cbz(deflate=True), 200 * 160 / 80),
+        ('three times as tall', _episodes_cbz(sizes=tall), 600 * 160 / 80),
+    ):
+        src = _Counted(blob)
+        with mock.patch.object(webtoon, 'STRIP_PART_BYTES', 3_000_000):
+            parts = cbz.parts_for(src, scribe)
+        want = math.ceil(30 * rows * 1986 / 1e6 * 200_000 / 3_000_000)
+        check(f'an archive of {name} slices is measured by their size', parts == want > 1, f'{parts}, wanted {want}')
+    big = _episodes_cbz(episodes=40, each=10)
+    src = _Counted(big)
+    cbz.parts_for(src, scribe)
+    check('from the heads of a dozen slices, not the archive', src.taken < len(big) / 4, f'{src.taken} of {len(big)}')
+    check('asking a ranged source for the exact bytes of each head', src.exact == 24, f'{src.exact} exact reads')
+    with mock.patch.object(webtoon, 'STRIP_PART_BYTES', 3_000_000):
+        paged = cbz.parts_for(io.BytesIO(big), dataclasses.replace(scribe, reslice=False))
+        recut = cbz.parts_for(io.BytesIO(big), scribe)
+    check(
+        'a profile that does not re-cut never splits what one that does would', paged == 1 < recut, f'{paged} {recut}'
+    )
+    junk = io.BytesIO()
+    with zipfile.ZipFile(junk, 'w') as z:
+        for i in range(30):
+            z.writestr(f'{i:03d}.jpg', b'not a picture at all')
+    with mock.patch.object(webtoon, 'STRIP_PART_BYTES', 3_000_000):
+        unread = cbz.parts_for(junk, scribe)
+    check(
+        'slices that will not open are taken twice as tall as the panel is wide',
+        unread == math.ceil(30 * 3972 * 1986 * 0.2 / 3_000_000),
+    )
+
+    mono = dataclasses.replace(profiles.PROFILES['kobo-clara-hd-2e-bw'], autocrop=False, strip_folio=False)
+    blob = _episodes_cbz(episodes=3, each=2)
+    whole = _part_pages(blob, mono, None)
+    halves = [_part_pages(blob, mono, (k, 3)) for k in (1, 2, 3)]
+    check('premise: the whole book holds six pages', whole[1] == [1, 2, 3, 4, 5, 6], f'{whole[1]}')
+    check(
+        'each part holds its own episode, numbered as the whole book numbers its pages',
+        [h[1] for h in halves] == [[1, 2], [3, 4], [5, 6]],
+        f'{[h[1] for h in halves]}',
+    )
+    check('and every entry that is not a page', all('ComicInfo.xml' in h[0] for h in halves), f'{halves[1][0]}')
+    check('a part of one is the whole book', _part_pages(blob, mono, (1, 1))[1] == whole[1])
+    bare = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(blob)) as src, zipfile.ZipFile(bare, 'w') as z:
+        for name in src.namelist():
+            if name != 'ComicInfo.xml':
+                z.writestr(name, src.read(name))
+    series = {'meta': {}, 'series': {'name': 'Long'}, 'numbers': {}}
+
+    def described(part) -> etree._Element:
+        made = cbz.repack_iter(
+            io.BytesIO(bare.getvalue()), mono, 2, comicinfo=lambda sizes: kavita.render(series, '4', sizes), part=part
+        )
+        return etree.fromstring(zipfile.ZipFile(io.BytesIO(b''.join(made))).read('ComicInfo.xml'))
+
+    own, volume = described((2, 3)), described(None)
+    check(
+        "a part's generated ComicInfo counts its own pages",
+        own.findtext('PageCount') == '2' and len(own.find('Pages')) == 2 and volume.findtext('PageCount') == '6',
+        f'{own.findtext("PageCount")} {volume.findtext("PageCount")}',
+    )
+    check(
+        "and carries no Title, nor anything else the volume's does not",
+        own.find('Title') is None and [e.tag for e in own] == [e.tag for e in volume],
+        f'{[e.tag for e in own]}',
+    )
+    cover = fake_colour_page(400, 600)
+    sources: list[int] = []
+    out = b''.join(cbz.repack_iter(io.BytesIO(blob), mono, 2, cover=cover, sources=sources, part=(2, 3)))
+    names = sorted(n for n in zipfile.ZipFile(io.BytesIO(out)).namelist() if n.endswith(_PAGE_SUFFIXES))
+    check('a later part is led by the cover too', sources == [0, 3, 4] and len(names) == 3, f'{sources} {names}')
+    strip = _strip_profile()
+    cut = [_part_pages(_strip_cbz([900] * 6), strip, (k, 2))[1] for k in (1, 2)]
+    check(
+        'a strip is re-cut a part at a time, each page from a slice of its own part',
+        cut[0] and cut[1] and set(cut[0]) <= {1, 2, 3} and set(cut[1]) <= {4, 5, 6} and 4 in cut[1],
+        f'{cut}',
+    )
+    told: list[tuple[int, int]] = []
+    long_strip = _strip_cbz([900] * 20, gutter=[(i, 450) for i in range(20)])
+    b''.join(cbz.repack_iter(io.BytesIO(long_strip), strip, 2, progress=lambda d, t: told.append((d, t)), part=(2, 2)))
+    total = told[0][1]
+    check('premise: the second part of the strip holds about half its slices', 8 <= total <= 12, f'{total}')
+    check(
+        "its progress starts from its own first slice, not the volume's",
+        told[0] == (0, total) and 0 < told[1][0] <= total // 2,
+        f'{told[:3]}',
+    )
+    check(
+        'and climbs to its own end',
+        all(a[0] <= b[0] for a, b in itertools.pairwise(told))
+        and told[-1] == (total, total)
+        and all(t == total for _, t in told),
+        f'{told}',
+    )
+
+    with mock.patch.object(cbz, 'CBZ_LIMIT', 20_000), mock.patch.object(cbz.log, 'warning') as warned:
+        b''.join(cbz.repack_iter(io.BytesIO(blob), mono, 2))
+    check(
+        'a book past the size a reader opens is said to be',
+        any('opens none' in str(c.args[0]) for c in warned.call_args_list),
+    )
+    with mock.patch.object(cbz.log, 'warning') as warned:
+        b''.join(cbz.repack_iter(io.BytesIO(blob), mono, 2))
+    check('and one under it is not', not warned.call_args_list, f'{warned.call_args_list}')
+
+
+PARTS_FEED = """<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:pse="http://vaemendis.net/opds-pse/ns">
+ <title>Long</title>
+ <entry><title>Shelf</title><id>shelf</id>
+  <link rel="subsection" type="application/atom+xml;profile=opds-catalog" href="/opds/v1.2/mid"/></entry>
+ <entry><title>Vol 3</title><id>urn:vol:3</id>
+  <link rel="http://opds-spec.org/image" type="image/jpeg" href="/opds/v1.2/books/7/thumbnail"/>
+  <link rel="http://opds-spec.org/acquisition/open-access" type="application/x-cbz"
+        href="/opds/v1.2/long/Vol%203.cbz" pse:count="4766"/>
+  <link rel="__PSE_REL__" type="image/jpeg" href="/opds/v1.2/books/7/pages/{pageNumber}" pse:count="4766"/>
+ </entry>
+ <entry><title>Vol 4</title><id>urn:vol:4</id>
+  <link rel="http://opds-spec.org/acquisition" type="application/x-cbz" href="/opds/v1.2/long/Vol%204.cbz"
+        pse:count="120"/>
+ </entry>
+</feed>""".replace('__PSE_REL__', PSE_REL)
+
+PARTS_JSON = {
+    'metadata': {'title': 'Long'},
+    'publications': [
+        {
+            'metadata': {'title': 'Vol 3', 'numberOfPages': 4766},
+            'links': [
+                {'rel': 'http://opds-spec.org/acquisition', 'type': 'application/zip', 'href': '/opds/v2/long/3.cbz'}
+            ],
+            'images': [{'href': '/opds/v2/long/3.jpg', 'type': 'image/jpeg'}],
+        },
+        {
+            'metadata': {'title': 'Vol 4', 'numberOfPages': 120},
+            'links': [
+                {'rel': 'http://opds-spec.org/acquisition', 'type': 'application/zip', 'href': '/opds/v2/long/4.cbz'}
+            ],
+        },
+    ],
+    'groups': [
+        {
+            'metadata': {'title': 'More'},
+            'publications': [
+                {
+                    'metadata': {'title': 'Vol 5', 'numberOfPages': 4766},
+                    'links': [{'rel': ['http://opds-spec.org/acquisition/open-access'], 'href': '/opds/v2/long/5.cbz'}],
+                }
+            ],
+        }
+    ],
+}
+
+
+def check_parts_feed() -> None:
+    asked: list = []
+
+    def by_count(url: str, count: int) -> int:
+        asked.append((url, count))
+        return 2 if count > 1000 else 1
+
+    def ctx(parts) -> rewrite.Ctx:
+        return rewrite.Ctx(
+            profile='kindle-scribe-colorsoft-webtoon',
+            public_base='http://proxy.test',
+            base_url='http://127.0.0.1:8899/opds/v1.2/catalog',
+            parts=parts,
+        )
+
+    atom = '{http://www.w3.org/2005/Atom}'
+    body = PARTS_FEED.encode()
+    plain = rewrite.rewrite(body, ctx(None), None, False)
+    split = rewrite.rewrite(body, ctx(by_count), None, False)
+    entries = list(etree.fromstring(split).iter(f'{atom}entry'))
+    titles = [e.findtext(f'{atom}title') for e in entries]
+    check(
+        'a book too long for one file is an entry for each part, in its place',
+        titles == ['Shelf', 'Vol 3 (1 of 2)', 'Vol 3 (2 of 2)', 'Vol 4'],
+        f'{titles}',
+    )
+    check(
+        'the feed asks about each book by the URL the upstream gave and its page count',
+        asked
+        == [
+            ('http://127.0.0.1:8899/opds/v1.2/long/Vol%203.cbz', 4766),
+            ('http://127.0.0.1:8899/opds/v1.2/long/Vol%204.cbz', 120),
+        ],
+        f'{asked}',
+    )
+    ids = [e.findtext(f'{atom}id') for e in entries]
+    check('each part has an id of its own', len(set(ids)) == len(ids), f'{ids}')
+    hrefs = [[a.get('href') for a in e.iter(f'{atom}link') if rewrite.is_acquisition(a.get('rel'))] for e in entries]
+    whole = re.search(r'http://proxy\.test/kindle-scribe-colorsoft-webtoon/dl/[\w-]+', plain.decode()).group(0)
+    check(
+        "and its download link is the book's, with the part it is",
+        hrefs[1] == [f'{whole}?part=1&parts=2'] and hrefs[2] == [f'{whole}?part=2&parts=2'] and '?' not in hrefs[3][0],
+        f'{hrefs[1:]}',
+    )
+    covers = [[a.get('href') for a in e.iter(f'{atom}link') if 'image' in (a.get('rel') or '')] for e in entries[1:3]]
+    check("its cover is the book's, untouched", covers[0] == covers[1] and 'part=' not in covers[0][0], f'{covers}')
+    check(
+        'with nothing to ask, the feed is as it was',
+        rewrite.rewrite(body, ctx(lambda *_: 1), None, False) == plain,
+    )
+
+    def titles_with(parts) -> list[str]:
+        return [
+            e.findtext(f'{atom}title')
+            for e in etree.fromstring(rewrite.rewrite(body, ctx(parts), None, False)).iter(f'{atom}entry')
+        ]
+
+    def broken(*_) -> int:
+        raise RuntimeError('no upstream')
+
+    check('a count that cannot be had leaves the book whole', titles_with(broken) == ['Shelf', 'Vol 3', 'Vol 4'])
+    check('so does one that is no number', titles_with(lambda *_: 2.5) == ['Shelf', 'Vol 3', 'Vol 4'])
+    many = titles_with(lambda _url, count: 500 if count > 1000 else 1)
+    check('no book is offered in more than 99 parts', many[1] == 'Vol 3 (1 of 99)' and len(many) == 101, f'{len(many)}')
+
+    asked.clear()
+    doc = json.loads(rewrite.rewrite(json.dumps(PARTS_JSON).encode(), ctx(by_count), None, False))
+    listed = [p['metadata']['title'] for p in doc['publications']]
+    grouped = [p['metadata']['title'] for p in doc['groups'][0]['publications']]
+    check(
+        'a JSON feed splits its publications the same way, in a group too',
+        listed == ['Vol 3 (1 of 2)', 'Vol 3 (2 of 2)', 'Vol 4'] and grouped == ['Vol 5 (1 of 2)', 'Vol 5 (2 of 2)'],
+        f'{listed} {grouped}',
+    )
+    links = [p['links'][0]['href'] for p in doc['publications']]
+    check(
+        'each with the part on its download link',
+        links[0].endswith('?part=1&parts=2')
+        and links[1].endswith('?part=2&parts=2')
+        and '?' not in links[2]
+        and links[0].split('?')[0] == links[1].split('?')[0],
+        f'{links}',
+    )
+    check('and its cover untouched', 'part=' not in doc['publications'][0]['images'][0]['href'])
+    check(
+        "asked by the upstream's URL and numberOfPages",
+        sorted(asked)
+        == sorted(
+            (f'http://127.0.0.1:8899/opds/v2/long/{n}.cbz', pages) for n, pages in ((3, 4766), (4, 120), (5, 4766))
+        ),
+        f'{asked}',
+    )
+
+    feed = web.parse(body, ctx(by_count))
+    shown = [(i.title, i.href.partition('?')[2], i.kindle if 'part=' in i.href else None) for i in feed.items]
+    check(
+        'the browse page lists each part as a download of its own',
+        shown
+        == [
+            ('Shelf', '', None),
+            ('Vol 3 (1 of 2)', 'part=1&parts=2', None),
+            ('Vol 3 (2 of 2)', 'part=2&parts=2', None),
+            ('Vol 4', '', None),
+        ],
+        f'{shown}',
+    )
+
+
+_LONG_BODY = _episodes_cbz(episodes=4, each=3)
+_LONG = {'requests': 0}
+
+
+@upstream.get('/opds/v1.2/long/{name}')
+def _long_file(request: Request, name: str):
+    body = _LONG_BODY
+    rng = request.headers.get('range')
+    if name.startswith('whole') or not rng:
+        return Response(
+            body, media_type='application/x-cbz', headers={'content-disposition': 'attachment; filename="Long v3.cbz"'}
+        )
+    first, _, last = rng.partition('=')[2].partition('-')
+    lo, hi = int(first), min(int(last) if last else len(body) - 1, len(body) - 1)
+    if lo >= len(body) or lo > hi:
+        return Response(status_code=416, headers={'content-range': f'bytes */{len(body)}'})
+    _LONG['requests'] += 1
+    return Response(
+        body[lo : hi + 1],
+        status_code=206,
+        media_type='application/x-cbz',
+        headers={
+            'content-range': f'bytes {lo}-{hi}/{len(body)}',
+            'content-disposition': 'attachment; filename="Long v3.cbz"',
+        },
+    )
+
+
+@upstream.get('/opds/v1.2/long-feed')
+def _long_feed():
+    body = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<feed xmlns="http://www.w3.org/2005/Atom" xmlns:pse="http://vaemendis.net/opds-pse/ns"><title>Long</title>'
+        '<entry><title>Long book</title><id>long</id>'
+        '<link rel="http://opds-spec.org/acquisition" type="application/x-cbz" href="/opds/v1.2/long/a.cbz"'
+        ' pse:count="5000"/></entry></feed>'
+    )
+    return Response(body, media_type='application/atom+xml;profile=opds-catalog')
+
+
+async def check_parts_download(c) -> None:
+    base = 'http://127.0.0.1:8899/opds/v1.2/long'
+    scribe = profiles.PROFILES['kindle-scribe-colorsoft-webtoon']
+
+    app_mod._parts.clear()
+    check(
+        'a profile that does not re-cut asks nothing',
+        app_mod._parts_for(profiles.PROFILES['kobo-clara-hd-2e-bw'], {}) is None,
+    )
+    ask = app_mod._parts_for(scribe, {})
+    _LONG['requests'] = 0
+    short = await asyncio.to_thread(ask, f'{base}/a.cbz', 150)
+    check('a book of few pages is one part, unmeasured', short == 1 and _LONG['requests'] == 0, f'{short} {_LONG}')
+    with mock.patch.object(webtoon, 'STRIP_PART_BYTES', 1_500_000):
+        first = await asyncio.to_thread(ask, f'{base}/a.cbz', 5000)
+        fetched = _LONG['requests']
+        again = await asyncio.to_thread(app_mod._parts_for(scribe, {}), f'{base}/a.cbz', 5000)
+        want = math.ceil(12 * 400 * 1986 / 1e6 * 200_000 / 1_500_000)
+        check(
+            'a long one is measured from its archive, not its page count',
+            first == want > 1 and fetched > 0,
+            f'{first}, wanted {want}',
+        )
+        check('once: the answer is kept', again == first and _LONG['requests'] == fetched, f'{again} {_LONG}')
+        other = await asyncio.to_thread(app_mod._parts_for(scribe, {}), f'{base}/whole.cbz', 5000)
+        guess = math.ceil(5000 * 3972 * 1986 / 1e6 * 200_000 / 1_500_000)
+        check(
+            'an archive that cannot be read in ranges is judged by its page count',
+            other == guess,
+            f'{other}, wanted {guess}',
+        )
+        check('and that is not kept', ('kindle-scribe-colorsoft-webtoon', f'{base}/whole.cbz') not in app_mod._parts)
+        hurried = app_mod._parts_for(scribe, {})
+        with mock.patch.object(app_mod, 'PARTS_BUDGET', 0.0):
+            _LONG['requests'] = 0
+            late = await asyncio.to_thread(hurried, f'{base}/b.cbz', 5000)
+        check(
+            'nor is anything measured once a feed has spent its time',
+            late == guess and _LONG['requests'] == 0,
+            f'{late} {_LONG}',
+        )
+    app_mod._parts.clear()
+
+    mono = 'kobo-clara-hd-2e-bw'
+    tok = encode_token(f'{base}/a.cbz')
+
+    async def pages_of(query: str, profile: str = mono):
+        r = await _get(c, f'/{profile}/dl/{tok}{query}')
+        if r.status_code != 200:
+            return r.status_code, None, None
+        names = zipfile.ZipFile(io.BytesIO(r.content)).namelist()
+        return (
+            r.status_code,
+            sorted(n for n in names if n.endswith(_PAGE_SUFFIXES)),
+            r.headers.get('content-disposition'),
+        )
+
+    whole = await pages_of('')
+    one, two = await pages_of('?part=1&parts=2'), await pages_of('?part=2&parts=2')
+    check('premise: the whole book has twelve pages', whole[0] == 200 and len(whole[1]) == 12, f'{whole[0]} {whole[1]}')
+    check('a download of one part holds that part', len(one[1]) == 6 and len(two[1]) == 6, f'{one[1]} {two[1]}')
+    check(
+        'and is named for it, as the whole book is not',
+        one[2] == 'attachment; filename="Long v3 (1 of 2).cbz"'
+        and two[2] == 'attachment; filename="Long v3 (2 of 2).cbz"'
+        and whole[2] == 'attachment; filename="Long v3.cbz"',
+        f'{one[2]} {two[2]} {whole[2]}',
+    )
+    check('a part of one is the whole book, name and all', (await pages_of('?part=1&parts=1'))[1:] == whole[1:])
+    unranged = encode_token(f'{base}/whole.cbz')
+    r = await _get(c, f'/{mono}/dl/{unranged}?part=2&parts=2')
+    names = [n for n in zipfile.ZipFile(io.BytesIO(r.content)).namelist() if n.endswith(_PAGE_SUFFIXES)]
+    check(
+        'an archive fetched whole is split the same',
+        r.status_code == 200 and len(names) == 6,
+        f'{r.status_code} {names}',
+    )
+    for query in (
+        '?part=0&parts=2',
+        '?part=3&parts=2',
+        '?part=1&parts=100',
+        '?part=1',
+        '?parts=2',
+        '?part=x&parts=2',
+        '?part=1&parts=-2',
+        '?part=%D9%A1&parts=2',
+    ):
+        got = await pages_of(query)
+        check(f'{query} is no part of any book', got[0] == 400, f'{got[0]}')
+    for name, part, want in (
+        ('Long v3.cbz', (2, 3), 'Long v3 (2 of 3).cbz'),
+        ('bare', (1, 2), 'bare (1 of 2)'),
+        ('.cbz', (1, 2), '.cbz (1 of 2)'),
+        ('a.b.zip', None, 'a.b.zip'),
+    ):
+        got = app_mod._part_name(name, part)
+        check(f'part {part} of {name} is named {want}', got == want, got)
+
+    feed_tok = encode_token('http://127.0.0.1:8899/opds/v1.2/long-feed')
+    with mock.patch.object(webtoon, 'STRIP_PART_BYTES', 1_500_000):
+        cut = (await _get(c, f'/kindle-scribe-colorsoft-webtoon/f/{feed_tok}')).text
+        paged = (await _get(c, f'/kindle-scribe-colorsoft/f/{feed_tok}')).text
+        page = (await _get(c, f'/kindle-scribe-colorsoft-webtoon/b/{feed_tok}')).text
+    check(
+        'a feed on a profile that re-cuts offers a long book in parts',
+        'Long book (1 of 2)' in cut and 'Long book (2 of 2)' in cut and cut.count('part=2&amp;parts=2') == 1,
+        cut[-400:],
+    )
+    check('on any other profile it is one book', 'Long book</title>' in paged and 'part=' not in paged, paged[-300:])
+    check('and so does the browse page', 'Long book (1 of 2)' in page and 'part=2&amp;parts=2' in page, page[-300:])
+    app_mod._parts.clear()
 
 
 def _png_chunks(png: bytes) -> list[tuple[bytes, bytes]]:
@@ -12836,6 +13348,7 @@ async def main() -> int:
 
         print('browse pages')
         await check_browse(c)
+        await check_parts_download(c)
         await check_trail(c)
         await check_logo(c)
         check_grid_columns()
@@ -12973,6 +13486,9 @@ async def main() -> int:
     check_cut_margin_pad()
     print('deblock')
     check_deblock()
+    print('parts')
+    check_parts_core()
+    check_parts_feed()
     print('webtoon pad')
     check_webtoon_pad()
     print('gutter pad')

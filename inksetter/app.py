@@ -26,7 +26,7 @@ from fastapi.responses import (
 
 from . import __version__, cores, kavita, kosync, logs, status, web
 from .cache import DiskCache, Prefetcher, render_key
-from .imaging import azw3, cbz, profiles
+from .imaging import azw3, cbz, profiles, webtoon
 from .imaging.pipeline import RenderFailed, UnreadableImage, render_page
 from .imaging.profiles import Profile, cover_for
 from .opds import rewrite
@@ -128,8 +128,52 @@ def _public_base(request: Request) -> str:
     return str(request.base_url).rstrip('/')
 
 
-def _ctx(request: Request, profile: str, upstream_url: str) -> rewrite.Ctx:
-    return rewrite.Ctx(profile=profile, public_base=_public_base(request), base_url=upstream_url)
+PARTS_MIN_PAGES = 200
+PARTS_BUDGET = 4.0
+PARTS_KEPT = 2000
+_parts: collections.OrderedDict[tuple[str, str], int] = collections.OrderedDict()
+_parts_lock = threading.Lock()
+
+
+def _parts_for(p: Profile | None, headers: dict[str, str]):
+    if p is None or not p.reslice:
+        return None
+    spent = 0.0
+
+    def parts(url: str, count: int) -> int:
+        nonlocal spent
+        if count < PARTS_MIN_PAGES:
+            return 1
+        with _parts_lock:
+            known = _parts.get((p.name, url))
+        if known is not None:
+            return known
+        guess = webtoon.strip_parts([], count, p)
+        if spent >= PARTS_BUDGET:
+            return guess
+        began = time.monotonic()
+        reader = open_range(url, headers)
+        try:
+            if reader is None:
+                return guess
+            measured = cbz.parts_for(reader, p)
+        except Exception:
+            return guess
+        finally:
+            if reader is not None:
+                reader.close()
+            spent += time.monotonic() - began
+        with _parts_lock:
+            _parts[(p.name, url)] = measured
+            while len(_parts) > PARTS_KEPT:
+                _parts.popitem(last=False)
+        return measured
+
+    return parts
+
+
+def _ctx(request: Request, profile: str, upstream_url: str, parts=None) -> rewrite.Ctx:
+    return rewrite.Ctx(profile=profile, public_base=_public_base(request), base_url=upstream_url, parts=parts)
 
 
 def _error(request: Request, status: int, detail: str, headers: dict[str, str] | None = None) -> Response:
@@ -249,7 +293,12 @@ async def _serve_feed(request: Request, profile_name: str, url: str) -> Response
     ctype = resp.headers.get('content-type', '')
     page_mime = None if p.fmt == 'raw' else p.mime
     if rewrite.is_feed(ctype, resp.content) or rewrite.looks_like_feed(resp.content):
-        body = rewrite.rewrite(resp.content, _ctx(request, profile_name, str(resp.url)), page_mime, not p.reslice)
+        parts = _parts_for(p, request_headers(request.headers))
+        ctx = _ctx(request, profile_name, str(resp.url), parts)
+        if parts is None:
+            body = rewrite.rewrite(resp.content, ctx, page_mime, not p.reslice)
+        else:
+            body = await asyncio.to_thread(rewrite.rewrite, resp.content, ctx, page_mime, not p.reslice)
     else:
         body = resp.content
     return Response(content=body, media_type=ctype or 'application/atom+xml')
@@ -306,7 +355,9 @@ async def _serve_html(request: Request, profile_name: str, url: str, term: str =
     p = _profile_or_404(profile_name)
     resp = await client.get(url, request_headers(request.headers, accept=BROWSE_ACCEPT))
     base = _public_base(request)
-    feed = web.parse(resp.content, _ctx(request, profile_name, str(resp.url)))
+    parts = _parts_for(p, request_headers(request.headers))
+    ctx = _ctx(request, profile_name, str(resp.url), parts)
+    feed = web.parse(resp.content, ctx) if parts is None else await asyncio.to_thread(web.parse, resp.content, ctx)
     if feed is None:
         return HTMLResponse(web.unsupported(p, base))
     trail = request.query_params.get(web.TRAIL_PARAM, '')
@@ -649,8 +700,38 @@ async def _sync_for(src) -> kosync.Pending | None:
     return kosync.Pending(books, source)
 
 
-async def _repack(src, url: str, cover_url: str | None, p: Profile, request: Request, track, upstream):
-    track.update(name=_download_name(url, upstream))
+def _part_name(name: str, part: tuple[int, int] | None) -> str:
+    if part is None:
+        return name
+    stem, dot, suffix = name.rpartition('.')
+    if not dot or not stem:
+        return rewrite.part_title(name, *part)
+    return f'{rewrite.part_title(stem, *part)}.{suffix}'
+
+
+def _part_of(request: Request) -> tuple[int, int] | None:
+    part, parts = request.query_params.get('part'), request.query_params.get('parts')
+    if part is None and parts is None:
+        return None
+    if not all(raw is not None and raw.isascii() and raw.isdecimal() for raw in (part, parts)):
+        raise UpstreamError(400, 'no such part')
+    if not 1 <= int(part) <= int(parts) <= rewrite.MAX_PARTS:
+        raise UpstreamError(400, 'no such part')
+    return (int(part), int(parts)) if int(parts) > 1 else None
+
+
+async def _repack(
+    src,
+    url: str,
+    cover_url: str | None,
+    p: Profile,
+    request: Request,
+    track,
+    upstream,
+    part: tuple[int, int] | None = None,
+):
+    name = _part_name(_download_name(url, upstream), part)
+    track.update(name=name)
     cover = await _pick_cover(url, cover_url, request)
     meta = await kavita.for_download(url)
     sync = await _sync_for(src)
@@ -663,11 +744,15 @@ async def _repack(src, url: str, cover_url: str | None, p: Profile, request: Req
         comicinfo=meta,
         progress=_reporter(track),
         sources=sync.pages if sync else None,
+        part=part,
     )
+    headers = _stale(upstream)
+    if part is not None:
+        headers['content-disposition'] = _attachment(name)
     return StreamingResponse(
         _repacking(chunks, src, track, sync),
         media_type='application/vnd.comicbook+zip',
-        headers=_stale(upstream),
+        headers=headers,
     )
 
 
@@ -736,18 +821,22 @@ async def download(profile: str, token: str, request: Request, job: str = ''):
         del head.headers['content-length']
         return head
 
-    track = board.begin(profile, _download_name(url, {}), functools.partial(jobs.set, job))
+    part = _part_of(request)
+    track = board.begin(profile, _part_name(_download_name(url, {}), part), functools.partial(jobs.set, job))
     track.update(stage='fetching', done=0, total=0)
     try:
-        return await _deliver(p, url, cover_url, request, track)
+        return await _deliver(p, url, cover_url, request, track, part)
     except BaseException as exc:
         track.finish('stopped' if isinstance(exc, asyncio.CancelledError) else 'error')
         raise
 
 
-async def _deliver(p: Profile, url: str, cover_url: str | None, request: Request, track) -> Response:
+async def _deliver(
+    p: Profile, url: str, cover_url: str | None, request: Request, track, part: tuple[int, int] | None = None
+) -> Response:
+    pack = functools.partial(_repack, part=part)
     if p.fmt != 'raw':
-        ranged = await _repack_over_ranges(url, cover_url, p, request, track)
+        ranged = await _repack_over_ranges(url, cover_url, p, request, track, pack)
         if ranged is not None:
             return ranged
 
@@ -764,7 +853,7 @@ async def _deliver(p: Profile, url: str, cover_url: str | None, request: Request
     if p.fmt != 'raw' and _is_comic_zip(ctype, body):
         try:
             body.seek(0)
-            return await _repack(body, url, cover_url, p, request, track, out_headers)
+            return await pack(body, url, cover_url, p, request, track, out_headers)
         except Exception:
             body.seek(0)
         except BaseException:
