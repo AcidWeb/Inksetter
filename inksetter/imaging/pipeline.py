@@ -12,7 +12,7 @@ COLOUR (Kaleido 3):
   decode+autorot -> flatten alpha -> folio remover -> autocrop
          -> rotate wide spreads -> descreen (FFT notch, only when downscaling)
          -> downscale or upscale -> pad to the panel box
-         -> LCh saturation boost -> Lab: blur a/b only
+         -> LCh saturation boost -> Lab: average the flat areas (deblock) -> blur a/b only
          -> levels+gamma, unsharp and defringe on L only
          -> sRGB -> re-flatten the pad -> encode (palette PNG, PNG, JPEG or WebP)
          -> for the palette PNG: libimagequant, then pin pure white and pure black
@@ -31,7 +31,7 @@ import scipy.fft as sfft
 from typing import NamedTuple
 from imagequant._libimagequant import ffi as liq_ffi, lib as liq
 
-from . import folio
+from . import deblock, folio
 from .profiles import UPSCALE_MAX_CEILING, Profile
 from .. import cores
 
@@ -861,6 +861,8 @@ def _render_colour(
         lch = lch * [1.0, p.saturation, 1.0]
 
     lab = lch.colourspace('lab')
+    if p.deblock:
+        lab = deblock.smooth_flats(lab)
     L, a, b = lab[0], lab[1], lab[2]
 
     sigma = p.chroma_sigma

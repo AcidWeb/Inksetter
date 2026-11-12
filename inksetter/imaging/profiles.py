@@ -153,6 +153,8 @@ class Profile:
     defringe_tolerance: float = 10.0
     defringe_strength: float = 0.95
     defringe_deadband: float = 0.4
+    # Average the flat areas of a colour page, where a lossy source's blocks show on a panel of few levels.
+    deblock: bool = False
 
     # Route grey pages through the mono path even on a colour device.
     auto_mono: bool = True
@@ -247,6 +249,8 @@ def validate(p: Profile, where: str = 'profile') -> Profile:
         problems.append(
             f'defringe={p.defringe!r} with panel={p.panel!r}: only a kaleido panel has a filter array to beat with'
         )
+    if p.deblock and not p.is_colour:
+        problems.append(f'deblock=true with fmt={p.fmt!r}: only a colour page has flat areas to smooth')
     if not 0 < p.descreen_max_megapixels <= 64:
         problems.append(f'descreen_max_megapixels={p.descreen_max_megapixels} must be >0 and <=64')
     if not 0 < p.usm_sigma <= 10:

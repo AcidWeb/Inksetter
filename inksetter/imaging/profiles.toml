@@ -187,7 +187,7 @@ height = 1696
 # Scribe Colorsoft, 12th gen, 2025. 11".
 [profiles.kindle-scribe-colorsoft-webtoon]
 base = "kaleido-webtoon"
-fmt = "webpc"
+deblock = true
 width = 1986
 height = 2648
 

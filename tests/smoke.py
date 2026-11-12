@@ -58,7 +58,7 @@ from inksetter import app as app_mod  # noqa: E402
 from inksetter.app import app  # noqa: E402
 from inksetter import cores  # noqa: E402
 from inksetter import __main__ as entry  # noqa: E402
-from inksetter.imaging import cbz, folio, pipeline, profiles, webtoon  # noqa: E402
+from inksetter.imaging import cbz, deblock, folio, pipeline, profiles, webtoon  # noqa: E402
 from inksetter import web  # noqa: E402
 from inksetter.opds import rewrite  # noqa: E402
 from inksetter.opds.rewrite import encode_token  # noqa: E402
@@ -2421,6 +2421,261 @@ def check_webp_colour() -> None:
     pages = [n for n in zw.namelist() if n[0].isdigit()]
     check('webpc repack names WebP pages .webp', pages and all(n.endswith('.webp') for n in pages), f'{pages}')
     check('webpc repack really contains WebP', all(zw.read(n)[8:12] == b'WEBP' for n in pages))
+
+
+def _smoothed_lab(lab: np.ndarray) -> np.ndarray:
+    a = np.ascontiguousarray(lab, dtype=np.float32)
+    im = pyvips.Image.new_from_memory(a, a.shape[1], a.shape[0], 3, 'float').copy(interpretation='lab')
+    out = deblock.smooth_flats(im)
+    assert out.interpretation == 'lab' and out.format == 'float', (out.interpretation, out.format)
+    return np.ndarray(buffer=out.write_to_memory(), dtype=np.float32, shape=(out.height, out.width, out.bands))
+
+
+def _blocks_of(h: int, w: int, size: int, spread: float, seed: int) -> np.ndarray:
+    ys, xs = np.mgrid[0:h, 0:w]
+    return np.random.default_rng(seed).uniform(-spread, spread, (h // size + 1, w // size + 1))[ys // size, xs // size]
+
+
+def _blocky_lab(h: int = 610, w: int = 530) -> np.ndarray:
+    lab = np.zeros((h, w, 3), np.float32)
+    lab[:, :, 0] = 40 + 0.9 * (np.mgrid[0:h, 0:w][0] // 16) + _blocks_of(h, w, 16, 0.3, 5)
+    lab[:, :, 1] = 6 + _blocks_of(h, w, 32, 1.2, 6)
+    lab[:, :, 2] = -4 + _blocks_of(h, w, 32, 1.2, 7)
+    return lab
+
+
+def _row_steps(plane: np.ndarray, period: int) -> tuple[float, float]:
+    d = np.abs(np.diff(plane, axis=0)).mean(axis=1)
+    on = np.zeros(len(d), bool)
+    on[period - 1 :: period] = True
+    return float(d[on].mean()), float(d[~on].mean())
+
+
+def _block_jump(plane: np.ndarray, size: int) -> float:
+    h, w = plane.shape[0] // size * size, plane.shape[1] // size * size
+    means = plane[:h, :w].reshape(h // size, size, w // size, size).mean(axis=(1, 3))
+    return float(np.abs(np.diff(means, axis=1)).mean())
+
+
+def _blocky_page(w: int, h: int) -> bytes:
+    ys, xs = np.mgrid[0:h, 0:w]
+    rgb = np.repeat((90 + (ys // 16) + _blocks_of(h, w, 16, 1.0, 12))[:, :, None], 3, axis=2)
+    tint = np.random.default_rng(11).integers(-1, 2, (h // 32 + 1, w // 32 + 1))[ys // 32, xs // 32]
+    rgb[:, :, 0] += 20 + tint
+    rgb[:, :, 2] += 40 - tint
+    a = np.clip(np.rint(rgb), 0, 255).astype(np.uint8)
+    a[h // 2 : h // 2 + 6] = 0
+    return pyvips.Image.new_from_memory(a.tobytes(), w, h, 3, 'uchar').pngsave_buffer()
+
+
+def check_deblock() -> None:
+    h, w = 610, 530
+    ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
+    plain = _blocky_lab(h, w)
+    out = _smoothed_lab(plain)
+    check('a smoothed page keeps its size, odd as it is', out.shape == plain.shape, f'{out.shape}')
+    before, after = _row_steps(plain[:, :, 0], 16), _row_steps(out[:, :, 0], 16)
+    check(
+        'premise: the fixture steps on its 16-row grid and nowhere else',
+        before[0] > 0.8 and before[1] == 0,
+        f'{before}',
+    )
+    check('the steps of a lightness staircase are gone', after[0] < 0.2, f'{after[0]:.3f} from {before[0]:.3f}')
+    check('and the fade is a ramp now, not a flat', after[1] > 0.03, f'{after[1]:.3f} a row inside a block')
+    rise = [float(a[-40:, :, 0].mean() - a[:40, :, 0].mean()) for a in (plain, out)]
+    check('which rises as far as it did', abs(rise[0] - rise[1]) < 0.5, f'{rise[0]:.2f} and {rise[1]:.2f}')
+    jumps = [
+        (_block_jump(a[:, :, 0], 16), _block_jump(a[:, :, 1], 32), _block_jump(a[:, :, 2], 32)) for a in (plain, out)
+    ]
+    check(
+        'blocks side by side are level, in lightness and in both colour bands',
+        all(after < 0.4 * before for before, after in zip(*jumps, strict=True)),
+        f'{[round(j, 2) for j in jumps[0]]} -> {[round(j, 2) for j in jumps[1]]}',
+    )
+
+    marked = plain.copy()
+    marked[300:306, :, 0] = 5
+    specks = ((100, 100), (150, 400), (220, 250))
+    for y, x in specks:
+        marked[y : y + 3, x : x + 3, 0] = 95
+    marked[400:520, 60:200, 0] += np.random.default_rng(9).normal(0, 4, (120, 140))
+    marked[400:520, 300:440, 1] += np.random.default_rng(10).normal(0, 4, (120, 140))
+    marked[30:90, 250:390, 2] += np.random.default_rng(11).normal(0, 4, (60, 140))
+    moved = np.abs(_smoothed_lab(marked) - marked).max(axis=2)
+    check('a line is left exactly as it was', moved[300:306].max() == 0, f'{moved[300:306].max()}')
+    left = max(float(moved[y : y + 3, x : x + 3].max()) for y, x in specks)
+    check('and so is a speck', left == 0, f'{left}')
+    check('and so is grain', moved[404:516, 64:196].max() == 0, f'{moved[404:516, 64:196].max()}')
+    tinted = float(moved[404:516, 304:436].max()), float(moved[34:86, 254:386].max())
+    check('in either colour band alone, too', tinted == (0, 0), f'{tinted}')
+    check(
+        'the smoothing reaches to within 4 px of the line',
+        (moved[292:297] > 0.05).mean() > 0.5 and (moved[310:315] > 0.05).mean() > 0.5,
+        f'{(moved[292:297] > 0.05).mean():.2f} above, {(moved[310:315] > 0.05).mean():.2f} below',
+    )
+    ring = moved[92:111, 92:111].copy()
+    ring[5:14, 5:14] = 0
+    check('and round a speck', (ring > 0.05).mean() > 0.3, f'{(ring > 0.05).mean():.2f} of the pixels 5-9 px from it')
+
+
+    chequer = np.zeros((h, w, 3), np.float32)
+    chequer[:, :, 0] = 40 + 0.03 * ys + 0.1 * (((ys // 16) + (xs // 16)) % 2 * 2 - 1)
+    got = _smoothed_lab(chequer)
+    worst = [max(_block_jump(a[top : top + 32, :, 0], 16) for top in range(64, h - 96, 32)) for a in (chequer, got)]
+    check('premise: every band of the chequer steps a fifth of a level', worst[0] > 0.19, f'{worst[0]:.3f}')
+    check('no band of it is left stepping', worst[1] < 0.05, f'{worst[1]:.3f} at the worst')
+
+    rng = np.random.default_rng(21)
+    at = rng.uniform(3, 9, (8, 12)).astype(np.float32)
+    low, share = np.floor(at).astype(np.intp), rng.uniform(0, 1, (8, 12)).astype(np.float32)
+    value = rng.uniform(-20, 20, (8, 12)).astype(np.float32)
+    cells = deblock._gathered(low, at - low, share, value, 12, 4).astype(np.float64)
+
+    def by_cell(a: np.ndarray) -> np.ndarray:
+        return a.astype(np.float64).reshape(2, 4, 3, 4).sum(axis=(1, 3))
+
+    gaps = (
+        np.abs(cells[:, :, :, 1].sum(axis=2) - by_cell(share)).max(),
+        np.abs(cells[:, :, :, 0].sum(axis=2) - by_cell(share * value)).max(),
+        np.abs((cells[:, :, :, 1] * np.arange(12)).sum(axis=2) - by_cell(share * at)).max(),
+    )
+    check(
+        'a cell holds the weight of its squares, their values and their mean level',
+        cells.shape == (2, 3, 12, 2) and max(gaps) < 1e-3,
+        f'{cells.shape}, off by {[float(round(g, 5)) for g in gaps]}',
+    )
+
+    halves = np.zeros((h, w, 3), np.float32)
+    halves[:, :, 0] = np.where(ys < 303, 50, 58) + _blocks_of(h, w, 16, 0.3, 3)
+    halves[300:306, :, 0] = 5
+    got = _smoothed_lab(halves)
+    drift = [float(got[rows, :, 0].mean() - halves[rows, :, 0].mean()) for rows in (slice(288, 296), slice(310, 318))]
+    acted = float((np.abs(got - halves)[288:296, :, 0] > 0.02).mean())
+    check('premise: the pixels beside that line are smoothed', acted > 0.5, f'{acted:.2f}')
+    check('an area takes nothing from the one across a line', max(abs(v) for v in drift) < 0.15, f'{drift}')
+
+    tints = _blocky_lab(h, w)
+    tints[:, :, 0] = 70 + 0.3 * np.sin(ys / 7.0)
+    tints[:, : w // 2, 1] -= 26
+    tints[:, w // 2 :, 1] += 14
+    got = _smoothed_lab(tints)
+    near = (slice(None), slice(w // 2 - 20, w // 2 - 8)), (slice(None), slice(w // 2 + 8, w // 2 + 20))
+    level = [float(tints[part][:, :, 0].mean()) for part in near]
+    check('premise: the two colours are of one lightness', abs(level[0] - level[1]) < 0.1, f'{level}')
+    acted = float((np.abs(got - tints)[near[0]][:, :, 1] > 0.05).mean())
+    check('premise: and the pixels beside their border are smoothed', acted > 0.5, f'{acted:.2f}')
+    drift = [float(got[part][:, :, 1].mean() - tints[part][:, :, 1].mean()) for part in near]
+    check('a colour takes nothing from another of its own lightness', max(abs(v) for v in drift) < 0.3, f'{drift}')
+
+    ramp = np.stack([30 + 0.05 * xs + 0.03 * ys, -10 + 0.04 * xs, 5 + 0.04 * ys], axis=2)
+    gap = (_smoothed_lab(ramp) - ramp)[64:-64, 64:-64].reshape(-1, 3)
+    check(
+        'a ramp in each band is left where it was',
+        np.abs(gap.mean(axis=0)).max() < 0.03 and np.abs(gap).max() < 0.2,
+        f'mean {gap.mean(axis=0).round(3)}, most {np.abs(gap).max():.3f}',
+    )
+
+    wide = 930
+
+    def kept(band: int, stretch: int, base: float, down: bool = False) -> float:
+        wave = np.zeros((h, wide, 3), np.float32)
+        wave[:, :, 0] = 60
+        shape = np.sin(2 * np.pi * np.mgrid[0:h, 0:wide][0 if down else 1] / (200 * stretch)).astype(np.float32)
+        wave[:, :, band] = base + shape
+        got = _smoothed_lab(wave)[100:-100, 100:-100, band] - base
+        return float((got * shape[100:-100, 100:-100]).mean() / (shape[100:-100, 100:-100] ** 2).mean())
+
+    keeps = {(band, stretch): kept(band, stretch, base) for band, base in ((0, 60), (1, 4)) for stretch in (1, 2)}
+    check(
+        'a lightness wave 200 px long keeps most of its height, and loses some',
+        0.8 < keeps[0, 1] < 0.95,
+        f'{keeps[0, 1]:.3f}',
+    )
+    falls = kept(0, 1, 60, down=True)
+    check('and as much when it runs down the page', abs(falls - keeps[0, 1]) < 0.02, f'{falls:.3f}')
+    check(
+        'a colour wave of that length loses more, colour being averaged further',
+        0.55 < keeps[1, 1] < 0.8,
+        f'{keeps[1, 1]:.3f}',
+    )
+    check('and one 400 px long keeps most of its height', keeps[1, 2] > 0.85, f'{keeps[1, 2]:.3f}')
+
+    by, bx = np.mgrid[0:h, 0:wide].astype(np.float32)
+    for band, name, cap in ((0, 'lightness', 2.5), (1, 'colour', 5.0)):
+        bump = np.zeros((h, wide, 3), np.float32)
+        bump[:, :, 0] = 60
+        bump[:, :, band] += 7 * np.exp(-0.5 * (((by - 300) / 4) ** 2 + ((bx - 460) / 4) ** 2))
+        most = float(np.abs(_smoothed_lab(bump) - bump)[:, :, band].max())
+        check(f'{name} moves {cap} at the most', cap - 0.05 < most <= cap + 1e-3, f'{most:.3f}')
+
+    noise = np.random.default_rng(2).normal(50, 12, (h, w, 3)).astype(np.float32)
+    check('a page with nothing flat comes back as it came', np.array_equal(_smoothed_lab(noise), noise))
+    white = np.zeros((h, w, 3), np.float32)
+    white[:, :, 0] = 100
+    check('and white stays white', np.abs(_smoothed_lab(white) - white).max() < 1e-4)
+
+    base = profiles.PROFILES['kindle-colorsoft-1-2']
+    off = dataclasses.replace(base, autocrop=False, auto_mono=False, palette=False)
+    on = dataclasses.replace(off, deblock=True)
+    src = _blocky_page(base.width, base.height)
+    pages = [_rgb_of(pipeline.render_page(src, prof)[0]).astype(np.float32) for prof in (off, on)]
+    luma = [a[96:800] @ np.array([0.299, 0.587, 0.114], np.float32) for a in pages]
+    stepped = [_row_steps(a.mean(axis=1, keepdims=True), 16)[0] for a in luma]
+    check('premise: without deblock a rendered fade steps on its block grid', stepped[0] > 0.8, f'{stepped[0]:.2f}')
+    check('with it the steps are gone', stepped[1] < 0.4 * stepped[0], f'{stepped[1]:.2f} from {stepped[0]:.2f}')
+    tinted = [_block_jump(a[96:800, :, 0] - a[96:800, :, 2], 32) for a in pages]
+    check('and so are the colour blocks', tinted[1] < 0.5 * tinted[0], f'{tinted[1]:.2f} from {tinted[0]:.2f}')
+    line = [float(a[base.height // 2 + 1 : base.height // 2 + 5].max()) for a in pages]
+    check('the line across the page is as black as it was', line[0] == line[1], f'{line}')
+
+    calls = []
+    real = deblock.smooth_flats, pipeline._tone, pipeline._unsharp
+
+    def noting(name: str, fn):
+        def wrapper(im, *args, **kwargs):
+            calls.append((name, im.interpretation, im.bands, im.format))
+            return fn(im, *args, **kwargs)
+
+        return wrapper
+
+    with (
+        mock.patch.object(deblock, 'smooth_flats', noting('smooth', real[0])),
+        mock.patch.object(pipeline, '_tone', noting('tone', real[1])),
+        mock.patch.object(pipeline, '_unsharp', noting('unsharp', real[2])),
+    ):
+        pipeline.render_page(src, on)
+        with_it = list(calls)
+        calls.clear()
+        pipeline.render_page(src, off)
+    check(
+        'the page is smoothed as Lab, before the tone curve and the sharpening',
+        [c[0] for c in with_it] == ['smooth', 'tone', 'unsharp'] and with_it[0][1:] == ('lab', 3, 'float'),
+        f'{with_it}',
+    )
+    check('and not at all with deblock off', [c[0] for c in calls] == ['tone', 'unsharp'], f'{calls}')
+
+    check(
+        'a grey page on a deblock profile is the page it was',
+        pipeline.render_page(fake_page(0), dataclasses.replace(base, deblock=True))
+        == pipeline.render_page(fake_page(0), base),
+    )
+    check(
+        'deblock is part of the render key',
+        cache_mod.render_key('http://x/p/1', on, None) != cache_mod.render_key('http://x/p/1', off, None),
+    )
+    mono = profiles.PROFILES['kobo-clara-hd-2e-bw']
+    check(
+        'deblock on a profile with no colour page is refused', bool(_refusal(dataclasses.replace(mono, deblock=True)))
+    )
+    check('and taken on a colour one', not _refusal(on), _refusal(on))
+    shipped = sorted(name for name, prof in profiles.PROFILES.items() if prof.deblock)
+    check(
+        'the Scribe Colorsoft webtoon profile ships with it, and no other',
+        shipped == ['kindle-scribe-colorsoft-webtoon'],
+        f'{shipped}',
+    )
+    scribe = profiles.PROFILES['kindle-scribe-colorsoft-webtoon']
+    check('as a palette PNG', scribe.fmt == 'pngc' and scribe.palette, f'{scribe.fmt}')
 
 
 def _png_chunks(png: bytes) -> list[tuple[bytes, bytes]]:
@@ -12716,6 +12971,8 @@ async def main() -> int:
     print('colour pad ring')
     check_colour_pad_ring()
     check_cut_margin_pad()
+    print('deblock')
+    check_deblock()
     print('webtoon pad')
     check_webtoon_pad()
     print('gutter pad')
