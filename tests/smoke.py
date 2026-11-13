@@ -879,6 +879,13 @@ def _komga_file(bid: str, name: str):  # noqa: ARG001
     return Response(_cbz_bytes(1), media_type='application/zip')
 
 
+@upstream.get('/komga/opds/v1.2/books/{bid}/{segment}/{name}')
+def _komga_matrix(bid: str, segment: str, name: str):
+    if segment.partition(';')[0] != 'file':
+        return Response(status_code=404)
+    return _komga_file(bid, name)
+
+
 def _komga_denied() -> Response:
     return Response('denied', status_code=401, headers={'www-authenticate': 'Basic realm="Realm"'})
 
@@ -901,6 +908,8 @@ async def _komga_api_progress(bid: str, request: Request, authorization: str = H
         return _komga_denied()
     if bid == '0FAIL':
         return Response('Komga is starting up', status_code=503)
+    if bid == '0PROXY':
+        return Response(status_code=407, headers={'proxy-authenticate': 'Basic realm="proxy"'})
     if request.headers.get('content-type') != 'application/json':
         return Response(status_code=415)
     KOMGA_SEEN['progress'].append((bid, json.loads(await request.body()), authorization))
@@ -9870,6 +9879,19 @@ async def check_security(c) -> None:
         'javascript:' not in b.text and 'data:text' not in b.text,
     )
 
+    big = encode_token(f'{up}/opds/v1.2/norange-big/file.cbz')
+    with mock.patch.object(app_mod, 'FEED_MAX', 1 << 20), mock.patch.object(app_mod, 'PAGE_MAX', 1 << 20):
+        for route in ('f', 'osd', 'b', 'bs', 'p', 'img'):
+            _BIG['yielded'] = 0
+            r = await _get(c, f'/kobo-clara-hd-2e-bw/{route}/{big}')
+            await asyncio.sleep(0.3)
+            pulled = _BIG['yielded']
+            check(
+                f'a /{route}/ token made for a 32 MB download gives up past its bound, with a 502',
+                r.status_code == 502 and pulled < _BIG_TOTAL // 4,
+                f'status={r.status_code} {pulled / 1024**2:.1f} MB of {_BIG_TOTAL / 1024**2:.0f} MB pulled',
+            )
+
 
 async def check_http_edges(c) -> None:
     up = 'http://127.0.0.1:8899'
@@ -10256,7 +10278,7 @@ async def check_browse(c) -> None:
     check('the index links each profile into the browse pages', '/kobo-clara-hd-2e-bw/browse' in home)
     check(
         'the index still shows the catalog URL for readers',
-        re.search(r'/kobo-clara-hd-2e-bw/(opds/v1\.2/)?catalog</code>', home) is not None,
+        '/kobo-clara-hd-2e-bw/opds/v1.2/catalog</code>' in home,
     )
     check('the index does not name itself twice in the tab', '<title>Inksetter</title>' in home)
 
@@ -10743,7 +10765,7 @@ async def check_landing_groups(c) -> None:
     )
     check(
         'and still shows its catalog URL',
-        all(re.search(rf'/{n}/(opds/v1\.2/)?catalog</code>', home) for n in profiles.PROFILES),
+        all(f'/{n}/opds/v1.2/catalog</code>' in home for n in profiles.PROFILES),
     )
     order = re.findall(r'href="http://proxy\.test/([\w-]+)/browse"', home)
     check(
@@ -11509,7 +11531,7 @@ async def check_komga_mirror(c) -> None:
     for label, url, want in (
         ('a Komga catalog', 'http://komga:25600/opds/v1.2/catalog', 'http://komga:25600/opds/v1.2'),
         ('a Komga behind a path prefix', 'https://host/komga/opds/v1.2/catalog', 'https://host/komga/opds/v1.2'),
-        ('a Komga URL with a login in it', 'http://u:pw@komga:25600/opds/v1.2/catalog', 'http://komga:25600/opds/v1.2'),
+        ('a Komga URL with a login in it', 'http://u:pw@komga:25600/opds/v1.2/catalog', ''),
         ('a Codex catalog', 'http://codex:9810/opds/v1.2', ''),
         ('a Kavita catalog', f'http://kavita:5000/api/opds/{SEAL_KEY}', ''),
         ('a feed under the catalog', 'http://komga:25600/opds/v1.2/catalog/more', ''),
@@ -11546,6 +11568,7 @@ async def check_komga_mirror(c) -> None:
     for label, body, upstream in (
         ('a feed that does not sign itself Komga', unsigned, catalog),
         ('a Komga feed on a catalog not shaped as Komga', signed, codex),
+        ('a Komga feed on a catalog URL with a login in it', signed, catalog.replace('//', '//u:pw@', 1)),
     ):
         hrefs = proxied(body, f'{KOMGA}/series/0S1', upstream)
         check(
@@ -11721,6 +11744,25 @@ async def check_komga_mirror(c) -> None:
                 )
             r = await _send(c, 'PATCH', report.replace('0B1', '0FAIL'), content=b'{"page":3}', headers=auth)
             check("a Komga failing the report is Inksetter's 502", r.status_code == 502, f'status={r.status_code}')
+            r = await _send(c, 'PATCH', report.replace('0B1', '0PROXY'), content=b'{"page":3}', headers=auth)
+            check(
+                "an outbound proxy asking for credentials is Inksetter's 502, as on every other route",
+                r.status_code == 502,
+                f'status={r.status_code}',
+            )
+            read = []
+
+            async def flood():
+                for _ in range(4096):
+                    read.append(1)
+                    yield b' ' * 1024
+
+            r = await _send(c, 'PATCH', report, content=flood(), headers={**auth, **json_type})
+            check(
+                'a progress report of 4 MB is refused having read no more than 2 KB of it',
+                r.status_code == 400 and len(read) <= 2,
+                f'status={r.status_code} read={len(read)} KB',
+            )
 
         r = await _get(c, latest)
         _, aggregate = _meguru_komga_feed(r.content, latest) if r.status_code == 200 else (None, [])
@@ -11762,7 +11804,7 @@ async def check_komga_mirror(c) -> None:
             f'{cover} status={r.status_code} {r.headers.get("content-type")} {asked}',
         )
 
-        ctx = rewrite.Ctx(prof, 'http://proxy.test', f'{KOMGA}/series/0S1', komga=True)
+        ctx = rewrite.Ctx(prof, 'http://proxy.test', f'{KOMGA}/series/0S1', komga=KOMGA)
         check(
             'premise: the plain stream and series feed take the Komga-shaped links',
             '/opds/v1.2/books/' in rewrite.map_href(stream, 'p', ctx, count=6)
@@ -11778,6 +11820,7 @@ async def check_komga_mirror(c) -> None:
             'a path outside the root': stream.replace('/komga/opds/', '/opds/'),
             'an odd book id': stream.replace('0B1', '0B.1'),
             'a fragment': f'{stream}#x',
+            'another scheme': stream.replace('http://', 'https://'),
         }
         mapped = {label: rewrite.map_href(href, 'p', ctx, count=6) for label, href in odd.items()}
         check(
@@ -11791,6 +11834,7 @@ async def check_komga_mirror(c) -> None:
             'an escaped letter': f'{KOMGA}/series/%30S1',
             'a placeholder': f'{KOMGA}/series/{{id}}',
             'a fragment': f'{KOMGA}/series/0S1#top',
+            'another scheme': f'{KOMGA}/series/0S1'.replace('http://', 'https://'),
             'another port': f'{KOMGA}/series/0S1'.replace(':8899', ':8898'),
             'a path outside the root': 'http://127.0.0.1:8899/komga/api/v1/books/0B1',
         }
@@ -11805,6 +11849,8 @@ async def check_komga_mirror(c) -> None:
             ('climbs out of the root', '/opds/v1.2/%2e%2e/%2e%2e/api/v1/books/0B1'),
             ('climbs out from the series URL', '/series/%2e%2e/%2e%2e/api/v1/books/0B1'),
             ('is a download', '/opds/v1.2/books/0B1/file/v.cbz'),
+            ('is a download with a matrix parameter', '/opds/v1.2/books/0B1/file;x/v.cbz'),
+            ('is a download with an escaped one', '/opds/v1.2/books/0B1/file%3Bx/v.cbz'),
             ('names an odd book', '/opds/v1.2/books/0B.1/pages/1'),
             ('looks up an odd book', '/api/v1/books/0B.1'),
             ('asks for an odd series cover', '/api/v1/series/0S.1/thumbnail'),
@@ -11817,6 +11863,13 @@ async def check_komga_mirror(c) -> None:
                 r.status_code == 404 and now == before,
                 f'status={r.status_code}',
             )
+        for rest in ('..;/..;/api/v1/books/0B1', 'books/0B1/file;x/v.cbz'):
+            try:
+                komga.mirror_feed(rest)
+                said = 200
+            except komga.UpstreamError as exc:
+                said = exc.status
+            check(f'the mirror refuses {rest}, as Komga would read its segments', said == 404, f'{said}')
         before = len(KOMGA_SEEN['api'])
         r = await _send(c, 'PATCH', f'/{prof}/api/v1/books/0B.1/read-progress', content=b'{"page":1}', headers=auth)
         check('a report on an odd book is refused unasked', r.status_code == 404 and len(KOMGA_SEEN['api']) == before)
@@ -11961,6 +12014,23 @@ async def check_kosync(c) -> None:
         except ValueError:
             return {}
         return got if isinstance(got, dict) else {}
+
+    read = []
+
+    async def flood():
+        for _ in range(4096):
+            read.append(1)
+            yield b' ' * 1024
+
+    with mock.patch.object(app_mod, 'KOSYNC_MAX', 16 << 10):
+        r = await _send(
+            c, 'PUT', '/kosync/syncs/progress', content=flood(), headers={'content-type': 'application/json'}
+        )
+    check(
+        'a progress push of 4 MB is refused having read no more than one chunk past its bound',
+        r.status_code == 400 and len(read) <= 17,
+        f'status={r.status_code} read={len(read)} KB of a 16 KB bound',
+    )
 
     rng = np.random.default_rng(11)
     for size in (0, 1, 1023, 1024, 1025, 5000, 70_000, 300_000, 1_100_000, 4_200_000):

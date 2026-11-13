@@ -85,25 +85,10 @@ def _mirrored(url: str) -> str | None:
     return kavita.mirror_link(url)
 
 
-def _komga_signed(root) -> bool:
+def _komga():
     from .. import komga
 
-    author = root.find(f'{{{ATOM}}}author')
-    if author is None:
-        return False
-    return komga.signs(' '.join(author.findtext(f'{{{ATOM}}}{tag}') or '' for tag in ('name', 'uri')))
-
-
-def _komga_stream(url: str) -> str | None:
-    from .. import komga
-
-    return komga.stream_link(url)
-
-
-def _komga_feed(url: str) -> str | None:
-    from .. import komga
-
-    return komga.feed_link(url)
+    return komga
 
 
 def encode_token(url: str, cover: str | None = None) -> str:
@@ -201,7 +186,7 @@ class Ctx:
     public_base: str
     base_url: str
     parts: Callable[[str, int], int] | None = None
-    komga: bool = False
+    komga: str = ''
 
 
 def parts_of(ctx: Ctx, href: str | None, count: int) -> int:
@@ -294,9 +279,13 @@ def map_href(
 
     if kind == 'p':
         pages = f'&count={count}' if count > 0 else ''
-        stream = _mirrored(target) or (ctx.komga and _komga_stream(target)) or f'/p/{token}?page={{pageNumber}}'
+        stream = (
+            _mirrored(target)
+            or (ctx.komga and _komga().stream_link(target, ctx.komga))
+            or f'/p/{token}?page={{pageNumber}}'
+        )
         return f'{prefix}{stream}{"&" if "?" in stream else "?"}maxWidth={{maxWidth}}{pages}'
-    if kind == 'f' and ctx.komga and (mirrored := _komga_feed(target)):
+    if kind == 'f' and ctx.komga and (mirrored := _komga().feed_link(target, ctx.komga)):
         return f'{prefix}{mirrored}'
     if kind == 's':
         if search_style == 'opds2':
@@ -369,8 +358,8 @@ def rewrite_atom(body: bytes, ctx: Ctx, page_mime: str | None, stream: bool = Tr
 
     if root.tag == f'{{{OSD_NS}}}OpenSearchDescription':
         return _rewrite_osd(root, ctx)
-    if _komga_signed(root):
-        ctx = replace(ctx, komga=True)
+    if _komga().signs(root):
+        ctx = replace(ctx, komga=_komga().opds_root())
 
     for tag in ('icon', 'logo'):
         for el in root.iter(f'{{{ATOM}}}{tag}'):

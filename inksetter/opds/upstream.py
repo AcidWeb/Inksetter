@@ -73,7 +73,7 @@ def _upstream_failure(exc: Exception) -> UpstreamError:
     return UpstreamError(502, f'upstream answered badly: {type(exc).__name__}')
 
 
-def _status_error(status: int, headers) -> UpstreamError:
+def status_error(status: int, headers) -> UpstreamError:
     if status >= 500:
         return UpstreamError(502, f'upstream is failing: status {status}')
     if status == 407:
@@ -116,6 +116,16 @@ def request_headers(incoming, *, forward_accept: bool = False, accept: str = '*/
     return out
 
 
+async def _read_most(resp: httpx.Response, most: int) -> None:
+    parts, size = [], 0
+    async for chunk in resp.aiter_bytes():
+        size += len(chunk)
+        if size > most:
+            raise UpstreamError(502, f'upstream answered more than {most} bytes')
+        parts.append(chunk)
+    resp._content = b''.join(parts)
+
+
 class Client:
     def __init__(self) -> None:
         self._client: httpx.AsyncClient | None = None
@@ -148,7 +158,7 @@ class Client:
                     target = _redirect_target(url, resp)
                     if target is None:
                         if resp.status_code >= 400:
-                            raise _status_error(resp.status_code, resp.headers)
+                            raise status_error(resp.status_code, resp.headers)
                         yield resp
                         return
                 url = target
@@ -156,9 +166,12 @@ class Client:
             raise _upstream_failure(exc) from exc
         raise UpstreamError(502, f'more than {MAX_REDIRECTS} redirects')
 
-    async def get(self, url: str, headers: dict[str, str]) -> httpx.Response:
+    async def get(self, url: str, headers: dict[str, str], most: int | None = None) -> httpx.Response:
         async with self._answer(url, headers) as resp:
-            await resp.aread()
+            if most is None:
+                await resp.aread()
+            else:
+                await _read_most(resp, most)
         return resp
 
     async def stream(self, url: str, headers: dict[str, str], sink=None) -> httpx.Response:

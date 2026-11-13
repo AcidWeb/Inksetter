@@ -9,7 +9,8 @@ import httpx
 from urllib.parse import quote, unquote, urlsplit
 
 from .settings import settings
-from .opds.upstream import DEFAULT_CHALLENGE, UpstreamError, client, host_key
+from .opds.rewrite import ATOM
+from .opds.upstream import UpstreamError, client, host_key, status_error
 
 _CATALOG = re.compile(r'(.*/opds/v1\.2)/catalog')
 MIRROR = '/opds/v1.2'
@@ -20,7 +21,7 @@ _ADDED = ('maxWidth', 'count')
 _PATH_SAFE = "/!$&'()*+,;=:@"
 _REFUSED = frozenset({'.', '..', 'file'})
 _PROGRESS = {'page': int, 'completed': bool}
-_PROGRESS_MAX = 1024
+PROGRESS_MAX = 1024
 
 
 def opds_root() -> str:
@@ -30,9 +31,9 @@ def opds_root() -> str:
     except ValueError:
         return ''
     found = _CATALOG.fullmatch(parts.path)
-    if not found or not parts.netloc or parts.scheme.lower() not in ('http', 'https'):
+    if not found or not parts.netloc or '@' in parts.netloc or parts.scheme.lower() not in ('http', 'https'):
         return ''
-    return f'{parts.scheme}://{parts.netloc.rpartition("@")[2]}{found.group(1)}'
+    return f'{parts.scheme}://{parts.netloc}{found.group(1)}'
 
 
 def mirror_root() -> str:
@@ -42,15 +43,21 @@ def mirror_root() -> str:
     return root
 
 
-def signs(author: str) -> bool:
-    return SIGNATURE in (author or '').lower()
+def signs(feed) -> bool:
+    author = feed.find(f'{{{ATOM}}}author')
+    names = '' if author is None else ' '.join(author.findtext(f'{{{ATOM}}}{tag}') or '' for tag in ('name', 'uri'))
+    return SIGNATURE in names.lower()
 
 
-def _under(url: str) -> tuple[str, str] | None:
-    root = opds_root()
+def _under(url: str, root: str) -> tuple[str, str] | None:
     try:
         parts, home = urlsplit(url), urlsplit(root)
-        here = bool(root) and host_key(url) == host_key(root) and parts.path.startswith(f'{home.path}/')
+        here = (
+            bool(root)
+            and parts.scheme.lower() == home.scheme.lower()
+            and host_key(url) == host_key(root)
+            and parts.path.startswith(f'{home.path}/')
+        )
     except ValueError:
         return None
     if not here or parts.fragment or '{' in parts.query or '}' in parts.query:
@@ -59,15 +66,15 @@ def _under(url: str) -> tuple[str, str] | None:
 
 
 def _servable(rest: str) -> bool:
-    return not any(step in _REFUSED for step in rest.split('/'))
+    return not any(step.partition(';')[0] in _REFUSED for step in rest.split('/'))
 
 
 def _with(query: str) -> str:
     return f'?{query}' if query else ''
 
 
-def feed_link(url: str) -> str | None:
-    found = _under(url)
+def feed_link(url: str, root: str) -> str | None:
+    found = _under(url, root)
     if found is None:
         return None
     rest, query = found
@@ -77,8 +84,8 @@ def feed_link(url: str) -> str | None:
     return f'{MIRROR}/{rest}{_with(query)}'
 
 
-def stream_link(url: str) -> str | None:
-    found = _under(url)
+def stream_link(url: str, root: str) -> str | None:
+    found = _under(url, root)
     if found is None:
         return None
     rest, query = found
@@ -121,7 +128,7 @@ def series_thumbnail_url(series: str) -> str:
 
 def progress_body(raw: bytes) -> bytes:
     try:
-        body = json.loads(raw) if len(raw) <= _PROGRESS_MAX else None
+        body = json.loads(raw) if len(raw) <= PROGRESS_MAX else None
     except ValueError:
         body = None
     fits = isinstance(body, dict) and body and set(body) <= set(_PROGRESS)
@@ -139,9 +146,6 @@ async def report(book: str, raw: bytes, headers: dict[str, str]) -> httpx.Respon
         resp = await client.request('PATCH', url, content=body, headers={**headers, 'content-type': 'application/json'})
     except httpx.HTTPError, httpx.InvalidURL:
         raise UpstreamError(502, 'Komga did not answer the progress report') from None
-    if resp.status_code >= 500:
-        raise UpstreamError(502, f'Komga is failing: status {resp.status_code}')
-    if resp.status_code == 401:
-        challenge = resp.headers.get('www-authenticate') or DEFAULT_CHALLENGE
-        raise UpstreamError(401, headers={'www-authenticate': challenge})
+    if resp.status_code >= 500 or resp.status_code in (401, 407):
+        raise status_error(resp.status_code, resp.headers)
     return resp

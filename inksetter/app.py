@@ -7,6 +7,7 @@ import re
 import time
 import socket
 import asyncio
+import json
 import logging
 import tempfile
 import functools
@@ -290,9 +291,13 @@ async def status_page(request: Request):
 # --------------------------------------------------------------------------
 
 
+FEED_MAX = 64 << 20
+PAGE_MAX = 256 << 20
+
+
 async def _serve_feed(request: Request, profile_name: str, url: str) -> Response:
     p = _profile_or_404(profile_name)
-    resp = await client.get(url, request_headers(request.headers, forward_accept=True))
+    resp = await client.get(url, request_headers(request.headers, forward_accept=True), FEED_MAX)
     ctype = resp.headers.get('content-type', '')
     page_mime = None if p.fmt == 'raw' else p.mime
     if rewrite.is_feed(ctype, resp.content) or rewrite.looks_like_feed(resp.content):
@@ -328,7 +333,7 @@ async def feed(profile: str, token: str, request: Request):
 async def opensearch(profile: str, token: str, request: Request):
     _profile_or_404(profile)
     url = rewrite.decode_token(token)
-    resp = await client.get(url, request_headers(request.headers, forward_accept=True))
+    resp = await client.get(url, request_headers(request.headers, forward_accept=True), FEED_MAX)
     body = rewrite.rewrite(resp.content, _ctx(request, profile, str(resp.url)), None)
     return Response(body, media_type='application/opensearchdescription+xml')
 
@@ -356,7 +361,7 @@ BROWSE_ACCEPT = 'application/atom+xml, application/xml;q=0.9'
 
 async def _serve_html(request: Request, profile_name: str, url: str, term: str = '') -> Response:
     p = _profile_or_404(profile_name)
-    resp = await client.get(url, request_headers(request.headers, accept=BROWSE_ACCEPT))
+    resp = await client.get(url, request_headers(request.headers, accept=BROWSE_ACCEPT), FEED_MAX)
     base = _public_base(request)
     parts = _parts_for(p, request_headers(request.headers))
     ctx = _ctx(request, profile_name, str(resp.url), parts)
@@ -382,7 +387,7 @@ async def browse_search(profile: str, token: str, request: Request, q: str = '')
     _profile_or_404(profile)
     url = rewrite.decode_token(token)
     if not rewrite.is_search_template(url):
-        resp = await client.get(url, request_headers(request.headers, accept=BROWSE_ACCEPT))
+        resp = await client.get(url, request_headers(request.headers, accept=BROWSE_ACCEPT), FEED_MAX)
         template = rewrite.search_template(resp.content)
         if template is None:
             raise UpstreamError(502, 'upstream offers no search template')
@@ -417,7 +422,7 @@ async def _render_cached(
         if hit is not None:
             board.served(kind, True, time.monotonic() - began)
             return hit
-        resp = await client.get(url, headers)
+        resp = await client.get(url, headers, PAGE_MAX)
         if p.fmt == 'raw':
             blob = resp.content
             ctype = resp.headers.get('content-type', 'application/octet-stream')
@@ -437,6 +442,15 @@ async def _render_cached(
     prefetcher.spawn(cache.maybe_trim(), 'cache-trim')
     board.served(kind, False, time.monotonic() - began)
     return blob, ctype
+
+
+async def _body(request: Request, most: int) -> bytes:
+    raw = b''
+    async for chunk in request.stream():
+        raw += chunk
+        if len(raw) > most:
+            break
+    return raw
 
 
 def _query_int(raw: str) -> int:
@@ -570,14 +584,15 @@ async def komga_series(profile: str, rest: str, request: Request):
 @app.patch('/{profile}/api/v1/books/{book}/read-progress')
 async def komga_progress(profile: str, book: str, request: Request):
     _refuse_stream(_profile_or_404(profile))
-    resp = await komga.report(book, await request.body(), request_headers(request.headers, accept='application/json'))
-    return Response(resp.content, status_code=resp.status_code, media_type=resp.headers.get('content-type'))
+    raw = await _body(request, komga.PROGRESS_MAX)
+    resp = await komga.report(book, raw, request_headers(request.headers, accept='application/json'))
+    return _relay(resp)
 
 
 @app.get('/{profile}/api/v1/books/{book}')
 async def komga_book(profile: str, book: str, request: Request):
     _refuse_stream(_profile_or_404(profile))
-    resp = await client.get(komga.book_url(book), request_headers(request.headers, accept='application/json'))
+    resp = await client.get(komga.book_url(book), request_headers(request.headers, accept='application/json'), FEED_MAX)
     if rewrite.looks_like_feed(resp.content):
         raise UpstreamError(502, 'Komga answered a feed, not a book')
     return Response(resp.content, media_type=resp.headers.get('content-type') or 'application/json')
@@ -694,7 +709,7 @@ async def _cover_bytes(url: str | None, request: Request) -> bytes | None:
     if not url:
         return None
     try:
-        resp = await client.get(url, request_headers(request.headers))
+        resp = await client.get(url, request_headers(request.headers), PAGE_MAX)
     except Exception:
         return None
     return resp.content or None
@@ -1010,10 +1025,14 @@ async def kosync_auth():
     return _relay(await kavita.sync('GET', 'users/auth'))
 
 
+KOSYNC_MAX = 64 << 10
+
+
 @app.put('/kosync/syncs/progress')
 async def kosync_push(request: Request):
+    raw = await _body(request, KOSYNC_MAX)
     try:
-        body = await request.json()
+        body = json.loads(raw if len(raw) <= KOSYNC_MAX else b'')
     except ValueError:
         raise UpstreamError(400, 'progress sync expects a JSON body') from None
     document = _document(body.get('document') if isinstance(body, dict) else None)
