@@ -24,7 +24,7 @@ from fastapi.responses import (
     StreamingResponse,
 )
 
-from . import __version__, cores, kavita, kosync, logs, status, web
+from . import __version__, cores, kavita, komga, kosync, logs, status, web
 from .cache import DiskCache, Prefetcher, render_key
 from .imaging import azw3, cbz, profiles, webtoon
 from .imaging.pipeline import RenderFailed, UnreadableImage, render_page
@@ -246,7 +246,10 @@ def _for_readers(base: str) -> str:
 @app.api_route('/', methods=['GET', 'HEAD'], response_class=HTMLResponse)
 async def index(request: Request):
     base = _public_base(request)
-    root = f'api/opds/{kavita.MIRROR_KEY}' if kavita.opds_root() else 'catalog'
+    if kavita.opds_root():
+        root = f'api/opds/{kavita.MIRROR_KEY}'
+    else:
+        root = f'{komga.MIRROR.lstrip("/")}/catalog' if komga.opds_root() else 'catalog'
     return web.index(base, sorted(profiles.PROFILES.items()), _for_readers(base), root)
 
 
@@ -538,6 +541,54 @@ async def mirrored_feed(profile: str, request: Request, rest: str = ''):
     _profile_or_404(profile)
     url = kavita.mirror_feed(rest) if rest else settings.upstream_catalog
     return await _serve_feed(request, profile, _with_query(url, request))
+
+
+# --------------------------------------------------------------------------
+# Komga's layout, mirrored under each profile
+# --------------------------------------------------------------------------
+
+
+@app.api_route('/{profile}/opds/v1.2/books/{book}/pages/{number}', methods=['GET', 'HEAD'])
+async def komga_page(profile: str, book: str, number: str, request: Request, maxWidth: str = '0', count: str = '0'):
+    p = _profile_or_404(profile)
+    _refuse_stream(p)
+    template = komga.unmirror(book, request.url.query)
+    return await _stream(request, p, template, _query_int(number), _query_int(maxWidth), _query_int(count))
+
+
+@app.api_route('/{profile}/opds/v1.2/{rest:path}', methods=['GET', 'HEAD'])
+async def komga_feed(profile: str, rest: str, request: Request):
+    _profile_or_404(profile)
+    return await _serve_feed(request, profile, _with_query(komga.mirror_feed(rest), request))
+
+
+@app.api_route('/{profile}/series/{rest:path}', methods=['GET', 'HEAD'])
+async def komga_series(profile: str, rest: str, request: Request):
+    return await komga_feed(profile, f'series/{rest}', request)
+
+
+@app.patch('/{profile}/api/v1/books/{book}/read-progress')
+async def komga_progress(profile: str, book: str, request: Request):
+    _refuse_stream(_profile_or_404(profile))
+    resp = await komga.report(book, await request.body(), request_headers(request.headers, accept='application/json'))
+    return Response(resp.content, status_code=resp.status_code, media_type=resp.headers.get('content-type'))
+
+
+@app.get('/{profile}/api/v1/books/{book}')
+async def komga_book(profile: str, book: str, request: Request):
+    _refuse_stream(_profile_or_404(profile))
+    resp = await client.get(komga.book_url(book), request_headers(request.headers, accept='application/json'))
+    if rewrite.looks_like_feed(resp.content):
+        raise UpstreamError(502, 'Komga answered a feed, not a book')
+    return Response(resp.content, media_type=resp.headers.get('content-type') or 'application/json')
+
+
+@app.api_route('/{profile}/api/v1/series/{series}/thumbnail', methods=['GET', 'HEAD'])
+async def komga_series_cover(profile: str, series: str, request: Request):
+    p = _profile_or_404(profile)
+    url = komga.series_thumbnail_url(series)
+    blob, ctype = await _render_cached(url, cover_for(p), None, request_headers(request.headers), 'cover')
+    return Response(blob, media_type=ctype, headers={'Cache-Control': 'private, max-age=604800'})
 
 
 # --------------------------------------------------------------------------

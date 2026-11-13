@@ -808,6 +808,113 @@ def _kavita_odd(key: str, shape: str):
     return Response(body, media_type=media)
 
 
+KOMGA = 'http://127.0.0.1:8899/komga/opds/v1.2'
+KOMGA_SIGNED = '<author><name>Komga</name><uri>https://github.com/gotson/komga</uri></author>'
+KOMGA_AUTH = 'Basic Zm9vOmJhcg=='
+KOMGA_SEEN: dict = {'pages': [], 'files': 0, 'api': [], 'progress': [], 'series': []}
+
+
+def _komga_feed(title: str, body: str) -> Response:
+    return Response(
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<feed xmlns="http://www.w3.org/2005/Atom" xmlns:pse="http://vaemendis.net/opds-pse/ns">'
+        f'<id>x</id><title>{title}</title>{KOMGA_SIGNED}{body}</feed>',
+        media_type='application/atom+xml;profile=opds-catalog;charset=UTF-8',
+    )
+
+
+def _komga_book(bid: str, tail: str = '') -> str:
+    read = [p['page'] for b, p, _ in KOMGA_SEEN['progress'] if b == bid]
+    last = f' pse:lastRead="{read[-1]}"' if read else ''
+    book = f'{KOMGA}/books/{bid}'
+    return (
+        f'<entry><title>Komga Series v{bid[-1]}</title><id>{bid}</id>'
+        '<author><name>A Writer</name></author>'
+        f'<link rel="http://opds-spec.org/image/thumbnail" type="image/jpeg" href="{book}/thumbnail/small"/>'
+        f'<link rel="http://opds-spec.org/acquisition" type="application/zip" href="{book}/file/v.cbz"/>'
+        f'<link rel="{PSE_REL}" type="image/jpeg" pse:count="6"{last} href="{book}/pages/{{pageNumber}}{tail}"/>'
+        '</entry>'
+    )
+
+
+@upstream.get('/komga/opds/v1.2/catalog')
+def _komga_catalog():
+    nav = 'application/atom+xml;profile=opds-catalog;kind=navigation'
+    return _komga_feed(
+        'Komga OPDS catalog',
+        f'<link rel="self" type="{nav}" href="{KOMGA}/catalog"/><link rel="start" type="{nav}" href="{KOMGA}/catalog"/>'
+        f'<link rel="search" type="application/opensearchdescription+xml" href="{KOMGA}/search"/>'
+        f'<entry><title>Komga Series</title><id>0S1</id>'
+        f'<link rel="subsection" type="{nav}" href="{KOMGA}/series/0S1"/></entry>'
+        f'<entry><title>Latest books</title><id>latest</id>'
+        f'<link rel="subsection" type="{nav}" href="{KOMGA}/books/latest"/></entry>',
+    )
+
+
+@upstream.get('/komga/opds/v1.2/series/{sid}')
+def _komga_series(sid: str, page: int = 0):
+    KOMGA_SEEN['series'].append((sid, page))
+    acq = 'application/atom+xml;profile=opds-catalog;kind=acquisition'
+    paging = f'<link rel="next" type="{acq}" href="{KOMGA}/series/{sid}?page=1"/>' if page == 0 else ''
+    books = _komga_book('0B1') + _komga_book('0B2', '?convert=jpeg') if page == 0 else _komga_book('0B3')
+    return _komga_feed(
+        f'Komga Series, page {page}', f'<link rel="self" type="{acq}" href="{KOMGA}/series/{sid}"/>{paging}{books}'
+    )
+
+
+@upstream.get('/komga/opds/v1.2/books/latest')
+def _komga_latest():
+    return _komga_feed('Latest books', _komga_book('0B1'))
+
+
+@upstream.get('/komga/opds/v1.2/books/{bid}/pages/{n}')
+def _komga_page(bid: str, n: int, request: Request):
+    KOMGA_SEEN['pages'].append((bid, n, request.url.query))
+    return Response(fake_page(n % 3), media_type='image/jpeg')
+
+
+@upstream.get('/komga/opds/v1.2/books/{bid}/file/{name}')
+def _komga_file(bid: str, name: str):  # noqa: ARG001
+    KOMGA_SEEN['files'] += 1
+    return Response(_cbz_bytes(1), media_type='application/zip')
+
+
+def _komga_denied() -> Response:
+    return Response('denied', status_code=401, headers={'www-authenticate': 'Basic realm="Realm"'})
+
+
+@upstream.get('/komga/api/v1/books/{bid}')
+def _komga_api_book(bid: str, authorization: str = Header(default='')):
+    KOMGA_SEEN['api'].append(('book', bid))
+    if authorization != KOMGA_AUTH:
+        return _komga_denied()
+    if bid == '0FEED':
+        return _komga_catalog()
+    book = {'id': bid, 'seriesId': '0S1', 'seriesTitle': 'Komga Series', 'name': f'Komga Series v{bid[-1]}'}
+    return Response(json.dumps(book), media_type='application/json')
+
+
+@upstream.patch('/komga/api/v1/books/{bid}/read-progress')
+async def _komga_api_progress(bid: str, request: Request, authorization: str = Header(default='')):
+    KOMGA_SEEN['api'].append(('progress', bid))
+    if authorization != KOMGA_AUTH:
+        return _komga_denied()
+    if bid == '0FAIL':
+        return Response('Komga is starting up', status_code=503)
+    if request.headers.get('content-type') != 'application/json':
+        return Response(status_code=415)
+    KOMGA_SEEN['progress'].append((bid, json.loads(await request.body()), authorization))
+    return Response(status_code=204)
+
+
+@upstream.get('/komga/api/v1/series/{sid}/thumbnail')
+def _komga_api_series_cover(sid: str, authorization: str = Header(default='')):
+    KOMGA_SEEN['api'].append(('cover', sid))
+    if authorization != KOMGA_AUTH:
+        return _komga_denied()
+    return Response(fake_colour_page(300, 450), media_type='image/jpeg')
+
+
 LONG_JSON = json.dumps(
     {'metadata': {'title': 'Long', 'description': 'x' * 8000}, 'links': [{'href': f'/api/opds/{SEAL_KEY}/feed'}]}
 )
@@ -10147,7 +10254,10 @@ async def check_browse(c) -> None:
 
     home = (await c.get('/')).text
     check('the index links each profile into the browse pages', '/kobo-clara-hd-2e-bw/browse' in home)
-    check('the index still shows the catalog URL for readers', '/kobo-clara-hd-2e-bw/catalog' in home)
+    check(
+        'the index still shows the catalog URL for readers',
+        re.search(r'/kobo-clara-hd-2e-bw/(opds/v1\.2/)?catalog</code>', home) is not None,
+    )
     check('the index does not name itself twice in the tab', '<title>Inksetter</title>' in home)
 
 
@@ -10633,7 +10743,7 @@ async def check_landing_groups(c) -> None:
     )
     check(
         'and still shows its catalog URL',
-        all(f'/{n}/catalog' in home for n in profiles.PROFILES),
+        all(re.search(rf'/{n}/(opds/v1\.2/)?catalog</code>', home) for n in profiles.PROFILES),
     )
     order = re.findall(r'href="http://proxy\.test/([\w-]+)/browse"', home)
     check(
@@ -11121,10 +11231,13 @@ async def check_kavita_mirror(c) -> None:
     async def landing() -> str:
         return (await c.get('/', headers={'accept': 'text/html'})).text
 
-    check(
-        'without a Kavita catalog the root page shows the plain catalog URL',
-        f'/{prof}/catalog</code>' in await landing(),
-    )
+    from inksetter import komga
+
+    with _catalog(komga, f'{up}/opds/v1.2'):
+        check(
+            'without a Kavita or Komga catalog the root page shows the plain catalog URL',
+            f'/{prof}/catalog</code>' in await landing(),
+        )
     r = await _get(c, f'{catalog}/series/2')
     check('and the catalog has no Kavita paths under it', r.status_code == 404, f'status={r.status_code}')
     r = await _get(c, f'{catalog}/')
@@ -11329,6 +11442,405 @@ def check_raw_redacted() -> None:
             finally:
                 proc.terminate()
                 proc.wait(15)
+
+
+def _meguru_komga_feed(body: bytes, base_url: str) -> tuple[str | None, list[dict]]:
+    from urllib.parse import urljoin
+
+    atom = '{http://www.w3.org/2005/Atom}'
+    feed = etree.fromstring(body)
+    author = feed.find(f'{atom}author')
+    signed = ' '.join(author.findtext(f'{atom}{tag}') or '' for tag in ('name', 'uri')) if author is not None else ''
+    items = []
+    for book in feed.iter(f'{atom}entry'):
+        for link in book.iter(f'{atom}link'):
+            attrs = {k.rpartition('}')[2]: v for k, v in link.attrib.items()}
+            template = urljoin(base_url, link.get('href') or '')
+            if link.get('rel') != PSE_REL or '{pageNumber}' not in template or 'count' not in attrs:
+                continue
+            key = re.search(r'/books/([^/]+)/pages/', template)
+            if key:
+                items.append({'template': template, 'item_key': key.group(1), 'last_read': attrs.get('lastRead')})
+            break
+    return ('komga' if 'komga' in signed.lower() else None), items
+
+
+def _meguru_komga_kind(template: str) -> str | None:
+    komga = all(needle in template for needle in ('/opds/', '/books/', '/pages/{pageNumber}'))
+    kavita = 'chapterId=' in template
+    return 'komga' if komga and not kavita else 'kavita' if kavita and not komga else None
+
+
+def _meguru_komga_series(feed_url: str) -> str | None:
+    found = re.search(r'/series/([^/?]+)', feed_url)
+    return found.group(1) if found else None
+
+
+def _meguru_komga_catalog(conn: str, series: str) -> str:
+    return f'{re.sub(r"/catalog$", "", re.sub(r"/+$", "", conn))}/series/{series}'
+
+
+def _meguru_komga_rest(template: str) -> tuple[str, str] | None:
+    found = re.match(r'(.*)/opds/v1\.2/books/([^/]+)/pages/', template)
+    return (found.group(1), found.group(2)) if found else None
+
+
+def _meguru_komga_cover(base_url: str) -> str | None:
+    found = re.match(r'(.*)/opds/v1\.2/series/([^/?]+)', base_url)
+    return f'{found.group(1)}/api/v1/series/{found.group(2)}/thumbnail' if found else None
+
+
+async def check_komga_mirror(c) -> None:
+    from inksetter import komga
+
+    prof = 'kobo-clara-hd-2e-bw'
+    strip = _strip_profile()
+    catalog = f'{KOMGA}/catalog'
+    codex = 'http://127.0.0.1:8899/opds/v1.2'
+    shaped = f'http://proxy.test/{prof}/opds/v1.2/catalog'
+    plain = f'http://proxy.test/{prof}/catalog'
+    auth = {'authorization': KOMGA_AUTH}
+    reader = 'KOReader/2025.10 (https://koreader.rocks/) LuaSocket/3.1.0'
+    stream = f'{KOMGA}/books/0B1/pages/{{pageNumber}}'
+    for seen in KOMGA_SEEN.values():
+        seen.clear() if isinstance(seen, list) else None
+    KOMGA_SEEN['files'] = 0
+
+    for label, url, want in (
+        ('a Komga catalog', 'http://komga:25600/opds/v1.2/catalog', 'http://komga:25600/opds/v1.2'),
+        ('a Komga behind a path prefix', 'https://host/komga/opds/v1.2/catalog', 'https://host/komga/opds/v1.2'),
+        ('a Komga URL with a login in it', 'http://u:pw@komga:25600/opds/v1.2/catalog', 'http://komga:25600/opds/v1.2'),
+        ('a Codex catalog', 'http://codex:9810/opds/v1.2', ''),
+        ('a Kavita catalog', f'http://kavita:5000/api/opds/{SEAL_KEY}', ''),
+        ('a feed under the catalog', 'http://komga:25600/opds/v1.2/catalog/more', ''),
+        ('a catalog of another scheme', 'ftp://komga:25600/opds/v1.2/catalog', ''),
+    ):
+        with _catalog(komga, url):
+            got = komga.opds_root()
+        check(f'the Komga root of {label} is {want or "none"}', got == want, got)
+
+    def proxied(body: bytes, base: str, upstream: str) -> list[str]:
+        with _catalog(komga, upstream):
+            out = rewrite.rewrite_atom(body, rewrite.Ctx(prof, 'http://proxy.test', base), 'image/png')
+        return [h.decode().replace('&amp;', '&') for h in re.findall(rb'href="([^"]*)"', out)]
+
+    signed = _komga_series('0S1').body
+    unsigned = signed.replace(KOMGA_SIGNED.encode(), b'')
+    KOMGA_SEEN['series'].clear()
+    mirrored = proxied(signed, f'{KOMGA}/series/0S1', catalog)
+    check(
+        "from Komga, a feed's own links and its stream links take Komga's paths under the profile, with no token",
+        f'http://proxy.test/{prof}/opds/v1.2/series/0S1' in mirrored
+        and f'http://proxy.test/{prof}/opds/v1.2/series/0S1?page=1' in mirrored
+        and f'http://proxy.test/{prof}/opds/v1.2/books/0B1/pages/{{pageNumber}}?maxWidth={{maxWidth}}&count=6'
+        in mirrored
+        and f'http://proxy.test/{prof}/opds/v1.2/books/0B2/pages/{{pageNumber}}?convert=jpeg&maxWidth={{maxWidth}}&count=6'
+        in mirrored,
+        f'{mirrored}',
+    )
+    check(
+        'while its covers and downloads keep their token links',
+        sum(f'/{prof}/img/' in h for h in mirrored) == 2 and sum(f'/{prof}/dl/' in h for h in mirrored) == 2,
+        f'{mirrored}',
+    )
+    for label, body, upstream in (
+        ('a feed that does not sign itself Komga', unsigned, catalog),
+        ('a Komga feed on a catalog not shaped as Komga', signed, codex),
+    ):
+        hrefs = proxied(body, f'{KOMGA}/series/0S1', upstream)
+        check(
+            f'{label} keeps its token links',
+            not any('/opds/' in h for h in hrefs) and sum(f'/{prof}/p/' in h for h in hrefs) == 2,
+            f'{hrefs}',
+        )
+
+    async def landing() -> str:
+        return (await c.get('/', headers={'accept': 'text/html'})).text
+
+    with _catalog(komga, catalog), _catalog(app_mod, catalog):
+        shown = await landing()
+    check(
+        'from Komga the root page shows the Komga-shaped root as the catalog URL',
+        f'/{prof}/opds/v1.2/catalog</code>' in shown and f'/{prof}/catalog</code>' not in shown,
+    )
+    check(
+        'which Meguru needs to build a series cover for a book found in an aggregate feed',
+        _meguru_komga_cover(_meguru_komga_catalog(shaped, '0S1')) is not None
+        and _meguru_komga_cover(_meguru_komga_catalog(plain, '0S1')) is None,
+    )
+
+    with _catalog(komga, codex), _catalog(app_mod, codex):
+        shown = await landing()
+        check('without a Komga catalog the root page shows the plain catalog URL', f'/{prof}/catalog</code>' in shown)
+        for method, path, label in (
+            ('GET', '/opds/v1.2/catalog', 'the Komga-shaped root'),
+            ('GET', '/series/0S1', "Meguru's series URL from the plain catalog"),
+            ('GET', '/opds/v1.2/books/0B1/pages/1', 'a Komga-shaped stream link'),
+            ('PATCH', '/api/v1/books/0B1/read-progress', 'a progress report'),
+            ('GET', '/api/v1/books/0B1', 'a book lookup'),
+            ('GET', '/api/v1/series/0S1/thumbnail', 'a series cover'),
+        ):
+            r = await _send(c, method, f'/{prof}{path}', headers=auth, content=b'{"page":1}')
+            check(f'and {label} is not served', r.status_code == 404, f'status={r.status_code}')
+        check(
+            'nor is Komga asked anything',
+            not KOMGA_SEEN['pages'] and not KOMGA_SEEN['api'] and not KOMGA_SEEN['series'],
+            f'{KOMGA_SEEN}',
+        )
+
+    with _catalog(komga, catalog), _catalog(app_mod, catalog):
+        items, series, latest = [], '', ''
+        for where, conn in (('the Komga-shaped root', shaped), ('the plain catalog URL', plain)):
+            r = await _get(c, conn)
+            kind, _ = _meguru_komga_feed(r.content, conn) if r.status_code == 200 else (None, [])
+            nav = (
+                [
+                    link.get('href')
+                    for link in etree.fromstring(r.content).iter('{http://www.w3.org/2005/Atom}link')
+                    if link.get('rel') == 'subsection'
+                ]
+                if r.status_code == 200
+                else []
+            )
+            series, latest = [*nav, '', ''][:2]
+            check(
+                f'from {where}, Meguru knows the catalog for Komga and finds the series id in its feed URL',
+                kind == 'komga' and _meguru_komga_series(series) == '0S1',
+                f'status={r.status_code} kind={kind} {nav}',
+            )
+            r = await _get(c, series)
+            _, items = _meguru_komga_feed(r.content, series) if r.status_code == 200 else (None, [])
+            check(
+                "and keys each book by the id in its stream link, which it knows for Komga's",
+                [i['item_key'] for i in items] == ['0B1', '0B2']
+                and all(_meguru_komga_kind(i['template']) == 'komga' for i in items),
+                f'status={r.status_code} {items}',
+            )
+            walk = _meguru_komga_catalog(conn, '0S1')
+            r = await _get(c, walk)
+            _, again = _meguru_komga_feed(r.content, walk) if r.status_code == 200 else (None, [])
+            check(
+                f"for next and previous, Meguru's series URL from {where} serves the same books",
+                [i['item_key'] for i in again] == ['0B1', '0B2'],
+                f'{walk} status={r.status_code}',
+            )
+        r = await _get(c, f'{series}?page=1')
+        _, more = _meguru_komga_feed(r.content, series) if r.status_code == 200 else (None, [])
+        check(
+            "a query on a Komga-shaped path goes on to Komga with it, so Meguru's walk reaches the next page",
+            [i['item_key'] for i in more] == ['0B3'] and KOMGA_SEEN['series'][-1:] == [('0S1', 1)],
+            f'status={r.status_code} {KOMGA_SEEN["series"][-1:]}',
+        )
+
+        if items:
+            KOMGA_SEEN['pages'].clear()
+            page = items[0]['template'].replace('{pageNumber}', '2').replace('{maxWidth}', '1072')
+            r = await _get(c, page, headers={'user-agent': reader})
+            await _prefetch_settled()
+            check(
+                'the stream link serves its pages, rendered for the panel',
+                r.status_code == 200 and r.headers.get('content-type') == 'image/png',
+                f'status={r.status_code}',
+            )
+            asked = [p for p in KOMGA_SEEN['pages'] if p[1] == 2]
+            check(
+                'and asks Komga for exactly the URL the feed linked',
+                asked == [('0B1', 2, '')] and sorted(p[1] for p in KOMGA_SEEN['pages']) == [2, 3, 4],
+                f'{KOMGA_SEEN["pages"]}',
+            )
+            r = await _get(
+                c, f'/{prof}/p/{encode_token(stream)}', params={'page': '2', 'maxWidth': '1072', 'count': '6'}
+            )
+            await _prefetch_settled()
+            check(
+                'so a token link to the same page finds it cached',
+                r.status_code == 200 and [p for p in KOMGA_SEEN['pages'] if p[1] == 2] == asked,
+                f'status={r.status_code} {KOMGA_SEEN["pages"]}',
+            )
+            page = items[1]['template'].replace('{pageNumber}', '1').replace('{maxWidth}', '1072')
+            r = await _get(c, page)
+            await _prefetch_settled()
+            check(
+                "a stream link with Komga's own query keeps it, and only it",
+                r.status_code == 200 and ('0B2', 1, 'convert=jpeg') in KOMGA_SEEN['pages'],
+                f'status={r.status_code} {KOMGA_SEEN["pages"]}',
+            )
+
+            rest = _meguru_komga_rest(items[0]['template'])
+            check(
+                'premise: Meguru finds the server and the book in the stream link',
+                rest == (f'http://proxy.test/{prof}', '0B1'),
+                f'{rest}',
+            )
+            report = f'http://proxy.test/{prof}/api/v1/books/0B1/read-progress'
+            json_type = {'content-type': 'application/json'}
+            r = await _send(c, 'PATCH', report, content=b'{"page":3}', headers={**auth, **json_type})
+            check(
+                "Meguru's progress report reaches Komga as JSON, with the reader's credentials",
+                r.status_code == 204 and KOMGA_SEEN['progress'][-1:] == [('0B1', {'page': 3}, KOMGA_AUTH)],
+                f'status={r.status_code} {KOMGA_SEEN["progress"]}',
+            )
+            r = await _get(c, series)
+            _, after = _meguru_komga_feed(r.content, series) if r.status_code == 200 else (None, [])
+            check(
+                'and the series feed then has the book read to there',
+                bool(after) and after[0]['last_read'] == '3',
+                f'{after[:1]}',
+            )
+            r = await _send(c, 'PATCH', report, content=b'{"page":5,"completed":true}', headers={**auth, **json_type})
+            check(
+                'a report that the book is completed goes on too',
+                r.status_code == 204 and KOMGA_SEEN['progress'][-1][1] == {'page': 5, 'completed': True},
+                f'status={r.status_code}',
+            )
+            r = await _send(c, 'PATCH', report, content=b'{"page":3}', headers=json_type)
+            check(
+                "without credentials, Komga's 401 comes back with its challenge",
+                r.status_code == 401 and r.headers.get('www-authenticate') == 'Basic realm="Realm"',
+                f'status={r.status_code} {dict(r.headers)}',
+            )
+            for raw in (
+                b'',
+                b'not json',
+                b'[3]',
+                b'{}',
+                b'{"page":0}',
+                b'{"page":"3"}',
+                b'{"page":true}',
+                b'{"page":3.0}',
+                b'{"completed":1}',
+                b'{"page":3,"bookId":"0B2"}',
+                b'{"page":3}' + b' ' * 1100,
+            ):
+                asked = len(KOMGA_SEEN['api'])
+                r = await _send(c, 'PATCH', report, content=raw, headers={**auth, **json_type})
+                check(
+                    f'a progress report of {raw[:24]!r} is refused without asking Komga',
+                    r.status_code == 400 and len(KOMGA_SEEN['api']) == asked,
+                    f'status={r.status_code} {KOMGA_SEEN["api"][asked:]}',
+                )
+            r = await _send(c, 'PATCH', report.replace('0B1', '0FAIL'), content=b'{"page":3}', headers=auth)
+            check("a Komga failing the report is Inksetter's 502", r.status_code == 502, f'status={r.status_code}')
+
+        r = await _get(c, latest)
+        _, aggregate = _meguru_komga_feed(r.content, latest) if r.status_code == 200 else (None, [])
+        check(
+            'premise: an aggregate feed names no series in its URL',
+            bool(aggregate) and _meguru_komga_series(latest) is None,
+            f'{latest} {aggregate}',
+        )
+        rest = _meguru_komga_rest(aggregate[0]['template']) if aggregate else None
+        lookup = f'{rest[0]}/api/v1/books/{rest[1]}' if rest else f'http://proxy.test/{prof}/api/v1/books/0B1'
+        r = await _get(c, lookup, headers=auth)
+        book = r.json() if r.status_code == 200 else {}
+        check(
+            "Meguru's lookup of a book from it answers Komga's own record, with the series",
+            book.get('seriesId') == '0S1' and book.get('seriesTitle') == 'Komga Series' and book.get('id') == '0B1',
+            f'status={r.status_code} {book}',
+        )
+        r = await _get(c, lookup)
+        check(
+            "and without credentials, Komga's 401 with its challenge",
+            r.status_code == 401 and r.headers.get('www-authenticate') == 'Basic realm="Realm"',
+            f'status={r.status_code}',
+        )
+        r = await _get(c, lookup.replace('0B1', '0FEED'), headers=auth)
+        check('a lookup that Komga answers with a feed is refused', r.status_code == 502, f'status={r.status_code}')
+
+        cover = _meguru_komga_cover(series)
+        r = await _get(c, cover or f'http://proxy.test/{prof}/api/v1/series/0S1/thumbnail', headers=auth)
+        asked = KOMGA_SEEN['api'][-1:]
+        thumb = encode_token('http://127.0.0.1:8899/komga/api/v1/series/0S1/thumbnail')
+        same = await _get(c, f'/{prof}/img/{thumb}', headers=auth)
+        check(
+            "Meguru's series cover, built from the series feed, serves Komga's series thumbnail rendered as a cover",
+            cover == f'http://proxy.test/{prof}/api/v1/series/0S1/thumbnail'
+            and r.status_code == 200
+            and r.headers.get('content-type') == profiles.cover_for(profiles.PROFILES[prof]).mime
+            and r.content == same.content
+            and asked == [('cover', '0S1')],
+            f'{cover} status={r.status_code} {r.headers.get("content-type")} {asked}',
+        )
+
+        ctx = rewrite.Ctx(prof, 'http://proxy.test', f'{KOMGA}/series/0S1', komga=True)
+        check(
+            'premise: the plain stream and series feed take the Komga-shaped links',
+            '/opds/v1.2/books/' in rewrite.map_href(stream, 'p', ctx, count=6)
+            and '/opds/v1.2/series/' in rewrite.map_href(f'{KOMGA}/series/0S1?page=1', 'f', ctx),
+        )
+        odd = {
+            'a second placeholder': f'{stream}?width={{maxWidth}}',
+            'a count of its own': f'{stream}?count=9',
+            'a maxWidth of its own': f'{stream}?convert=jpeg&maxWidth=9',
+            'another port': stream.replace(':8899', ':8898'),
+            'another path': stream.replace('/pages/', '/pages/x/'),
+            'a suffix': f'{stream}.jpg',
+            'a path outside the root': stream.replace('/komga/opds/', '/opds/'),
+            'an odd book id': stream.replace('0B1', '0B.1'),
+            'a fragment': f'{stream}#x',
+        }
+        mapped = {label: rewrite.map_href(href, 'p', ctx, count=6) for label, href in odd.items()}
+        check(
+            'a stream the mirror could not rebuild exactly keeps its token link: ' + ', '.join(odd),
+            all(f'/{prof}/p/' in m and '/opds/' not in m for m in mapped.values()),
+            f'{mapped}',
+        )
+        odd = {
+            'a download': f'{KOMGA}/books/0B1/file/v.cbz',
+            'a climb out of the root': f'{KOMGA}/series/../../api/v1/books/0B1',
+            'an escaped letter': f'{KOMGA}/series/%30S1',
+            'a placeholder': f'{KOMGA}/series/{{id}}',
+            'a fragment': f'{KOMGA}/series/0S1#top',
+            'another port': f'{KOMGA}/series/0S1'.replace(':8899', ':8898'),
+            'a path outside the root': 'http://127.0.0.1:8899/komga/api/v1/books/0B1',
+        }
+        mapped = {label: rewrite.map_href(href, 'f', ctx) for label, href in odd.items()}
+        check(
+            'a feed link the mirror could not serve exactly keeps its token link: ' + ', '.join(odd),
+            all(f'/{prof}/f/' in m and '/opds/' not in m for m in mapped.values()),
+            f'{mapped}',
+        )
+
+        for label, path in (
+            ('climbs out of the root', '/opds/v1.2/%2e%2e/%2e%2e/api/v1/books/0B1'),
+            ('climbs out from the series URL', '/series/%2e%2e/%2e%2e/api/v1/books/0B1'),
+            ('is a download', '/opds/v1.2/books/0B1/file/v.cbz'),
+            ('names an odd book', '/opds/v1.2/books/0B.1/pages/1'),
+            ('looks up an odd book', '/api/v1/books/0B.1'),
+            ('asks for an odd series cover', '/api/v1/series/0S.1/thumbnail'),
+        ):
+            before = (len(KOMGA_SEEN['api']), KOMGA_SEEN['files'], len(KOMGA_SEEN['pages']))
+            r = await _get(c, f'/{prof}{path}', headers=auth)
+            now = (len(KOMGA_SEEN['api']), KOMGA_SEEN['files'], len(KOMGA_SEEN['pages']))
+            check(
+                f'a path that {label} is not served, nor asked of Komga',
+                r.status_code == 404 and now == before,
+                f'status={r.status_code}',
+            )
+        before = len(KOMGA_SEEN['api'])
+        r = await _send(c, 'PATCH', f'/{prof}/api/v1/books/0B.1/read-progress', content=b'{"page":1}', headers=auth)
+        check('a report on an odd book is refused unasked', r.status_code == 404 and len(KOMGA_SEEN['api']) == before)
+
+        r = await _get(c, f'/{strip.name}/opds/v1.2/books/0B1/pages/1')
+        said = r.json().get('error', '') if r.status_code == 404 else ''
+        check(
+            'a re-cut profile refuses the Komga-shaped stream link, and says to download the book',
+            r.status_code == 404 and 'download' in said,
+            f'status={r.status_code} {said!r}',
+        )
+        before = len(KOMGA_SEEN['api'])
+        for method, route in (('PATCH', 'api/v1/books/0B1/read-progress'), ('GET', 'api/v1/books/0B1')):
+            r = await _send(c, method, f'/{strip.name}/{route}', content=b'{"page":1}', headers=auth)
+            check(f'and its {method} {route} as well', r.status_code == 404, f'status={r.status_code}')
+        check('without asking Komga', len(KOMGA_SEEN['api']) == before, f'{KOMGA_SEEN["api"][before:]}')
+        r = await _get(c, f'/{strip.name}/opds/v1.2/series/0S1')
+        hrefs = re.findall(r'href="([^"]*)"', r.text) if r.status_code == 200 else []
+        check(
+            "while its feeds still take Komga's paths, with no stream link in them",
+            f'http://proxy.test/{strip.name}/opds/v1.2/series/0S1?page=1' in hrefs
+            and not any('/pages/' in h for h in hrefs),
+            f'status={r.status_code} {hrefs}',
+        )
 
 
 def _koreader_md5(data: bytes) -> str:
@@ -13376,6 +13888,7 @@ async def main() -> int:
         await check_kavita_resume(c)
         await check_kavita_mirror(c)
         check_raw_redacted()
+        await check_komga_mirror(c)
 
         print('cache trim')
         await check_trim_aside(c)
